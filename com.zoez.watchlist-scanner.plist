@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.zoez.watchlist-scanner</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>/Users/zoez/Desktop/watchlist-scanner/run_scan.sh</string>
+    </array>
+    <!-- Fixed Brisbane times, every day; scanner.py "auto" keeps fires that
+         land inside a US-session window and skips the rest, so the schedule
+         survives both US DST regimes AND US weekends (Brisbane Sat 05:45 =
+         US Fri close scan; Brisbane Sun / Mon-before-open skip). The extra
+         retry fires are harmless: report-exists dedup skips them once the
+         primary run has written its report.
+           23:45 AEST = 09:45 EDT  open scan   (US summer)
+           00:45 AEST = 09:45 EST  open scan   (US winter)
+           01:30 AEST = 10:30 EST  open retry  (US winter; EDT=11:30, skip)
+           05:45 AEST = 15:45 EDT  close scan  (US summer)
+           06:00 AEST = 16:00 EDT  close retry (US summer; EST=15:00, skip)
+           06:45 AEST = 15:45 EST  close scan  (US winter)
+           07:00 AEST = 16:00 EST  close retry (US winter; EDT=17:00, skip)
+           10:30 AEST = watchdog: run_scan.sh routes any 09-12 Brisbane fire
+                        (incl. sleep-coalesced missed ones) to a missed-scan
+                        check + notification instead of a scan. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Hour</key><integer>23</integer><key>Minute</key><integer>45</integer></dict>
+        <dict><key>Hour</key><integer>0</integer><key>Minute</key><integer>45</integer></dict>
+        <dict><key>Hour</key><integer>1</integer><key>Minute</key><integer>30</integer></dict>
+        <dict><key>Hour</key><integer>5</integer><key>Minute</key><integer>45</integer></dict>
+        <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>45</integer></dict>
+        <dict><key>Hour</key><integer>7</integer><key>Minute</key><integer>0</integer></dict>
+        <dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>30</integer></dict>
+    </array>
+    <key>StandardOutPath</key>
+    <string>/Users/zoez/Desktop/watchlist-scanner/reports/launchd.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/zoez/Desktop/watchlist-scanner/reports/launchd.err</string>
+</dict>
+</plist>

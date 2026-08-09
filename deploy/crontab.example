@@ -1,0 +1,10 @@
+# watchlist-scanner on a droplet — crontab -e and paste (server clock = UTC).
+# scanner.py --mode auto gates by the US-Eastern window, so the doubled
+# entries survive US DST: whichever lands in-window runs, the rest exit 3.
+# UTC 13-22h = same-calendar-day US Eastern, so 1-5 (Mon-Fri) aligns with
+# US trading days. --email inside run_scan.sh pushes the report.
+45 13 * * 1-5 /opt/watchlist-scanner/deploy/run_scan.sh   # 09:45 EDT open  (US summer)
+45 14 * * 1-5 /opt/watchlist-scanner/deploy/run_scan.sh   # 09:45 EST open  (US winter; EDT=10:45 also in-window, dedup skips)
+45 19 * * 1-5 /opt/watchlist-scanner/deploy/run_scan.sh   # 15:45 EDT close (US summer)
+45 20 * * 1-5 /opt/watchlist-scanner/deploy/run_scan.sh   # 15:45 EST close (US winter; EDT=16:45, skip)
+30 22 * * 1-5 /opt/watchlist-scanner/deploy/run_scan.sh watchdog   # 报告缺失 -> 邮件报警

@@ -1,0 +1,1650 @@
+#!/usr/bin/env python3
+"""Left/right-side watchlist scanner (开盘异动 + 尾盘信号).
+
+Two scheduled passes over a fixed watchlist (watchlist.toml), mechanically
+applying the rules from 危机黄金与左右侧交易-实战笔记.md:
+
+  open  pass (~09:45 ET): overnight gaps, value-zone entries, earnings
+        today/next days, regime changes, trailing-stop warnings.
+        NO right-side confirmations — those are close-based by design.
+  close pass (~15:45 ET): full signal engine per ticker:
+        - right-side confirmation, 2 of 3: stopped making new lows /
+          reclaimed the 20dma on volume / broke the 20d high
+          (only counted after an actual pullback — a quiet uptrend never
+          "confirms")
+        - state machine UPTREND/PULLBACK/LEFT_ZONE/CONFIRMED/TREND with a
+          20dma trailing-stop alert once right-side
+        - VIX/VIX3M regime gate: stage 1 (inverted) = sellers only, no new
+          right-side entries; stage 2 window (inversion just resolved) =
+          LEAP entries allowed ("buy the relief, not the panic")
+        - concrete option tickets: CSP (2-4wk delta 0.10-0.15 normal /
+          weekly 16-rule distance in panic, never across earnings) and
+          LEAP calls (deep ITM 0.70-0.85 delta, 450-1100 DTE Jan cycle,
+          OI >= 500, spread <= 5%, extrinsic <= 40%, enter after earnings)
+
+Data: yfinance only (prices, chains, earnings calendar) — free, ~15min
+delayed, quotes zero out overnight, so both scan windows sit inside US RTH
+by construction (a freshness gate skips holidays/half-days).
+
+Value zones are YOUR judgment, maintained by hand in watchlist.toml; the
+scanner only measures distance to them. Left-side suggestions stay off for
+tickers without a zone. Not investment advice — the tickets follow the
+playbook mechanically and know nothing the tape doesn't.
+
+Exit codes: 0 = report written, 3 = intentionally skipped (outside window,
+duplicate run, market not live), 1 = error.
+"""
+
+from __future__ import annotations
+
+import argparse
+import io
+import json
+import math
+import os
+import sys
+import tomllib
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+# ETFs have no earnings calendar — silence yfinance's 404 chatter
+import logging
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+
+ET = ZoneInfo("America/New_York")
+BASE = Path(__file__).resolve().parent
+REPORTS = BASE / "reports"
+DATA = BASE / "data"
+STATE_FILE = DATA / "state.json"
+IV_HISTORY = DATA / "iv_history.csv"
+CONFIG_FILE = BASE / "watchlist.toml"
+
+RATE = 0.04                      # risk-free for BS delta/IV inversion
+SKIP = 3                         # exit code for intentional no-op runs
+
+# ET windows the auto mode accepts. launchd fires at 4 fixed Brisbane times
+# (2 candidates per scan to survive the US DST shift); whichever lands inside
+# a window runs, the rest exit SKIP. Duplicates are caught by report-exists.
+OPEN_WINDOW = ((9, 40), (10, 50))
+CLOSE_WINDOW = ((15, 30), (16, 5))
+
+MAX_STALE_TRADE_DAYS = 5         # option lastPrice older than this = unusable
+
+
+# --------------------------------------------------------------------------
+# Config / persistence
+# --------------------------------------------------------------------------
+
+TICKER_DEFAULTS = {"kind": "stock", "options": True, "high_beta": False,
+                   "value_zone": None, "two_x": None, "notes": ""}
+
+SETTINGS_DEFAULTS = {
+    "gap_alert_pct": 1.5,        # open pass: flag |gap| above this
+    "move_alert_pct": 2.0,       # open pass: flag |move since prev close|
+    "volume_surge": 1.5,         # x 20d avg volume = "放量"
+    "near_zone_pct": 5.0,        # within this % above zone top = NEAR_ZONE
+    "earnings_alert_days": 2,    # open pass: flag earnings within N days
+    # CSP (剧本: 平时 2-4 周 delta 0.10-0.15)
+    "csp_delta_lo": 0.10, "csp_delta_hi": 0.15, "csp_delta_target": 0.12,
+    "csp_dte_normal": [12, 31],  # 平时卖 2-4 周
+    "csp_dte_panic": [4, 10],    # 恐慌期卖周权
+    "csp_min_oi": 200, "csp_min_mid": 0.20,
+    "csp_min_annualized": 10.0,  # 年化下限 % (moomoo 筛选器同口径 10~80)
+    "sixteen_rule_mult": 2.75,   # 距离 >= 2.5-3 x IV/16 x sqrt(DTE)
+    # 正股分批 (剧本: 档位更深、间距更大、末档留给真正的恐慌价)
+    "ladder_panic_discount": 0.18,   # 末档 = 区间下沿再打 18% 折扣
+    # 回踩 call spread (剧本: 突破后首次回踩 -> 3-6 个月 call spread)
+    "spread_dte": [80, 200],
+    "spread_long_delta": 0.60, "spread_short_delta": 0.30,
+    "spread_min_reward_risk": 0.6,  # 0.60/0.30 价差正常 ~1:1 — 低于此=报价失真
+    "trend_middle_days": 30,     # TREND 持续 N 天 -> 2x/PMCC 工具切换提示
+    "two_x_vix_max": 25.0,       # 波动收敛门: VIX 低于此才提示 2x/PMCC
+    # LEAP
+    "leap_dte": [450, 1100],
+    "leap_delta_index": [0.70, 0.80],
+    "leap_delta_stock": [0.75, 0.85],
+    "leap_min_oi": 500, "leap_max_spread_pct": 5.0,
+    "leap_max_extrinsic_pct": 40.0,
+    "leap_earnings_buffer_days": 14,  # 财报前 <=2 周不进 LEAP (2026-08-09 校准)
+    "leap_earnings_note_days": 30,    # 财报 15-30 天内出票但带提示
+    # regime
+    "stage2_window_bars": 10,    # trading days after inversion resolves
+    "episode_min_days": 3, "episode_min_peak": 1.10,
+}
+
+
+def load_config(path: Path = CONFIG_FILE) -> tuple[dict, dict]:
+    """-> (settings, {symbol: ticker_cfg}). Ticker order follows the file."""
+    with open(path, "rb") as f:
+        raw = tomllib.load(f)
+    settings = {**SETTINGS_DEFAULTS, **raw.get("settings", {})}
+    tickers = {}
+    for sym, tcfg in raw.get("tickers", {}).items():
+        cfg = {**TICKER_DEFAULTS, **tcfg}
+        zone = cfg["value_zone"]
+        if zone is not None and (len(zone) != 2 or zone[0] >= zone[1]):
+            raise ValueError(f"{sym}: value_zone must be [low, high]")
+        tickers[sym.upper()] = cfg
+    if not tickers:
+        raise ValueError("watchlist.toml has no [tickers.*] entries")
+    return settings, tickers
+
+
+def load_state() -> dict:
+    if STATE_FILE.exists():
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    return {}
+
+
+def save_state(state: dict) -> None:
+    DATA.mkdir(exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False),
+                          encoding="utf-8")
+
+
+def next_persisted_state(prev: dict, r: dict, today: str) -> dict:
+    """close 收盘后单标的 state.json 条目 (纯函数, 便于测试).
+    - since: 状态变了才刷新
+    - leap_window: 阶段2窗口 dedup key, 跨日携带
+    - retested: 回踩一次性提示 — 新一轮确认重新计数, 本日回踩置位, 否则沿用"""
+    since = prev.get("since")
+    if prev.get("state") != r["state"]:
+        since = today
+    entry = {"state": r["state"], "since": since}
+    lw = r.get("leap_window") or prev.get("leap_window")
+    if lw:
+        entry["leap_window"] = lw
+    retested = prev.get("retested", False)
+    if r["state"] == "CONFIRMED" \
+            and prev.get("state") not in ("CONFIRMED", "TREND"):
+        retested = False
+    if r.get("retest"):
+        retested = True
+    if retested:
+        entry["retested"] = True
+    return entry
+
+
+# --------------------------------------------------------------------------
+# Market clock gating
+# --------------------------------------------------------------------------
+
+def in_window(now_et: datetime, window) -> bool:
+    (h1, m1), (h2, m2) = window
+    t = (now_et.hour, now_et.minute)
+    return (h1, m1) <= t <= (h2, m2)
+
+
+def resolve_mode(arg_mode: str, now_et: datetime) -> str | None:
+    """'open'/'close' passthrough; 'auto' decides from the ET clock.
+    Returns None when auto lands outside both windows (caller exits SKIP)."""
+    if arg_mode != "auto":
+        return arg_mode
+    if now_et.weekday() >= 5:
+        return None
+    if in_window(now_et, OPEN_WINDOW):
+        return "open"
+    if in_window(now_et, CLOSE_WINDOW):
+        return "close"
+    return None
+
+
+def market_is_live() -> bool:
+    """SPY has printed a 1m bar in the last 20 minutes = US session live.
+    Catches weekends, holidays and half-days without a holiday calendar.
+    A dead feed raises instead of returning False — on a holiday Yahoo still
+    serves the previous session's bars, so exception/empty means the data
+    feed is broken and must surface as a FAILURE, not a silent skip."""
+    try:
+        bars = yf.Ticker("SPY").history(period="1d", interval="1m")
+    except Exception as e:
+        raise RuntimeError(
+            f"SPY liveness fetch failed ({type(e).__name__}: {e})") from e
+    if bars.empty:
+        raise RuntimeError("SPY liveness fetch returned no bars — feed problem")
+    last = bars.index[-1].to_pydatetime()
+    return (datetime.now(timezone.utc) - last).total_seconds() < 20 * 60
+
+
+# --------------------------------------------------------------------------
+# Regime: VIX/VIX3M term-structure state machine
+# --------------------------------------------------------------------------
+
+def inversion_episodes(ratio: pd.Series) -> list[dict]:
+    """Contiguous runs of ratio >= 1.0 -> [{start, end, days, peak, ongoing}]."""
+    episodes, cur = [], None
+    for ts, val in ratio.items():
+        if val >= 1.0:
+            if cur is None:
+                cur = {"start": ts, "end": ts, "days": 0, "peak": float(val)}
+            cur["days"] += 1
+            cur["end"] = ts
+            cur["peak"] = max(cur["peak"], float(val))
+        elif cur is not None:
+            episodes.append({**cur, "ongoing": False})
+            cur = None
+    if cur is not None:
+        episodes.append({**cur, "ongoing": True})
+    return episodes
+
+
+def classify_regime(ratio: pd.Series, s: dict) -> tuple[str, list[dict]]:
+    """-> (stage, episodes). Stages:
+    STAGE1_DEEP  ratio >= 1.10 (历史级恐慌区: CSP 第二/三档)
+    STAGE1       ratio >= 1.0  (倒挂: 只做卖方, 右侧停)
+    STAGE2_WINDOW inversion (>=3d, peak >=1.10) resolved within N bars
+                 (解除窗口: LEAP/risk-reversal 允许)
+    NORMAL       everything else
+    """
+    episodes = inversion_episodes(ratio)
+    r = float(ratio.iloc[-1])
+    if r >= 1.10:
+        return "STAGE1_DEEP", episodes
+    if r >= 1.0:
+        return "STAGE1", episodes
+    qual = [e for e in episodes if not e["ongoing"]
+            and e["days"] >= s["episode_min_days"]
+            and e["peak"] >= s["episode_min_peak"]]
+    if qual:
+        bars_since = len(ratio) - 1 - ratio.index.get_loc(qual[-1]["end"])
+        if bars_since <= s["stage2_window_bars"]:
+            return "STAGE2_WINDOW", episodes
+    return "NORMAL", episodes
+
+
+CBOE_HISTORY_URL = ("https://cdn.cboe.com/api/global/us_indices/"
+                    "daily_prices/{}_History.csv")
+
+
+def _cboe_series(name: str) -> pd.Series:
+    """Official CBOE daily closes. Primary source for the VIX complex —
+    Yahoo's ^VIX3M/^VIX9D feeds go stale for weeks at a time (observed
+    2026-08: ^VIX3M frozen since 07-17 while ^VIX stayed current)."""
+    req = urllib.request.Request(CBOE_HISTORY_URL.format(name),
+                                 headers={"User-Agent": "Mozilla/5.0"})
+    text = urllib.request.urlopen(req, timeout=30).read().decode()
+    df = pd.read_csv(io.StringIO(text))
+    ser = pd.Series(df["CLOSE"].astype(float).values,
+                    index=pd.to_datetime(df["DATE"], format="%m/%d/%Y"))
+    return ser.tail(400)
+
+
+def _yahoo_vix_pair() -> tuple[pd.Series, pd.Series]:
+    df = yf.download(["^VIX", "^VIX3M"], period="1y", interval="1d",
+                     auto_adjust=False, progress=False)["Close"]
+    return df["^VIX"].dropna(), df["^VIX3M"].dropna()
+
+
+CBOE_QUOTE_URL = "https://cdn.cboe.com/api/global/delayed_quotes/quotes/_{}.json"
+
+
+def _cboe_delayed(name: str) -> tuple[float, datetime]:
+    """15-min delayed intraday index level + last trade time (ET, naive)."""
+    req = urllib.request.Request(CBOE_QUOTE_URL.format(name),
+                                 headers={"User-Agent": "Mozilla/5.0"})
+    d = json.loads(urllib.request.urlopen(req, timeout=30).read())["data"]
+    return float(d["current_price"]), datetime.fromisoformat(d["last_trade_time"])
+
+
+def fetch_regime(s: dict) -> dict:
+    try:
+        vix, vix3m = _cboe_series("VIX"), _cboe_series("VIX3M")
+        source = "CBOE"
+    except Exception as e:
+        print(f"  CBOE index feed failed ({type(e).__name__}) — Yahoo fallback",
+              file=sys.stderr)
+        vix, vix3m = _yahoo_vix_pair()
+        source = "Yahoo"
+    try:
+        vxn_last = float(_cboe_series("VXN").iloc[-1])
+    except Exception:
+        vxn_last = None
+
+    settled = (vix / vix3m).dropna()
+    if len(settled) < 30:
+        raise RuntimeError("VIX/VIX3M history too short — data problem")
+    # staleness/as-of judged on SETTLED closes only (the honest date)
+    age_days = (datetime.now(ET).date() - settled.index[-1].date()).days
+    as_of = str(settled.index[-1].date())
+
+    # The daily file lags a session (CBOE settles after the close), so graft
+    # a provisional intraday point on top — a day-one inversion must gate
+    # TODAY's tickets, not tomorrow's.
+    intraday = False
+    try:
+        v_now, v_ts = _cboe_delayed("VIX")
+        v3_now, v3_ts = _cboe_delayed("VIX3M")
+        today_et = datetime.now(ET).date()
+        if v_ts.date() == today_et == v3_ts.date():
+            stamp = pd.Timestamp(today_et)
+            vix = pd.concat(
+                [vix[vix.index < stamp], pd.Series([v_now], index=[stamp])])
+            vix3m = pd.concat(
+                [vix3m[vix3m.index < stamp], pd.Series([v3_now], index=[stamp])])
+            intraday = True
+    except Exception:
+        pass  # settled series still stands; staleness warning covers the gap
+
+    ratio = (vix / vix3m).dropna()
+    stage, episodes = classify_regime(ratio, s)
+    prev = float(ratio.iloc[-2])
+    cur = float(ratio.iloc[-1])
+    return {
+        "vix": float(vix.iloc[-1]), "vix3m": float(vix3m.iloc[-1]),
+        "vxn": vxn_last,
+        "ratio": cur, "ratio_prev": prev,
+        "crossed_up": prev < 1.0 <= cur, "crossed_down": prev >= 1.0 > cur,
+        "stage": stage,
+        "last_episode": episodes[-1] if episodes else None,
+        "as_of": as_of,
+        "source": source, "stale_days": age_days, "intraday": intraday,
+    }
+
+
+REGIME_NOTES = {
+    "NORMAL": "正常结构 — 左侧看个股价值区, 右侧按确认信号走",
+    "STAGE1": "倒挂 (阶段1) — 剧本: 只做卖方 (CSP 第一档), 不加右侧仓",
+    "STAGE1_DEEP": "倒挂 >1.1 (历史级恐慌区) — 剧本: CSP 加第二/三档, 周权+16法则, 右侧仍停",
+    "STAGE2_WINDOW": "倒挂解除窗口 (阶段2) — 剧本: buy the relief — 价格确认后 LEAP/risk reversal",
+}
+
+
+# --------------------------------------------------------------------------
+# Technical signals — pure functions over daily OHLCV (unit-testable)
+# --------------------------------------------------------------------------
+
+def no_new_low(low: pd.Series) -> bool:
+    """不再新低: last 5 sessions' low holds above the prior 15 sessions' low."""
+    if len(low) < 20:
+        return False
+    return float(low.iloc[-5:].min()) > float(low.iloc[-20:-5].min())
+
+
+def reclaimed_20dma(close: pd.Series, vol_ratio: float, surge: float) -> bool:
+    """放量收复20日线: above the 20dma today, was below it within the last
+    10 sessions, and today's volume runs >= surge x the 20d average."""
+    if len(close) < 31:
+        return False
+    sma20 = close.rolling(20).mean()
+    above_now = float(close.iloc[-1]) > float(sma20.iloc[-1])
+    was_below = bool((close.iloc[-11:-1] < sma20.iloc[-11:-1]).any())
+    return above_now and was_below and vol_ratio >= surge
+
+
+def broke_20d_high(close: pd.Series, high: pd.Series) -> bool:
+    """突破: close above the prior 20 sessions' high (trendline-break proxy)."""
+    if len(high) < 21:
+        return False
+    return float(close.iloc[-1]) > float(high.iloc[-21:-1].max())
+
+
+def had_pullback(close: pd.Series) -> bool:
+    """Confirmation only means something after an actual decline: closed
+    below the 20dma within the last 15 sessions, or 60d drawdown >= 8%."""
+    if len(close) < 61:
+        return False
+    sma20 = close.rolling(20).mean()
+    below_recent = bool((close.iloc[-16:-1] < sma20.iloc[-16:-1]).any())
+    dd60 = float(close.iloc[-1]) / float(close.iloc[-60:].max()) - 1.0
+    return below_recent or dd60 <= -0.08
+
+
+def confirmation(close, high, low, vol_ratio, surge) -> dict:
+    """右侧确认 (三选二), gated on a real pullback having happened."""
+    a = no_new_low(low)
+    b = reclaimed_20dma(close, vol_ratio, surge)
+    c = broke_20d_high(close, high)
+    pullback = had_pullback(close)
+    return {"no_new_low": a, "reclaim20": b, "breakout": c,
+            "pullback_context": pullback,
+            "confirmed": pullback and (a + b + c) >= 2}
+
+
+def next_state(prev: str, *, close: float, sma20: float, confirmed: bool,
+               zone, near_pct: float) -> tuple[str, list[str]]:
+    """State machine. Right-side states trail the 20dma; the trailing stop
+    fires as a note on the transition day.
+
+    左侧状态要求真实弱势 (收盘在20日线下): 价格从下方涨穿价值区不算左侧,
+    那是趋势 (UPTREND)。CSP 触发与状态标签解耦 — 只要价格在/近价值区就
+    出票 (在接货价挂收钱限价单, 与趋势方向无关)。"""
+    notes = []
+    in_zone = zone is not None and close <= zone[1]
+    near_zone = (zone is not None and not in_zone
+                 and close <= zone[1] * (1 + near_pct / 100))
+    if prev in ("CONFIRMED", "TREND"):
+        if close < sma20:
+            notes.append("右侧止损触发: 收盘跌破20日线 (剧本: 移动止损, 凸性档减半/结构破清仓)")
+            state = "PULLBACK"
+        else:
+            state = "TREND"
+    elif confirmed:
+        state = "CONFIRMED"
+    elif close < sma20:
+        if in_zone:
+            state = "LEFT_ZONE"
+            if close < zone[0]:
+                notes.append("已跌破价值区下沿 — 剧本: 检查论点是否失效, 而不是继续摊")
+        elif near_zone:
+            state = "NEAR_ZONE"
+        else:
+            state = "PULLBACK"
+    else:
+        state = "UPTREND"
+    return state, notes
+
+
+STATE_LABEL = {
+    "UPTREND": "趋势上方", "PULLBACK": "回调中(20日线下)",
+    "NEAR_ZONE": "接近价值区", "LEFT_ZONE": "价值区内(左侧)",
+    "CONFIRMED": "右侧确认", "TREND": "右侧持仓(跟踪20日线)",
+    "NO_DATA": "数据不足",
+}
+
+
+def yang_zhang(price_data, window=30, trading_periods=252):
+    """30d realized vol — copied unchanged from earnings-iv-scanner."""
+    log_ho = (price_data["High"] / price_data["Open"]).apply(np.log)
+    log_lo = (price_data["Low"] / price_data["Open"]).apply(np.log)
+    log_co = (price_data["Close"] / price_data["Open"]).apply(np.log)
+    log_oc = (price_data["Open"] / price_data["Close"].shift(1)).apply(np.log)
+    log_cc = (price_data["Close"] / price_data["Close"].shift(1)).apply(np.log)
+    rs = log_ho * (log_ho - log_co) + log_lo * (log_lo - log_co)
+    close_vol = (log_cc ** 2).rolling(window).sum() / (window - 1.0)
+    open_vol = (log_oc ** 2).rolling(window).sum() / (window - 1.0)
+    window_rs = rs.rolling(window).sum() / (window - 1.0)
+    k = 0.34 / (1.34 + ((window + 1) / (window - 1)))
+    result = (open_vol + k * close_vol + (1 - k) * window_rs).apply(np.sqrt) \
+        * math.sqrt(trading_periods)
+    return float(result.iloc[-1])
+
+
+# --------------------------------------------------------------------------
+# Options math (BS bits from forward-volatility-calculator)
+# --------------------------------------------------------------------------
+
+def _norm_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def bs_price(S, K, T, r, sigma, is_call):
+    if sigma <= 0 or T <= 0:
+        fwd = S - K * math.exp(-r * T)
+        return max(fwd, 0.0) if is_call else max(-fwd, 0.0)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    if is_call:
+        return S * _norm_cdf(d1) - K * math.exp(-r * T) * _norm_cdf(d2)
+    return K * math.exp(-r * T) * _norm_cdf(-d2) - S * _norm_cdf(-d1)
+
+
+def bs_delta(S, K, T, r, sigma, is_call):
+    if sigma <= 0 or T <= 0:
+        itm = S > K if is_call else S < K
+        return (1.0 if itm else 0.0) if is_call else (-1.0 if itm else 0.0)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
+    return _norm_cdf(d1) if is_call else _norm_cdf(d1) - 1.0
+
+
+def implied_vol(price, S, K, T, r, is_call, lo=1e-3, hi=5.0):
+    if price <= bs_price(S, K, T, r, lo, is_call) + 1e-8:
+        return None
+    if price >= bs_price(S, K, T, r, hi, is_call):
+        return None
+    for _ in range(100):
+        mid = (lo + hi) / 2.0
+        if bs_price(S, K, T, r, mid, is_call) < price:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0
+
+
+def sixteen_rule_distance(iv: float, dte: int, mult: float) -> float:
+    """恐慌期 CSP 距离 (fraction of spot): mult x IV/16 x sqrt(DTE).
+    iv is a decimal (0.45 = 45%): 0.45/16 = daily move fraction."""
+    return mult * (iv / 16.0) * math.sqrt(dte)
+
+
+def csp_annualized(mid: float, strike: float, dte: int) -> float:
+    """moomoo 口径: 权利金/(行权价-权利金) x 365/DTE, per share."""
+    return mid / (strike - mid) * 365.0 / max(dte, 1) * 100
+
+
+def _mark(row, stale_cutoff):
+    """Usable option price: live bid/ask mid, else a recent last trade."""
+    bid = float(row.get("bid") or 0)
+    ask = float(row.get("ask") or 0)
+    if bid > 0 and ask > 0:
+        return (bid + ask) / 2.0, "live"
+    last = float(row.get("lastPrice") or 0)
+    traded = row.get("lastTradeDate")
+    if last > 0 and traded is not None and traded.to_pydatetime() >= stale_cutoff:
+        return last, "last"
+    return None, None
+
+
+def _stale_cutoff():
+    return datetime.now(timezone.utc) - timedelta(days=MAX_STALE_TRADE_DAYS)
+
+
+def _oi(row) -> int:
+    """openInterest as int; Yahoo omits the field for some contracts (NaN)."""
+    oi = row.get("openInterest")
+    return 0 if oi is None or pd.isna(oi) else int(oi)
+
+
+def contract_iv(row, mid, spot, T, is_call):
+    """Yahoo's impliedVolatility column when sane, else invert from mid."""
+    iv = row.get("impliedVolatility")
+    if iv is not None and not pd.isna(iv) and 0.01 < float(iv) < 5.0:
+        return float(iv)
+    if mid is not None:
+        return implied_vol(mid, spot, float(row["strike"]), T, RATE, is_call)
+    return None
+
+
+class ChainCache:
+    """One yf.Ticker per symbol; option chains fetched at most once."""
+
+    def __init__(self, symbol: str):
+        self.tk = yf.Ticker(symbol)
+        self._chains: dict[str, object] = {}
+        self._expiries: list[str] | None = None
+
+    def expiries(self) -> list[tuple[str, int]]:
+        if self._expiries is None:
+            self._expiries = list(self.tk.options)
+        today = datetime.now(ET).date()
+        out = []
+        for exp in self._expiries:
+            dte = (datetime.strptime(exp, "%Y-%m-%d").date() - today).days
+            if dte > 0:
+                out.append((exp, dte))
+        return sorted(out, key=lambda x: x[1])
+
+    def chain(self, exp: str):
+        if exp not in self._chains:
+            self._chains[exp] = self.tk.option_chain(exp)
+        return self._chains[exp]
+
+
+def atm_iv30(cc: ChainCache, spot: float) -> float | None:
+    """ATM IV interpolated to 30 DTE from the two bracketing expiries
+    (nearest expiry alone when only one side exists in 7..90 DTE)."""
+    usable = [(e, d) for e, d in cc.expiries() if 7 <= d <= 90]
+    if not usable:
+        return None
+    below = [x for x in usable if x[1] <= 30]
+    above = [x for x in usable if x[1] > 30]
+    picks = ([below[-1]] if below else []) + ([above[0]] if above else [])
+    pts = []
+    cutoff = _stale_cutoff()
+    for exp, dte in picks:
+        ch = cc.chain(exp)
+        T = dte / 365.0
+        ivs = []
+        for df, is_call in ((ch.calls, True), (ch.puts, False)):
+            if df is None or df.empty:
+                continue
+            idx = (df["strike"] - spot).abs().idxmin()
+            row = df.loc[idx]
+            mid, _src = _mark(row, cutoff)
+            iv = contract_iv(row, mid, spot, T, is_call)
+            if iv:
+                ivs.append(iv)
+        if ivs:
+            pts.append((dte, sum(ivs) / len(ivs)))
+    if not pts:
+        return None
+    if len(pts) == 1:
+        return pts[0][1]
+    (d1, v1), (d2, v2) = pts
+    if d1 == d2:
+        return (v1 + v2) / 2
+    return v1 + (v2 - v1) * (30 - d1) / (d2 - d1)
+
+
+# --------------------------------------------------------------------------
+# Tickets
+# --------------------------------------------------------------------------
+
+def _put_candidates(cc: ChainCache, exp: str, dte: int, spot: float):
+    ch = cc.chain(exp)
+    puts = ch.puts
+    if puts is None or puts.empty:
+        return []
+    cutoff = _stale_cutoff()
+    out = []
+    T = dte / 365.0
+    for _, row in puts[puts["strike"] < spot].iterrows():
+        mid, src = _mark(row, cutoff)
+        if mid is None:
+            continue
+        strike = float(row["strike"])
+        iv = contract_iv(row, mid, spot, T, is_call=False)
+        if iv is None:
+            continue
+        delta = abs(bs_delta(spot, strike, T, RATE, iv, is_call=False))
+        bid, ask = float(row.get("bid") or 0), float(row.get("ask") or 0)
+        out.append({
+            "exp": exp, "dte": dte, "strike": strike, "mid": mid, "src": src,
+            "iv": iv, "delta": delta,
+            "oi": _oi(row),
+            "spread_pct": (ask - bid) / mid * 100 if bid > 0 and ask > 0 else None,
+        })
+    return out
+
+
+def _finish_csp(c: dict, spot: float, s: dict, zone, panic: bool,
+                extra_notes: list[str]) -> dict:
+    c["annualized_pct"] = csp_annualized(c["mid"], c["strike"], c["dte"])
+    c["cushion_pct"] = (spot - c["strike"]) / spot * 100
+    c["breakeven"] = c["strike"] - c["mid"]
+    c["panic_mode"] = panic
+    notes = list(extra_notes)
+    if c["mid"] < s["csp_min_mid"]:
+        notes.append(f"权利金 {c['mid']:.2f} < {s['csp_min_mid']:.2f} — 手续费占比过高, 仅供参考")
+    if c["oi"] < s["csp_min_oi"]:
+        notes.append(f"OI {c['oi']} < {s['csp_min_oi']} — 流动性弱")
+    if c["spread_pct"] is not None and c["spread_pct"] > 10:
+        notes.append(f"价差 {c['spread_pct']:.0f}% mid — 挂 mid 磨, 别市价")
+    if c["src"] == "last":
+        notes.append("盘口不可用, 按最近成交价估算 — 下单前实查")
+    if zone is not None and c["strike"] > zone[1]:
+        notes.append(f"行权价高于价值区上沿 {zone[1]:g} — 被行权成本不在接货区, 可下移到 <= {zone[1]:g}")
+    c["notes"] = notes
+    return c
+
+
+def csp_ticket(cc: ChainCache, spot: float, iv30: float | None,
+               earnings_iso: str, stage: str, zone, s: dict) -> dict | None:
+    """One cash-secured-put suggestion. Normal: 12-31 DTE, delta 0.10-0.15.
+    Panic (stage 1): weekly, strike at the 16-rule distance. Expiries that
+    contain an earnings date are excluded outright (short 不跨财报)."""
+    panic = stage.startswith("STAGE1")
+    lo, hi = s["csp_dte_panic"] if panic else s["csp_dte_normal"]
+    window = [(e, d) for e, d in cc.expiries() if lo <= d <= hi]
+    blocked = []
+    if earnings_iso:
+        blocked = [e for e, _d in window if earnings_iso <= e]
+        window = [(e, d) for e, d in window if earnings_iso > e]
+    if not window:
+        if blocked:
+            return {"skip_reason": f"窗口内到期日都在财报 {earnings_iso} 之后 — 跳过 (short 不跨财报)"}
+        return {"skip_reason": f"无 {lo}-{hi} DTE 到期日"}
+    notes = []
+    if earnings_iso is None:
+        notes.append("财报日期获取失败 — 下单前自查该到期日是否跨财报")
+    if blocked:
+        notes.append(f"财报 {earnings_iso}: 已剔除跨财报到期日 {', '.join(blocked)}")
+
+    target_dte = 7 if panic else 21
+    exp, dte = min(window, key=lambda x: abs(x[1] - target_dte))
+    cands = _put_candidates(cc, exp, dte, spot)
+    if not cands:
+        return {"skip_reason": f"{exp} put 链无可用报价 (市场关闭/流动性)"}
+
+    # 16法则参考 IV 用截断前的完整链 — zone 截断后只剩深 OTM, put skew 会
+    # 把参考 IV 系统性抬高 (spot 远在接货带上方时 near_atm 取空, 距离虚增)
+    full_chain = cands
+
+    # 行权价 = 愿意接货的价位, 是硬约束不是警告 — 接货带上沿以上的 put
+    # 不在考虑范围 (剧本 ORCL 教训)
+    if zone is not None:
+        capped = [c for c in cands if c["strike"] <= zone[1]]
+        if not capped:
+            return {"skip_reason": f"{exp} 接货带上沿 {zone[1]:g} 以下无可用行权价"}
+        cands = capped
+
+    if panic:
+        # 纪律: 距离以所卖周权链上自身的 IV 为准 — 倒挂期 30 天口径系统性
+        # 低估周权 IV, 会把行权价放得太近 (剧本: IVR/IVP 30天口径会骗人)
+        near_atm = [c["iv"] for c in full_chain if c["strike"] >= spot * 0.9]
+        weekly_iv = float(np.median(near_atm or [c["iv"] for c in full_chain]))
+        ref_iv = max(iv30 or 0.0, weekly_iv)
+        dist = sixteen_rule_distance(ref_iv, dte, s["sixteen_rule_mult"])
+        max_strike = spot * (1 - dist)
+        ok = [c for c in cands if c["strike"] <= max_strike]
+        if not ok:
+            return {"skip_reason": f"16法则距离 {dist * 100:.1f}% 外无可用行权价"}
+        pick = max(ok, key=lambda c: c["strike"])
+        notes.append(f"恐慌模式: 16法则距离 {dist * 100:.1f}% (mult {s['sixteen_rule_mult']}, iv {ref_iv * 100:.0f}%)")
+    else:
+        band = [c for c in cands
+                if s["csp_delta_lo"] <= c["delta"] <= s["csp_delta_hi"]]
+        pool = band or cands
+        # 年化下限先筛后选: 年化随 delta 单调升, 0.12 目标常差一档落在线下 —
+        # 带内有达标行权价时不该整票跳过
+        ok = [c for c in pool
+              if csp_annualized(c["mid"], c["strike"], c["dte"])
+              >= s["csp_min_annualized"] and c["mid"] >= s["csp_min_mid"]]
+        pool = ok or pool
+        liquid = [c for c in pool if c["oi"] >= s["csp_min_oi"]]
+        pick = min(liquid or pool,
+                   key=lambda c: abs(c["delta"] - s["csp_delta_target"]))
+        if not band:
+            notes.append(f"目标 delta 带 {s['csp_delta_lo']:.2f}-"
+                         f"{s['csp_delta_hi']:.2f} 内无行权价 — 取最接近的 "
+                         f"(delta {pick['delta']:.2f})")
+    ticket = _finish_csp(dict(pick), spot, s, zone, panic, notes)
+    # 年化下限: IV 低/离接货价远 => 权利金太薄, 卖方三需求不齐, 不出票。
+    # 恐慌档同样适用 — STAGE1 是市场级旗标, 浅倒挂里低 IV 标的的周权照样薄;
+    # 真恐慌时周权 IV 全曲线最肥 (剧本), 年化天然过线, 此门不拦
+    if (ticket["annualized_pct"] < s["csp_min_annualized"]
+            or ticket["mid"] < s["csp_min_mid"]):
+        return {"skip_reason": (
+            f"接货档权利金太薄: {exp} {ticket['strike']:g}P @ ~{ticket['mid']:.2f} "
+            f"年化仅 {ticket['annualized_pct']:.1f}% (< {s['csp_min_annualized']:g}%) — "
+            "IV 低/距离远, 剧本: 左侧改正股限价单或等 IV 回升再卖")}
+    return ticket
+
+
+def leap_ticket(cc: ChainCache, spot: float, cfg: dict,
+                earnings_iso: str | None, s: dict) -> dict | None:
+    """Deep-ITM LEAP call per the playbook: 450-1100 DTE (Jan cycle
+    preferred), delta 0.70-0.80 index / 0.75-0.85 single names, OI >= 500,
+    spread <= 5% of mid, extrinsic <= 40% of premium. Earnings inside the
+    buffer is a hard gate (剧本: 默认财报后入场), not a footnote."""
+    days_to_earnings = None
+    if earnings_iso:
+        days_to_earnings = (date.fromisoformat(earnings_iso)
+                            - datetime.now(ET).date()).days
+        if 0 <= days_to_earnings <= s["leap_earnings_buffer_days"]:
+            return {"skip_reason": (
+                f"财报 {earnings_iso} 就在 {days_to_earnings} 天后 — 财报前 <="
+                f"{s['leap_earnings_buffer_days']} 天不进 LEAP; "
+                "crush 落地即解禁 (通常隔天), 不是再等两周")}
+    lo, hi = s["leap_dte"]
+    cands_exp = [(e, d) for e, d in cc.expiries() if lo <= d <= hi]
+    if not cands_exp:
+        return {"skip_reason": f"无 {lo}-{hi} DTE 到期日 (标的可能没有 LEAP)"}
+    jan = [(e, d) for e, d in cands_exp if e[5:7] == "01"]
+    pool = jan or cands_exp
+    exp, dte = min(pool, key=lambda x: abs(x[1] - 730))
+
+    dlo, dhi = (s["leap_delta_index"] if cfg["kind"] == "index"
+                else s["leap_delta_stock"])
+    target = (dlo + dhi) / 2
+    ch = cc.chain(exp)
+    calls = ch.calls
+    if calls is None or calls.empty:
+        return {"skip_reason": f"{exp} call 链为空"}
+    cutoff = _stale_cutoff()
+    T = dte / 365.0
+    rows = []
+    for _, row in calls[calls["strike"] < spot].iterrows():
+        mid, src = _mark(row, cutoff)
+        if mid is None:
+            continue
+        strike = float(row["strike"])
+        iv = contract_iv(row, mid, spot, T, is_call=True)
+        if iv is None:
+            continue
+        delta = bs_delta(spot, strike, T, RATE, iv, is_call=True)
+        intrinsic = max(spot - strike, 0.0)
+        extrinsic = max(mid - intrinsic, 0.0)
+        bid, ask = float(row.get("bid") or 0), float(row.get("ask") or 0)
+        rows.append({
+            "exp": exp, "dte": dte, "strike": strike, "mid": mid, "src": src,
+            "iv": iv, "delta": delta,
+            "oi": _oi(row),
+            "spread_pct": (ask - bid) / mid * 100 if bid > 0 and ask > 0 else None,
+            "extrinsic_pct": extrinsic / mid * 100 if mid > 0 else None,
+            "lam": spot * delta / mid if mid > 0 else None,
+            "breakeven": strike + mid,
+            "insurance_pct_yr": extrinsic / spot / (dte / 365.0) * 100,
+        })
+    if not rows:
+        return {"skip_reason": f"{exp} 无可用 ITM call 报价"}
+
+    def passes(c):
+        return (dlo <= c["delta"] <= dhi and c["oi"] >= s["leap_min_oi"]
+                and (c["extrinsic_pct"] is None
+                     or c["extrinsic_pct"] <= s["leap_max_extrinsic_pct"])
+                and (c["spread_pct"] is None
+                     or c["spread_pct"] <= s["leap_max_spread_pct"]))
+
+    clean = [c for c in rows if passes(c)]
+    pick = min(clean or rows, key=lambda c: abs(c["delta"] - target))
+    notes = []
+    if not clean:
+        notes.append("无合约同时满足 delta带/OI/价差/外在价值全部过滤 — 取最接近目标 delta 的, 自查旗标")
+    if pick["oi"] < s["leap_min_oi"]:
+        notes.append(f"OI {pick['oi']} < {s['leap_min_oi']}")
+    if pick["spread_pct"] is not None and pick["spread_pct"] > s["leap_max_spread_pct"]:
+        notes.append(f"价差 {pick['spread_pct']:.1f}% > {s['leap_max_spread_pct']}% — 挂 mid 磨或换行权价")
+    if pick["extrinsic_pct"] is not None and pick["extrinsic_pct"] > s["leap_max_extrinsic_pct"]:
+        notes.append(f"外在价值 {pick['extrinsic_pct']:.0f}% > {s['leap_max_extrinsic_pct']}% — 深度不够")
+    if pick["src"] == "last":
+        notes.append("盘口不可用, 按最近成交价估算 — 下单前实查")
+    if days_to_earnings is not None and s["leap_earnings_buffer_days"] \
+            < days_to_earnings <= s["leap_earnings_note_days"]:
+        notes.append(f"财报 {earnings_iso} 在 {days_to_earnings} 天后, 持有期内 — "
+                     "想完全避事件可等 crush 后进")
+    if earnings_iso is None:
+        notes.append("财报日期获取失败 — 自查 2 周内无二元事件 (财报/发布会/FDA)")
+    if cfg["high_beta"]:
+        notes.append("高 beta 个股 — 剧本: 仓位折半 + 财报后入场")
+    notes.append("仓位: 单次事件权利金 <= 组合 3-5%; 剩 6-9 个月 roll; delta>0.9 roll up 提现")
+    pick = dict(pick)
+    pick["notes"] = notes
+    return pick
+
+
+def stock_ladder(zone, s: dict) -> list[float]:
+    """正股分批档位: ① 接货带上沿 ② 下沿 ③ 恐慌档 (下沿再打折) —
+    末档留给真正的恐慌价; 间距是否递增取决于区间宽度, render 侧核对."""
+    lo, hi = zone
+    return [hi, lo, round(lo * (1 - s["ladder_panic_discount"]), 2)]
+
+
+def call_spread_ticket(cc: ChainCache, spot: float, s: dict) -> dict:
+    """突破后首次回踩的 3-6 个月 call spread (剧本工具切换表):
+    买 ~0.60 delta / 卖 ~0.30 delta 同到期."""
+    lo, hi = s["spread_dte"]
+    exps = [(e, d) for e, d in cc.expiries() if lo <= d <= hi]
+    if not exps:
+        return {"skip_reason": f"无 {lo}-{hi} DTE 到期日"}
+    exp, dte = min(exps, key=lambda x: abs(x[1] - 135))
+    ch = cc.chain(exp)
+    calls = ch.calls
+    if calls is None or calls.empty:
+        return {"skip_reason": f"{exp} call 链为空"}
+    cutoff = _stale_cutoff()
+    T = dte / 365.0
+    rows = []
+    for _, row in calls.iterrows():
+        mid, src = _mark(row, cutoff)
+        if mid is None:
+            continue
+        strike = float(row["strike"])
+        iv = contract_iv(row, mid, spot, T, is_call=True)
+        if iv is None:
+            continue
+        rows.append({"strike": strike, "mid": mid, "src": src, "iv": iv,
+                     "delta": bs_delta(spot, strike, T, RATE, iv, True),
+                     "oi": _oi(row)})
+    if len(rows) < 2:
+        return {"skip_reason": f"{exp} 可用报价不足"}
+    long_leg = min(rows, key=lambda c: abs(c["delta"] - s["spread_long_delta"]))
+    shorts = [c for c in rows if c["strike"] > long_leg["strike"]]
+    if not shorts:
+        return {"skip_reason": "长腿上方无行权价"}
+    short_leg = min(shorts, key=lambda c: abs(c["delta"] - s["spread_short_delta"]))
+    debit = long_leg["mid"] - short_leg["mid"]
+    width = short_leg["strike"] - long_leg["strike"]
+    if debit <= 0 or width <= 0:
+        return {"skip_reason": "价差腿报价异常 (debit <= 0)"}
+    stale = "last" in (long_leg["src"], short_leg["src"])
+    stale_hint = "有腿无盘口按旧成交价估算, " if stale else ""
+    # 旧成交价 mark 会把 debit 顶到甚至超过宽度 — 数学上必亏/赔率失真, 不出票
+    if debit >= width:
+        return {"skip_reason": (f"净支出 {debit:.2f} >= 宽度 {width:g}, "
+                                f"最大盈利为负 — {stale_hint}报价失真")}
+    rr = (width - debit) / debit
+    if rr < s["spread_min_reward_risk"]:
+        return {"skip_reason": (
+            f"赔率 {rr:.2f}:1 < {s['spread_min_reward_risk']:g}:1 — "
+            f"{stale_hint}报价可疑, 下单前实查盘口再手动构造")}
+    notes = []
+    if abs(long_leg["delta"] - s["spread_long_delta"]) > 0.10 \
+            or abs(short_leg["delta"] - s["spread_short_delta"]) > 0.10:
+        notes.append(
+            f"腿 delta {long_leg['delta']:.2f}/{short_leg['delta']:.2f} 偏离目标 "
+            f"{s['spread_long_delta']:.2f}/{s['spread_short_delta']:.2f} — "
+            "链稀疏, 结构已变形, 下单前自查")
+    if min(long_leg["oi"], short_leg["oi"]) < s["csp_min_oi"]:
+        notes.append(f"OI {long_leg['oi']}/{short_leg['oi']} < "
+                     f"{s['csp_min_oi']} — 流动性弱, 挂 mid 磨")
+    return {
+        "exp": exp, "dte": dte,
+        "long_strike": long_leg["strike"], "long_mid": long_leg["mid"],
+        "long_delta": long_leg["delta"], "long_oi": long_leg["oi"],
+        "short_strike": short_leg["strike"], "short_mid": short_leg["mid"],
+        "short_delta": short_leg["delta"], "short_oi": short_leg["oi"],
+        "debit": debit, "width": width, "max_profit": width - debit,
+        "reward_risk": rr,
+        "breakeven": long_leg["strike"] + debit,
+        "notes": notes,
+        "src": "last" if stale else "live",
+    }
+
+
+def next_earnings(tk) -> str | None:
+    """Next earnings date as ISO string; '' = fetched fine, none upcoming;
+    None = lookup FAILED — callers must warn, not treat as no-earnings.
+    yfinance swallows HTTP errors and hands back calendar == {}, so an
+    empty/non-dict calendar counts as failed (ETFs legitimately 404 — the
+    caller downgrades None to '' for kind etf/index)."""
+    try:
+        cal = tk.calendar
+        if not isinstance(cal, dict) or not cal:
+            return None
+        dates = cal.get("Earnings Date")
+        future = [d for d in dates or [] if d >= date.today()]
+        return min(future).isoformat() if future else ""
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------------------
+# Per-ticker analysis
+# --------------------------------------------------------------------------
+
+def technical_snapshot(hist: pd.DataFrame, s: dict) -> dict | None:
+    """Levels + signals from daily OHLCV (today's bar may be partial).
+
+    新上市标的降级模式: 25-60 根日线时价格/20日线/量比/价值区照算,
+    右侧确认自动关闭 (confirmation 内部的长度门各自兜底 — had_pullback
+    需要 61 根, 不满足时 confirmed 恒为 False)。<25 根才整体放弃。"""
+    hist = hist.dropna(subset=["Close"])
+    if len(hist) < 25:
+        return None
+    close, high, low, vol = hist["Close"], hist["High"], hist["Low"], hist["Volume"]
+    last = float(close.iloc[-1])
+    prev = float(close.iloc[-2])
+    sma20 = float(close.rolling(20).mean().iloc[-1])
+    sma200 = float(close.rolling(200).mean().iloc[-1]) if len(close) >= 200 else None
+    vol20 = float(vol.rolling(20).mean().shift(1).iloc[-1])
+    vol_ratio = float(vol.iloc[-1]) / vol20 if vol20 > 0 else 0.0
+    sig = confirmation(close, high, low, vol_ratio, s["volume_surge"])
+    hi52 = float(close.iloc[-252:].max())
+    low_today = float(low.iloc[-1])
+    return {
+        "bars": len(hist),
+        # 当日下探过20日线但收盘守住 — 回踩提示的原料
+        "touched_20dma": low_today <= sma20 <= last,
+        "low_today": low_today,
+        "close": last, "prev_close": prev,
+        "change_pct": (last / prev - 1) * 100,
+        "gap_pct": (float(hist["Open"].iloc[-1]) / prev - 1) * 100,
+        "sma20": sma20, "sma200": sma200,
+        "vs_sma20_pct": (last / sma20 - 1) * 100,
+        "vs_sma200_pct": (last / sma200 - 1) * 100 if sma200 else None,
+        "vol_ratio": vol_ratio,
+        "from_52w_high_pct": (last / hi52 - 1) * 100,
+        "signals": sig,
+        "rv30": yang_zhang(hist) if len(hist) >= 40 else None,
+    }
+
+
+def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
+                   prev_state: dict, regime: dict, s: dict, mode: str,
+                   fetch_options: bool) -> dict:
+    r = {"symbol": sym, "cfg": cfg, "state": "NO_DATA", "notes": [],
+         "tech": None, "earnings": "", "iv30": None, "self_ivp": None,
+         "csp": None, "leap": None, "spread": None, "ladder": None,
+         "error": None}
+    try:
+        tech = technical_snapshot(hist, s) if hist is not None else None
+        if tech is None:
+            r["error"] = "insufficient price history"
+            return r
+        r["tech"] = tech
+        zone = cfg["value_zone"]
+        prev = prev_state.get("state", "UPTREND")
+        state, notes = next_state(
+            prev, close=tech["close"], sma20=tech["sma20"],
+            confirmed=tech["signals"]["confirmed"], zone=zone,
+            near_pct=s["near_zone_pct"])
+        r["state"], r["prev_state"] = state, prev
+        r["notes"].extend(notes)
+        if tech["bars"] < 61:
+            r["notes"].append(
+                f"数据仅 {tech['bars']} 个交易日 (Yahoo 起点晚/新上市) — "
+                "右侧确认需 61 根日线, 当前只看价格/20日线/价值区")
+        if zone is not None:
+            r["zone_dist_pct"] = (tech["close"] / zone[1] - 1) * 100
+
+        if not fetch_options:
+            return r
+
+        # 首次回踩 (收盘口径, 每轮确认只提示一次): 剧本首选入场/加仓点
+        # 倒挂期不提示也不烧一次性标记 (纪律: 阶段1不加右侧仓) — 解除后的
+        # 首次回踩才算这轮的"首次"
+        if state == "TREND" and tech["touched_20dma"] \
+                and not regime["stage"].startswith("STAGE1") \
+                and not prev_state.get("retested"):
+            r["retest"] = True
+            how = "票见下" if cfg["options"] else "无期权链 — 按股价操作"
+            r["notes"].append("首次回踩20日线不破 — 剧本首选入场/加仓点 "
+                              f"(3-6个月 call spread, {how})")
+
+        # 趋势中段工具切换 (剧本: 趋势确立、**波动收敛**后 -> 2x/PMCC 加仓)
+        # 波动收敛门: 环境止损 (VIX持续>25 / 破200日线) 成立时不得建议进场
+        vol_contracted = regime["vix"] < s["two_x_vix_max"] and (
+            tech["sma200"] is None or tech["close"] > tech["sma200"])
+        if state == "TREND" and regime["stage"] == "NORMAL" \
+                and vol_contracted and prev_state.get("since"):
+            days_in = (datetime.now(ET).date()
+                       - date.fromisoformat(prev_state["since"])).days
+            if days_in >= s["trend_middle_days"]:
+                two_x = (f"2x ETF {cfg['two_x']} / " if cfg.get("two_x") else "")
+                r["notes"].append(
+                    f"趋势中段 (右侧已 {days_in} 天): 剧本工具切换 → {two_x}"
+                    "PMCC 金字塔加仓 — 绝不摊低成本; 硬止损: 破20日线无条件; "
+                    "环境止损: 指数破200日线 / VIX 持续>25 / 倒挂重现即清")
+
+        # 正股分批档位只要 zone, 不依赖期权链 — options=false 的标的也要出
+        in_or_near_zone = zone is not None \
+            and tech["close"] <= zone[1] * (1 + s["near_zone_pct"] / 100)
+        if in_or_near_zone:
+            r["ladder"] = stock_ladder(zone, s)
+
+        cc = ChainCache(sym)
+        r["earnings"] = next_earnings(cc.tk)
+        if r["earnings"] is None and cfg["kind"] in ("etf", "index"):
+            r["earnings"] = ""  # ETF/指数无财报 — 404 是常态不是失败
+        if not cfg["options"]:
+            return r
+        try:
+            r["iv30"] = atm_iv30(cc, tech["close"])
+        except Exception as e:
+            r["notes"].append(f"iv30 获取失败: {type(e).__name__}")
+
+        stage = regime["stage"]
+        # CSP = 在愿意接货的价位卖 put — 没设价值区就没有接货价, 不出票
+        # (剧本 ORCL 教训: 不想接货的 put 本来就不该卖)。与状态标签解耦:
+        # 价格在/近价值区就出, 趋势上方也一样 — 接货限价单与趋势方向无关。
+        want_csp = zone is not None and (
+            in_or_near_zone or stage.startswith("STAGE1"))
+        if zone is None and stage.startswith("STAGE1"):
+            r["notes"].append("倒挂期但未设价值区 — 剧本: 不想接货的 put 不该卖; "
+                              "在 watchlist.toml 设好 value_zone 才出 CSP 票")
+
+        fresh_confirm = state == "CONFIRMED" and prev not in ("CONFIRMED", "TREND")
+        if stage == "STAGE2_WINDOW":
+            # 阶段2: 倒挂解除 + 价格确认二选一 (收上20日线 / 不再新低, 无量能
+            # 条件) → LEAP。历史典型序列是价格先确认、倒挂后解除, 所以不能
+            # 依赖 CONFIRMED 的一次性转换 — 以 episode 结束日为 key, 每个
+            # 解除窗口重挂一次。
+            ep_end = str(regime["last_episode"]["end"].date())
+            price_ok = tech["close"] > tech["sma20"] \
+                or tech["signals"]["no_new_low"]
+            want_leap = price_ok and prev_state.get("leap_window") != ep_end
+            if want_leap:
+                r["leap_window"] = ep_end
+                r["notes"].append("阶段2解除窗口 — buy the relief: 价格条件"
+                                  "(收上20日线/不再新低 二选一)已满足; 工具: "
+                                  "deep ITM LEAP / risk reversal (卖put融资买call)")
+        else:
+            want_leap = fresh_confirm and stage == "NORMAL"
+        if fresh_confirm and stage.startswith("STAGE1"):
+            r["notes"].append("右侧信号出现但倒挂未解除 — 剧本: 倒挂持续期间不加右侧仓, 等阶段2")
+
+        if want_csp:
+            r["csp"] = csp_ticket(cc, tech["close"], r["iv30"],
+                                  r["earnings"], stage, zone, s)
+        if want_leap:
+            r["leap"] = leap_ticket(cc, tech["close"], cfg, r["earnings"], s)
+        if r.get("retest"):  # STAGE1 已在回踩检测处拦掉
+            r["spread"] = call_spread_ticket(cc, tech["close"], s)
+            if "skip_reason" not in r["spread"]:
+                # 剧本工具切换表: 止损放回踩低点下方
+                r["spread"]["retest_low"] = tech["low_today"]
+    except Exception as e:
+        r["error"] = f"{type(e).__name__}: {e}"
+    return r
+
+
+# --------------------------------------------------------------------------
+# IV history (self-built percentile — moomoo IVP stays authoritative)
+# --------------------------------------------------------------------------
+
+def load_iv_history() -> pd.DataFrame:
+    if IV_HISTORY.exists():
+        return pd.read_csv(IV_HISTORY)
+    return pd.DataFrame(columns=["date", "symbol", "iv30", "rv30"])
+
+
+def append_iv_history(results: list[dict], scan_date: str) -> pd.DataFrame:
+    df = load_iv_history()
+    rows = []
+    for r in results:
+        if r["iv30"] is None:
+            continue
+        dup = ((df["date"] == scan_date) & (df["symbol"] == r["symbol"])).any()
+        if not dup:
+            rv = r["tech"]["rv30"] if r["tech"] else None
+            rows.append({"date": scan_date, "symbol": r["symbol"],
+                         "iv30": round(r["iv30"], 4),
+                         "rv30": round(rv, 4) if rv else None})
+    if rows:
+        df = pd.concat([df, pd.DataFrame(rows)], ignore_index=True)
+        DATA.mkdir(exist_ok=True)
+        df.to_csv(IV_HISTORY, index=False)
+    return df
+
+
+def self_ivp(df: pd.DataFrame, symbol: str, iv30: float) -> float | None:
+    hist = df[(df["symbol"] == symbol) & df["iv30"].notna()]["iv30"]
+    if len(hist) < 60:
+        return None
+    return float((hist < iv30).mean() * 100)
+
+
+# --------------------------------------------------------------------------
+# Reports
+# --------------------------------------------------------------------------
+
+def fmt(x, spec=".2f", suffix=""):
+    if x is None or (isinstance(x, float) and math.isnan(x)):
+        return "—"
+    return f"{x:{spec}}{suffix}"
+
+
+# 概览表/详情段排序: 可操作的在上, 观望垫底 (止损提示额外置顶)
+STATE_ORDER = {"CONFIRMED": 0, "LEFT_ZONE": 1, "NEAR_ZONE": 2, "TREND": 3,
+               "PULLBACK": 4, "UPTREND": 5, "NO_DATA": 6}
+
+
+def _has_stop(r) -> bool:
+    return any("止损触发" in n for n in r["notes"])
+
+
+def by_actionability(results: list[dict]) -> list[dict]:
+    return sorted(results, key=lambda r: (0 if _has_stop(r) else 1,
+                                          STATE_ORDER.get(r["state"], 9)))
+
+
+def action_label(r: dict, ivp) -> str:
+    """概览表"操作"列的短词 — 细节永远在下方票据里, 这里只指路."""
+    if r["error"] or r["tech"] is None:
+        return "—"
+    if _has_stop(r):
+        return "⚠️止损"
+    leap, csp = r["leap"], r["csp"]
+    if leap and "skip_reason" not in leap:
+        return "IV高·spread" if ivp is not None and ivp > 60 else "LEAP票👇"
+    if leap and "skip_reason" in leap:
+        return "等财报后" if "财报" in leap["skip_reason"] else "LEAP被拦"
+    if any("等阶段2" in n for n in r["notes"]):
+        return "等阶段2"
+    if csp and "skip_reason" not in csp:
+        return "CSP票👇"
+    if csp and "skip_reason" in csp:
+        return "CSP被拦"
+    spread = r.get("spread")
+    if spread and "skip_reason" not in spread:
+        return "spread票👇"
+    if r.get("retest"):
+        return "回踩中👀"
+    state = r["state"]
+    if state == "TREND":
+        return "持有·跟20日线"
+    if state == "CONFIRMED":
+        return "确认·看下文"
+    if r.get("ladder") and not csp:
+        return "分批档👇"  # 无期权链但在接货带内 — 正股分批是唯一工具
+    zone = r["cfg"]["value_zone"]
+    if zone is not None and r["tech"]["close"] > zone[1]:
+        return "等回落入区"  # 设了接货带, 现价还在上方 — 等价格回来
+    if state in ("LEFT_ZONE", "NEAR_ZONE", "PULLBACK") and zone is None:
+        return "设区间"  # 设了才解锁左侧工具 (CSP 票 / 正股分批档)
+    return "别追·等回调"  # 趋势里无入场事件: 空仓不追高, 持有继续拿
+
+
+def action_block(results: list[dict], ivdf) -> list[str]:
+    """报告最顶上的 3-6 行 — 手机上扫一眼就知道今天要不要动手."""
+    lines = ["## 今日动作", ""]
+    items: list[tuple[str, str]] = []
+    for r in by_actionability(results):
+        sym = r["symbol"]
+        if _has_stop(r):
+            items.append((sym, f"- ⚠️ **{sym}** 右侧止损: 收盘跌破20日线 — "
+                               "凸性档减半 / 结构破清仓"))
+        leap, csp = r["leap"], r["csp"]
+        if leap and "skip_reason" not in leap:
+            ivp = self_ivp(ivdf, sym, r["iv30"]) if r["iv30"] else None
+            if ivp is not None and ivp > 60:
+                items.append((sym, f"- 🟡 **{sym}** 右侧确认但自建IVP "
+                                   f"{ivp:.0f}>60 — 改 spread/PMCC (见下)"))
+            else:
+                items.append((sym, f"- 🟢 **{sym}** LEAP: BUY {leap['exp']} "
+                                   f"{leap['strike']:g}C @ ~{leap['mid']:.2f} "
+                                   f"(delta {leap['delta']:.2f}, 详见下)"))
+        elif leap:
+            items.append((sym, f"- ⏸ **{sym}** {leap['skip_reason']}"))
+        if csp and "skip_reason" not in csp:
+            items.append((sym, f"- 🔵 **{sym}** CSP: SELL {csp['exp']} "
+                               f"{csp['strike']:g}P @ ~{csp['mid']:.2f} "
+                               f"(delta {csp['delta']:.2f}, 年化 "
+                               f"~{csp['annualized_pct']:.0f}%, 详见下)"))
+        elif csp:
+            items.append((sym, f"- ⏸ **{sym}** CSP: {csp['skip_reason']}"))
+        spread = r.get("spread")
+        if spread and "skip_reason" not in spread:
+            items.append((sym, f"- 🟣 **{sym}** 回踩 spread: BUY {spread['exp']} "
+                               f"{spread['long_strike']:g}C / SELL "
+                               f"{spread['short_strike']:g}C 净支出 "
+                               f"~{spread['debit']:.2f} (详见下)"))
+        elif spread:
+            items.append((sym, f"- ⏸ **{sym}** 回踩 spread: {spread['skip_reason']}"))
+        elif r.get("retest"):
+            items.append((sym, f"- 👀 **{sym}** 首次回踩20日线不破 — 剧本首选"
+                               "加仓点 (3-6个月 call spread, 手动构造)"))
+    if items:
+        lines += [line for _sym, line in items]
+        mentioned = {sym for sym, _line in items}
+        others = [r["symbol"] for r in results if r["symbol"] not in mentioned]
+        if others:
+            lines.append(f"- 其余今日无动作: {', '.join(others)}")
+    else:
+        lines.append("- 今日无动作 (无止损 / 无票 / 无新信号)")
+    lines.append("")
+    return lines
+
+
+def sig_marks(sig: dict) -> str:
+    m = lambda b: "✓" if b else "·"
+    return (f"低{m(sig['no_new_low'])} 收{m(sig['reclaim20'])} "
+            f"破{m(sig['breakout'])}")
+
+
+def regime_block(regime: dict) -> list[str]:
+    lines = [
+        "## 市场状态 (VIX/VIX3M)",
+        "",
+        f"- VIX **{regime['vix']:.2f}** | VIX3M {regime['vix3m']:.2f} | "
+        f"ratio **{regime['ratio']:.3f}**"
+        + (f" | VXN {regime['vxn']:.2f}" if regime["vxn"] else "")
+        + f"  (as of {regime['as_of']}, {regime['source']}"
+        + (", 含盘中临时点·延迟15min" if regime.get("intraday") else "") + ")",
+        f"- 阶段: **{regime['stage']}** — {REGIME_NOTES[regime['stage']]}",
+    ]
+    if regime["stale_days"] > 5:
+        lines.append(f"- ⚠️ **VIX 数据已 {regime['stale_days']} 天未更新** — "
+                     "阶段判定不可信, 手动核对 CBOE/moomoo")
+    if regime["crossed_up"]:
+        lines.append("- ⚠️ **ratio 上穿 1.0** — 新一轮倒挂开始: CSP 第一档启动, 右侧停")
+    if regime["crossed_down"]:
+        lines.append("- ⚠️ **ratio 下穿 1.0** — 倒挂解除: 等价格确认 (收复20日线/不再新低) 后进阶段2")
+    ep = regime["last_episode"]
+    if ep and (ep["ongoing"] or regime["stage"] == "STAGE2_WINDOW"):
+        lines.append(
+            f"- 最近倒挂: {ep['start'].date()} → {ep['end'].date()}"
+            f" ({ep['days']} 日, 峰值 {ep['peak']:.3f}"
+            f"{', 进行中' if ep['ongoing'] else ''})")
+    lines.append("")
+    return lines
+
+
+def render_close(results, regime, ivdf, now_et) -> str:
+    d = now_et.strftime("%Y-%m-%d")
+    lines = [f"# 左右侧 watchlist 扫描 — {d} 尾盘 "
+             f"({now_et:%H:%M} ET)", ""]
+    lines += action_block(results, ivdf)
+    lines += regime_block(regime)
+
+    ordered = by_actionability(results)
+    lines += ["## 概览 (按可操作性排序)", "",
+              "| 标的 | 状态 | 操作 | 收盘 | Δ% | vs20日 | 量比 | 三选二 "
+              "| 价值区 | iv/rv | IVP |",
+              "|---|---|---|---|---|---|---|---|---|---|---|"]
+    for r in ordered:
+        t = r["tech"]
+        if t is None:
+            lines.append(f"| {r['symbol']} | {STATE_LABEL['NO_DATA']} | — | — "
+                         f"| — | — | — | — | — | — | — |")
+            continue
+        zone = r["cfg"]["value_zone"]
+        if zone:
+            if t["close"] > zone[1]:
+                pos = f"上方+{(t['close'] / zone[1] - 1) * 100:.0f}%"
+            elif t["close"] < zone[0]:
+                pos = f"破下沿{(t['close'] / zone[0] - 1) * 100:.0f}%"
+            else:
+                pos = "区内"
+            zone_s = f"{zone[0]:g}-{zone[1]:g} ({pos})"
+        else:
+            zone_s = "未设"
+        ivp = self_ivp(ivdf, r["symbol"], r["iv30"]) if r["iv30"] else None
+        ivrv = (f"{r['iv30'] * 100:.0f}/{t['rv30'] * 100:.0f}%"
+                if r["iv30"] and t["rv30"]
+                else fmt(r["iv30"] and r["iv30"] * 100, ".0f", "%"))
+        lines.append(
+            f"| {r['symbol']} | {STATE_LABEL[r['state']]} "
+            f"| {action_label(r, ivp)} | {t['close']:.2f} "
+            f"| {t['change_pct']:+.1f} | {t['vs_sma20_pct']:+.1f}% "
+            f"| {t['vol_ratio']:.1f}x | {sig_marks(t['signals'])} "
+            f"| {zone_s} | {ivrv} | {fmt(ivp, '.0f')} |")
+    lines += [
+        "",
+        "> 三选二: **低**=不再新低(近5日低点 > 前15日低点) · **收**=放量收复"
+        "20日线(收盘上穿 + 量比≥1.5) · **破**=突破前20日高 — ✓成立/·未成立, "
+        "≥2个✓且有真实回调前提才算确认。价值区: 上方+X% = 现价高于接货带"
+        "上沿X%(等回落), 区内 = 可接货, 破下沿 = 检查论点。",
+        ""]
+
+    detail = [r for r in ordered
+              if r["state"] in ("CONFIRMED", "TREND", "LEFT_ZONE", "NEAR_ZONE")
+              or r["notes"] or r["csp"] or r["leap"] or r.get("spread")
+              or r.get("ladder") or r["error"]]
+    if detail:
+        lines += ["## 信号与建议", ""]
+    for r in detail:
+        since = f" (自 {r.get('state_since')})" if r.get("state_since") else ""
+        lines.append(f"### {r['symbol']} — {STATE_LABEL.get(r['state'], r['state'])}{since}")
+        if r["error"]:
+            lines += [f"- 错误: {r['error']}", ""]
+            continue
+        t = r["tech"]
+        lines.append(f"- 位置: 收盘 {t['close']:.2f} ({t['change_pct']:+.1f}%) · "
+                     f"20日线 {t['vs_sma20_pct']:+.1f}% · "
+                     f"200日线 {fmt(t['vs_sma200_pct'], '+.1f', '%')} · "
+                     f"距52w高 {t['from_52w_high_pct']:+.1f}%")
+        if r["state"] == "CONFIRMED" and r.get("prev_state") not in ("CONFIRMED", "TREND"):
+            s_ = t["signals"]
+            parts = [n for n, k in (("不再新低", "no_new_low"),
+                                    ("放量收复20日线", "reclaim20"),
+                                    ("突破20日高", "breakout")) if s_[k]]
+            lines.append(f"- **今日右侧确认**: {' + '.join(parts)} (量比 {t['vol_ratio']:.1f}x)")
+            lines.append("- 剧本: 突破入场假信号多 — 首次回踩突破位/20日线不破再走强时进, 止损放确认结构下方")
+        for n in r["notes"]:
+            lines.append(f"- {n}")
+        if r["earnings"]:
+            lines.append(f"- 下次财报: {r['earnings']}")
+        csp = r["csp"]
+        if csp:
+            if "skip_reason" in csp:
+                lines.append(f"- CSP: {csp['skip_reason']}")
+            else:
+                tag = "恐慌档" if csp["panic_mode"] else "常规"
+                lines.append(
+                    f"- **CSP ({tag})**: SELL {r['symbol']} {csp['exp']} "
+                    f"{csp['strike']:g}P @ ~{csp['mid']:.2f} — delta {csp['delta']:.2f}, "
+                    f"{csp['dte']}DTE, 年化 ~{csp['annualized_pct']:.0f}%, "
+                    f"缓冲 {csp['cushion_pct']:.1f}%, BE {csp['breakeven']:.2f}, "
+                    f"OI {csp['oi']}"
+                    + (f", 价差 {csp['spread_pct']:.0f}%" if csp["spread_pct"] is not None else ""))
+                for n in csp["notes"]:
+                    lines.append(f"  - {n}")
+                zone = r["cfg"]["value_zone"]
+                if zone is not None and csp["strike"] <= zone[1]:
+                    lines.append("  - 愿意接货档 (行权价在价值区内): 拿到到期, "
+                                 "跌破行权价 = 接货流程; 赚 50-60% 权利金可提前收")
+                else:
+                    lines.append("  - GTC 三角 (不想接货档): 赚 50-60% 权利金平 / "
+                                 "权利金翻 3 倍或收盘跌破行权价平/roll / 剩 21 DTE 离场")
+        ladder = r.get("ladder")
+        if ladder:
+            # 剧本要求间距递增 — 区间宽时固定折扣的末档间距反而更窄, 不谎报
+            widening = (ladder[1] - ladder[2]) > (ladder[0] - ladder[1])
+            spacing_note = ("间距递增" if widening else
+                            "区间较宽, 末档间距未递增 — 剧本要求间距递增, 自行加深恐慌档")
+            lines.append(
+                f"- 正股分批档位: ① {ladder[0]:g} ② {ladder[1]:g} "
+                f"③ {ladder[2]:g} (恐慌档) — {spacing_note}; 总仓位按\"还能再跌"
+                f"30-50%\"定, 打完末档仍扛得住再跌; 止损靠论点失效不靠价格")
+        leap = r["leap"]
+        if leap:
+            ivp = self_ivp(ivdf, r["symbol"], r["iv30"]) if r["iv30"] else None
+            if "skip_reason" in leap:
+                lines.append(f"- LEAP: {leap['skip_reason']}")
+            elif ivp is not None and ivp > 60:
+                # 剧本 IV 档位: IVP >60 连 deep ITM 都改用 spread/PMCC/RR
+                lines.append(
+                    f"- LEAP: 自建IVP {ivp:.0f} > 60 — 剧本: 改用 spread/PMCC/"
+                    f"risk reversal 或等 IVP 回落 (候选 {leap['exp']} "
+                    f"{leap['strike']:g}C @ ~{leap['mid']:.2f}, 合约 IV "
+                    f"{leap['iv'] * 100:.0f}%; moomoo IVP 实查确认)")
+            else:
+                lines.append(
+                    f"- **LEAP**: BUY {r['symbol']} {leap['exp']} {leap['strike']:g}C "
+                    f"@ ~{leap['mid']:.2f} — delta {leap['delta']:.2f}, "
+                    f"外在 {fmt(leap['extrinsic_pct'], '.0f', '%')}, "
+                    f"λ {fmt(leap['lam'], '.1f', 'x')}, BE {leap['breakeven']:.2f} "
+                    f"({(leap['breakeven'] / t['close'] - 1) * 100:+.1f}%), "
+                    f"保险费率 ~{leap['insurance_pct_yr']:.1f}%/年, "
+                    f"合约 IV {leap['iv'] * 100:.0f}%, OI {leap['oi']}"
+                    + (f", 价差 {leap['spread_pct']:.1f}%" if leap["spread_pct"] is not None else ""))
+                for n in leap["notes"]:
+                    lines.append(f"  - {n}")
+        spread = r.get("spread")
+        if spread:
+            if "skip_reason" in spread:
+                lines.append(f"- 回踩 spread: {spread['skip_reason']}")
+            else:
+                lines.append(
+                    f"- **Call spread (回踩)**: BUY {r['symbol']} {spread['exp']} "
+                    f"{spread['long_strike']:g}C @ ~{spread['long_mid']:.2f} / "
+                    f"SELL {spread['short_strike']:g}C @ ~{spread['short_mid']:.2f} "
+                    f"— 净支出 ~{spread['debit']:.2f}, 最大盈利 "
+                    f"{spread['max_profit']:.2f} (赔率 {spread['reward_risk']:.1f}:1), "
+                    f"BE {spread['breakeven']:.2f}, {spread['dte']}DTE, delta "
+                    f"{spread['long_delta']:.2f}/{spread['short_delta']:.2f}, "
+                    f"OI {spread['long_oi']}/{spread['short_oi']}")
+                if spread.get("retest_low") is not None:
+                    lines.append(
+                        f"  - 止损: 收盘跌破回踩低点 {spread['retest_low']:.2f} → 平, "
+                        "回收剩余权利金 (右侧止损必挂必执行)")
+                lines.append("  - 仓位: 权利金 <= 0.5-1% NAV, 计入该标的总敞口")
+                if r["earnings"] and r["earnings"] <= spread["exp"]:
+                    lines.append(f"  - 财报 {r['earnings']} 在到期前 — 事件重估, 自查缺口风险")
+                for n in spread.get("notes", []):
+                    lines.append(f"  - {n}")
+                if spread["src"] == "last":
+                    lines.append("  - 盘口不可用, 按最近成交价估算 — 下单前实查")
+        lines.append("")
+
+    lines += [
+        "---",
+        "执行提醒: 左侧三条件齐才进 (价值区+被迫卖出证据+右侧确认); 加仓只加在强势上; "
+        "IV 建议以 moomoo IVP/合约 IV 实查为准 (自建IVP 样本积累中)。",
+        "数据: yfinance ~15min 延迟。合约价为 mid 估算, 下单前实查盘口。非投资建议。",
+    ]
+    return "\n".join(lines)
+
+
+def render_open(results, regime, now_et, s: dict) -> str:
+    d = now_et.strftime("%Y-%m-%d")
+    lines = [f"# 开盘异动 — {d} ({now_et:%H:%M} ET)", ""]
+    lines += regime_block(regime)
+    alerts = []
+    for r in results:
+        t = r["tech"]
+        sym = r["symbol"]
+        if t is None:
+            continue
+        if abs(t["gap_pct"]) >= s["gap_alert_pct"]:
+            alerts.append(f"- **{sym}** 开盘 gap {t['gap_pct']:+.1f}% "
+                          f"(现价 {t['close']:.2f}, 较昨收 {t['change_pct']:+.1f}%)")
+        elif abs(t["change_pct"]) >= s["move_alert_pct"]:
+            alerts.append(f"- **{sym}** 盘初波动 {t['change_pct']:+.1f}% "
+                          f"(现价 {t['close']:.2f})")
+        zone = r["cfg"]["value_zone"]
+        if zone and t["close"] <= zone[1]:
+            alerts.append(f"- **{sym}** 在价值区内 ({zone[0]:g}-{zone[1]:g}, "
+                          f"现价 {t['close']:.2f}) — 核对 CSP 挂单/接货档位")
+        if r.get("prev_state") in ("CONFIRMED", "TREND") and t["close"] < t["sma20"]:
+            alerts.append(f"- **{sym}** 盘中在20日线下 ({t['sma20']:.2f}) — "
+                          f"右侧移动止损以**收盘**为准, 尾盘扫描确认")
+        if r["earnings"]:
+            days = (date.fromisoformat(r["earnings"]) - now_et.date()).days
+            if 0 <= days <= s["earnings_alert_days"]:
+                when = "今天" if days == 0 else f"{days} 天内"
+                alerts.append(f"- **{sym}** 财报 {when} ({r['earnings']}) — "
+                              f"short option 不跨财报; LEAP 等财报后")
+    lines += alerts or ["- 无异动 (gap/波动/价值区/财报 均未触发)"]
+    lines += ["", "---",
+              "开盘扫描只做提醒 — 右侧确认以收盘为准, 见尾盘报告。数据 ~15min 延迟。"]
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+
+def send_email_report(report_path: Path, subject: str) -> None:
+    """SMTP push for headless (droplet) deployments. Config via env vars:
+    SCAN_SMTP_HOST, SCAN_SMTP_PORT (default 587, STARTTLS), SCAN_SMTP_USER,
+    SCAN_SMTP_PASS, SCAN_EMAIL_TO, SCAN_EMAIL_FROM (optional).
+    Raises on any failure — on a droplet, email IS the delivery channel."""
+    import smtplib
+    from email.message import EmailMessage
+
+    host = os.environ.get("SCAN_SMTP_HOST")
+    to = os.environ.get("SCAN_EMAIL_TO")
+    if not host or not to:
+        raise RuntimeError("SCAN_SMTP_HOST / SCAN_EMAIL_TO not set (see .env.example)")
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = os.environ.get(
+        "SCAN_EMAIL_FROM", os.environ.get("SCAN_SMTP_USER", "watchlist-scanner"))
+    msg["To"] = to
+    msg.set_content(report_path.read_text(encoding="utf-8"))
+    with smtplib.SMTP(host, int(os.environ.get("SCAN_SMTP_PORT", "587")),
+                      timeout=30) as smtp:
+        smtp.starttls()
+        user = os.environ.get("SCAN_SMTP_USER")
+        if user:
+            smtp.login(user, os.environ["SCAN_SMTP_PASS"])
+        smtp.send_message(msg)
+
+
+def batch_history(symbols: list[str]) -> dict[str, pd.DataFrame | None]:
+    df = yf.download(symbols, period="1y", interval="1d", auto_adjust=True,
+                     group_by="ticker", progress=False, threads=True)
+    out = {}
+    for sym in symbols:
+        try:
+            # yfinance with group_by="ticker" returns (Ticker, Price) MultiIndex
+            # columns even for a single symbol — no special case needed
+            sub = df[sym].dropna(subset=["Close"])
+            out[sym] = sub if not sub.empty else None
+        except KeyError:
+            out[sym] = None
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="左右侧 watchlist 扫描器")
+    ap.add_argument("--mode", choices=["open", "close", "auto"], default="auto")
+    ap.add_argument("--force", action="store_true",
+                    help="ignore window/duplicate/market-live gates")
+    ap.add_argument("--tickers", help="comma-separated subset (testing)")
+    ap.add_argument("--no-options", action="store_true",
+                    help="skip option chains (fast technicals-only pass)")
+    ap.add_argument("--email", action="store_true",
+                    help="email the report after writing it (SCAN_SMTP_* env)")
+    ap.add_argument("--workers", type=int, default=4)
+    args = ap.parse_args()
+
+    now_et = datetime.now(ET)
+    mode = resolve_mode(args.mode, now_et)
+    if mode is None:
+        if args.force:
+            mode = "close" if now_et.hour >= 13 else "open"
+        else:
+            print(f"outside scan windows ({now_et:%a %H:%M} ET) — skip")
+            return SKIP
+
+    # --force/--tickers = manual test run: keep it off the canonical report
+    # name (the auto run's dup gate checks it) and off state/iv history, so
+    # a mid-session test never makes the real scheduled scan silently skip
+    manual = args.force or bool(args.tickers)
+    d = now_et.strftime("%Y-%m-%d")
+    suffix = "-manual" if manual else ""
+    report_path = REPORTS / f"{d}-{mode}{suffix}.md"
+    if report_path.exists() and not args.force:
+        print(f"{report_path.name} already exists — skip (DST double-fire)")
+        return SKIP
+    if not args.force and not market_is_live():
+        print("US market not live (holiday/half-day/stale feed) — skip")
+        return SKIP
+
+    settings, tickers = load_config()
+    if args.tickers:
+        keep = {t.strip().upper() for t in args.tickers.split(",")}
+        tickers = {k: v for k, v in tickers.items() if k in keep}
+    symbols = list(tickers)
+
+    print(f"mode={mode} {d} {now_et:%H:%M} ET — {len(symbols)} tickers")
+    regime = fetch_regime(settings)
+    hist = batch_history(symbols)
+    state = load_state()
+
+    fetch_options = (mode == "close") and not args.no_options
+    fetch_earnings_only = mode == "open"
+    results_by_sym = {}
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        futs = {
+            pool.submit(
+                analyze_ticker, sym, cfg, hist.get(sym),
+                state.get(sym, {}), regime, settings, mode,
+                fetch_options) : sym
+            for sym, cfg in tickers.items()}
+        for fut in as_completed(futs):
+            r = fut.result()
+            results_by_sym[r["symbol"]] = r
+            status = r["error"] or r["state"]
+            print(f"  {r['symbol']:<6} {status}")
+    results = [results_by_sym[s_] for s_ in symbols]
+
+    # open pass still wants earnings dates for the alert block
+    if fetch_earnings_only:
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futs = {pool.submit(next_earnings, yf.Ticker(sym)): sym
+                    for sym in symbols}
+            for fut in as_completed(futs):
+                sym = futs[fut]
+                e = fut.result()
+                if e is None and tickers[sym]["kind"] in ("etf", "index"):
+                    e = ""
+                results_by_sym[sym]["earnings"] = e
+
+    ivdf = load_iv_history()
+    if mode == "close":
+        if manual:
+            for r in results:
+                r["state_since"] = state.get(r["symbol"], {}).get("since")
+        else:
+            ivdf = append_iv_history(results, d)
+            # persist state transitions (close-basis only, per the playbook)
+            for r in results:
+                if r["error"] or r["tech"] is None:
+                    continue
+                prev = state.get(r["symbol"], {})
+                state[r["symbol"]] = next_persisted_state(prev, r, d)
+                r["state_since"] = state[r["symbol"]]["since"]
+            save_state(state)
+        report = render_close(results, regime, ivdf, now_et)
+    else:
+        report = render_open(results, regime, now_et, settings)
+
+    REPORTS.mkdir(exist_ok=True)
+    report_path.write_text(report + "\n", encoding="utf-8")
+    latest = {
+        "mode": mode, "generated_et": now_et.isoformat(), "regime": regime,
+        "results": [{k: v for k, v in r.items() if k != "cfg"} for r in results],
+    }
+    (REPORTS / f"latest-{mode}{suffix}.json").write_text(
+        json.dumps(latest, indent=2, ensure_ascii=False, default=str),
+        encoding="utf-8")
+
+    print()
+    print(report)
+    print(f"\nREPORT {report_path}")
+    if args.email:
+        subject = (f"[watchlist] {d} {mode}"
+                   + (" manual" if manual else "")
+                   + f" — {regime['stage']}")
+        try:
+            send_email_report(report_path, subject)
+            print(f"email sent to {os.environ.get('SCAN_EMAIL_TO')}")
+        except Exception as e:
+            print(f"EMAIL FAILED: {e}", file=sys.stderr)
+            return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

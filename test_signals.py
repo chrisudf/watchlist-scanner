@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""Unit tests for the pure signal/state/ticket math in scanner.py.
+
+Run:  .venv/bin/python test_signals.py
+No network access needed — everything here is synthetic data.
+"""
+
+import math
+import unittest
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+
+import scanner as sc
+
+
+def series(vals):
+    idx = pd.bdate_range("2026-01-01", periods=len(vals))
+    return pd.Series(list(map(float, vals)), index=idx)
+
+
+def downtrend_then_base(n_down=40, n_base=10, start=100.0, step=0.8):
+    """Close path: steady decline then a flat base above the final low."""
+    down = [start - i * step for i in range(n_down)]
+    base = [down[-1] + 2.0] * n_base
+    return down + base
+
+
+class TestSignals(unittest.TestCase):
+    def test_no_new_low_holds(self):
+        lows = series(downtrend_then_base())
+        self.assertTrue(sc.no_new_low(lows))
+
+    def test_no_new_low_fails_on_fresh_low(self):
+        vals = downtrend_then_base()
+        vals[-1] = min(vals) - 5
+        self.assertFalse(sc.no_new_low(series(vals)))
+
+    def test_reclaim_needs_volume(self):
+        # decline below the 20dma, then pop back above it on the last bar
+        vals = [100 - i * 0.5 for i in range(40)] + [95.0]
+        close = series(vals)
+        self.assertTrue(sc.reclaimed_20dma(close, vol_ratio=2.0, surge=1.5))
+        self.assertFalse(sc.reclaimed_20dma(close, vol_ratio=1.0, surge=1.5))
+
+    def test_reclaim_requires_recent_cross(self):
+        # always above the 20dma -> nothing to "reclaim"
+        close = series([100 + i for i in range(60)])
+        self.assertFalse(sc.reclaimed_20dma(close, vol_ratio=3.0, surge=1.5))
+
+    def test_breakout(self):
+        vals = [100.0] * 30 + [105.0]
+        close = high = series(vals)
+        self.assertTrue(sc.broke_20d_high(close, high))
+        self.assertFalse(sc.broke_20d_high(series([100.0] * 31), series([100.0] * 31)))
+
+    def test_uptrend_never_confirms(self):
+        # grinding uptrend: signals may fire individually but the pullback
+        # gate must keep `confirmed` False
+        close = high = low = series([100 + i * 0.5 for i in range(80)])
+        out = sc.confirmation(close, high, low, vol_ratio=2.0, surge=1.5)
+        self.assertFalse(out["pullback_context"])
+        self.assertFalse(out["confirmed"])
+
+    def test_pullback_recovery_confirms(self):
+        # slide well below the 20dma, base, then reclaim on volume:
+        # no_new_low + reclaim20 = 2 of 3 with pullback context
+        # (>= 61 bars so the pullback gate has enough history)
+        vals = [100 - i * 0.5 for i in range(70)] + [66, 67, 68, 69, 80]
+        close = series(vals)
+        high = close + 1
+        low = close - 1
+        out = sc.confirmation(close, high, low, vol_ratio=2.0, surge=1.5)
+        self.assertTrue(out["pullback_context"])
+        self.assertTrue(out["no_new_low"])
+        self.assertTrue(out["reclaim20"])
+        self.assertTrue(out["confirmed"])
+
+
+class TestStateMachine(unittest.TestCase):
+    def test_confirmed_to_trend(self):
+        state, notes = sc.next_state("CONFIRMED", close=110, sma20=100,
+                                     confirmed=False, zone=None, near_pct=5)
+        self.assertEqual(state, "TREND")
+        self.assertEqual(notes, [])
+
+    def test_trailing_stop_fires(self):
+        state, notes = sc.next_state("TREND", close=95, sma20=100,
+                                     confirmed=False, zone=None, near_pct=5)
+        self.assertEqual(state, "PULLBACK")
+        self.assertTrue(any("止损" in n for n in notes))
+
+    def test_zone_states(self):
+        # 左侧状态要求弱势: 收盘在20日线下 + 在价值区内
+        state, _ = sc.next_state("UPTREND", close=250, sma20=260,
+                                 confirmed=False, zone=[200, 260], near_pct=5)
+        self.assertEqual(state, "LEFT_ZONE")
+        state, _ = sc.next_state("UPTREND", close=268, sma20=280,
+                                 confirmed=False, zone=[200, 260], near_pct=5)
+        self.assertEqual(state, "NEAR_ZONE")
+        state, notes = sc.next_state("UPTREND", close=190, sma20=260,
+                                     confirmed=False, zone=[200, 260], near_pct=5)
+        self.assertEqual(state, "LEFT_ZONE")
+        self.assertTrue(any("下沿" in n for n in notes))
+
+    def test_uptrend_through_zone_is_not_left_side(self):
+        # MSFT case: 价格在20日线上方 18%, 只是还没涨出宽价值区 — 趋势,
+        # 不是左侧 (CSP 触发与状态解耦, 由 analyze_ticker 的 zone 检查管)
+        state, notes = sc.next_state("UPTREND", close=500, sma20=424,
+                                     confirmed=False, zone=[460, 615], near_pct=5)
+        self.assertEqual(state, "UPTREND")
+        self.assertEqual(notes, [])
+
+    def test_confirmation_beats_zone(self):
+        state, _ = sc.next_state("LEFT_ZONE", close=250, sma20=240,
+                                 confirmed=True, zone=[200, 260], near_pct=5)
+        self.assertEqual(state, "CONFIRMED")
+
+
+class TestOptionMath(unittest.TestCase):
+    def test_sixteen_rule(self):
+        # IV 45%, 7 DTE, mult 2.75: 2.75 * (0.45/16) * sqrt(7) ~= 20.5%
+        d = sc.sixteen_rule_distance(0.45, 7, 2.75)
+        self.assertAlmostEqual(d, 2.75 * 0.45 / 16 * math.sqrt(7), places=10)
+        self.assertTrue(0.19 < d < 0.22)
+
+    def test_csp_annualized(self):
+        # 1.00 premium on a 100 strike, 30 DTE:
+        # 1/(100-1) * 365/30 ~= 12.3% annualized
+        self.assertAlmostEqual(sc.csp_annualized(1.0, 100.0, 30), 12.29, places=1)
+
+    def test_bs_delta_bounds(self):
+        atm = sc.bs_delta(100, 100, 1.0, 0.04, 0.3, is_call=True)
+        self.assertTrue(0.5 < atm < 0.7)          # ATM call, r/vol drift
+        deep = sc.bs_delta(100, 50, 1.0, 0.04, 0.3, is_call=True)
+        self.assertGreater(deep, 0.95)
+        otm_put = sc.bs_delta(100, 70, 0.05, 0.04, 0.3, is_call=False)
+        self.assertGreater(otm_put, -0.05)        # far OTM put ~ 0
+
+    def test_iv_roundtrip(self):
+        price = sc.bs_price(100, 90, 1.5, 0.04, 0.42, is_call=True)
+        iv = sc.implied_vol(price, 100, 90, 1.5, 0.04, is_call=True)
+        self.assertAlmostEqual(iv, 0.42, places=3)
+
+    def test_stock_ladder(self):
+        s = sc.SETTINGS_DEFAULTS
+        ladder = sc.stock_ladder([380.0, 440.0], s)
+        self.assertEqual(ladder[0], 440.0)
+        self.assertEqual(ladder[1], 380.0)
+        self.assertAlmostEqual(
+            ladder[2], 380.0 * (1 - s["ladder_panic_discount"]), places=2)
+        # 剧本: 间距递增, 末档留给恐慌价 (窄区间成立)
+        self.assertGreater(ladder[1] - ladder[2], ladder[0] - ladder[1])
+        # 宽区间 (AAPL 形状): 固定折扣末档间距不递增 — render 侧须走提示分支
+        wide = sc.stock_ladder([176.0, 264.0], s)
+        self.assertLess(wide[1] - wide[2], wide[0] - wide[1])
+
+
+class TestRegime(unittest.TestCase):
+    def _ratio(self, vals):
+        idx = pd.bdate_range("2026-01-01", periods=len(vals))
+        return pd.Series(vals, index=idx)
+
+    def test_episode_detection(self):
+        ratio = self._ratio([0.9] * 10 + [1.05, 1.12, 1.08, 1.11] + [0.95] * 5)
+        eps = sc.inversion_episodes(ratio)
+        self.assertEqual(len(eps), 1)
+        self.assertEqual(eps[0]["days"], 4)
+        self.assertAlmostEqual(eps[0]["peak"], 1.12)
+        self.assertFalse(eps[0]["ongoing"])
+
+    def test_stages(self):
+        s = sc.SETTINGS_DEFAULTS
+        stage, _ = sc.classify_regime(self._ratio([0.9] * 40), s)
+        self.assertEqual(stage, "NORMAL")
+        stage, _ = sc.classify_regime(self._ratio([0.9] * 39 + [1.02]), s)
+        self.assertEqual(stage, "STAGE1")
+        stage, _ = sc.classify_regime(self._ratio([0.9] * 39 + [1.15]), s)
+        self.assertEqual(stage, "STAGE1_DEEP")
+        # qualifying inversion (4d, peak 1.12) resolved 5 bars ago -> stage 2
+        stage, _ = sc.classify_regime(
+            self._ratio([0.9] * 30 + [1.05, 1.12, 1.08, 1.11] + [0.95] * 5), s)
+        self.assertEqual(stage, "STAGE2_WINDOW")
+        # same episode but 15 bars ago -> window closed
+        stage, _ = sc.classify_regime(
+            self._ratio([0.9] * 20 + [1.05, 1.12, 1.08, 1.11] + [0.95] * 15), s)
+        self.assertEqual(stage, "NORMAL")
+        # shallow inversion (peak < 1.10) never opens a stage-2 window
+        stage, _ = sc.classify_regime(
+            self._ratio([0.9] * 30 + [1.02, 1.03, 1.04, 1.05] + [0.95] * 5), s)
+        self.assertEqual(stage, "NORMAL")
+
+
+class TestActionLabel(unittest.TestCase):
+    def _r(self, **kw):
+        base = {"error": None, "tech": {"close": 100}, "notes": [],
+                "leap": None, "csp": None, "state": "UPTREND",
+                "cfg": {"value_zone": None, "options": True}}
+        base.update(kw)
+        return base
+
+    def test_labels(self):
+        leap = {"exp": "2028-01-21", "strike": 100, "mid": 1.0, "delta": 0.8}
+        csp = {"exp": "2026-08-28", "strike": 90, "mid": 1.0, "delta": 0.12,
+               "annualized_pct": 10}
+        cases = [
+            (self._r(notes=["右侧止损触发: 收盘跌破20日线"]), None, "⚠️止损"),
+            (self._r(leap=leap), None, "LEAP票👇"),
+            (self._r(leap=leap), 70.0, "IV高·spread"),
+            (self._r(leap={"skip_reason": "财报 2026-08-27 在 19 天内"}), None, "等财报后"),
+            (self._r(csp=csp, state="LEFT_ZONE",
+                     cfg={"value_zone": [80, 95], "options": True}), None, "CSP票👇"),
+            (self._r(notes=["右侧信号出现但倒挂未解除 — 等阶段2"]), None, "等阶段2"),
+            (self._r(state="TREND"), None, "持有·跟20日线"),
+            (self._r(state="TREND", retest=True), None, "回踩中👀"),
+            (self._r(state="TREND", retest=True,
+                     spread={"exp": "2026-12-18", "long_strike": 500,
+                             "short_strike": 550, "debit": 15.0}),
+             None, "spread票👇"),
+            (self._r(state="PULLBACK"), None, "设区间"),
+            # 无期权链标的设区间同样解锁正股分批档 — 也要提示
+            (self._r(state="PULLBACK",
+                     cfg={"value_zone": None, "options": False}),
+             None, "设区间"),
+            # MSFT case: 设了接货带, 现价在上方 — 不是模糊的"观望"
+            (self._r(state="UPTREND", tech={"close": 500},
+                     cfg={"value_zone": [380, 440], "options": True}),
+             None, "等回落入区"),
+            (self._r(state="PULLBACK", tech={"close": 313},
+                     cfg={"value_zone": [176, 264], "options": True}),
+             None, "等回落入区"),
+            # 无期权链但在接货带内 — 正股分批是唯一工具
+            (self._r(state="LEFT_ZONE", ladder=[264, 176, 144.32],
+                     cfg={"value_zone": [176, 264], "options": False},
+                     tech={"close": 250}), None, "分批档👇"),
+            (self._r(), None, "别追·等回调"),
+            (self._r(error="boom", tech=None), None, "—"),
+        ]
+        for r, ivp, expect in cases:
+            self.assertEqual(sc.action_label(r, ivp), expect)
+
+    def test_sort_by_actionability(self):
+        rs = [self._r(state="UPTREND"), self._r(state="CONFIRMED"),
+              self._r(state="TREND", notes=["右侧止损触发"]),
+              self._r(state="LEFT_ZONE")]
+        ordered = [r["state"] for r in sc.by_actionability(rs)]
+        self.assertEqual(ordered, ["TREND", "CONFIRMED", "LEFT_ZONE", "UPTREND"])
+
+
+class TestPartialHistory(unittest.TestCase):
+    def _frame(self, n):
+        idx = pd.bdate_range("2026-06-01", periods=n)
+        close = pd.Series([100 + i * 0.5 for i in range(n)], index=idx)
+        return pd.DataFrame({"Open": close, "High": close + 1,
+                             "Low": close - 1, "Close": close,
+                             "Volume": [1e6] * n}, index=idx)
+
+    def test_short_history_degrades_not_rejects(self):
+        # SPCX case: 39 根日线 — 出快照但右侧确认关闭
+        t = sc.technical_snapshot(self._frame(39), sc.SETTINGS_DEFAULTS)
+        self.assertIsNotNone(t)
+        self.assertEqual(t["bars"], 39)
+        self.assertFalse(t["signals"]["confirmed"])
+        self.assertIsNone(t["sma200"])
+
+    def test_too_short_rejects(self):
+        self.assertIsNone(
+            sc.technical_snapshot(self._frame(20), sc.SETTINGS_DEFAULTS))
+
+
+class TestPersistedState(unittest.TestCase):
+    def test_carry_and_flags(self):
+        prev = {"state": "TREND", "since": "2026-08-01",
+                "leap_window": "2026-07-30"}
+        e = sc.next_persisted_state(prev, {"state": "TREND", "retest": True},
+                                    "2026-08-09")
+        self.assertEqual(e["since"], "2026-08-01")        # 状态没变不刷新
+        self.assertEqual(e["leap_window"], "2026-07-30")  # 跨日携带
+        self.assertTrue(e["retested"])                    # 本日回踩置位
+
+    def test_retested_resets_on_fresh_confirm(self):
+        prev = {"state": "PULLBACK", "since": "2026-07-01", "retested": True}
+        e = sc.next_persisted_state(prev, {"state": "CONFIRMED"}, "2026-08-09")
+        self.assertEqual(e["since"], "2026-08-09")
+        self.assertNotIn("retested", e)
+
+    def test_retested_carries_forward(self):
+        prev = {"state": "TREND", "since": "2026-08-01", "retested": True}
+        e = sc.next_persisted_state(prev, {"state": "TREND"}, "2026-08-09")
+        self.assertTrue(e["retested"])
+
+
+class TestClock(unittest.TestCase):
+    def _et(self, h, m, weekday_date="2026-08-07"):  # a Friday
+        return datetime.fromisoformat(f"{weekday_date}T{h:02d}:{m:02d}:00").replace(
+            tzinfo=sc.ET)
+
+    def test_windows(self):
+        self.assertEqual(sc.resolve_mode("auto", self._et(9, 45)), "open")
+        self.assertEqual(sc.resolve_mode("auto", self._et(10, 45)), "open")
+        self.assertEqual(sc.resolve_mode("auto", self._et(15, 45)), "close")
+        self.assertIsNone(sc.resolve_mode("auto", self._et(12, 0)))
+        self.assertIsNone(sc.resolve_mode("auto", self._et(16, 45)))
+        # weekend
+        self.assertIsNone(sc.resolve_mode("auto", self._et(9, 45, "2026-08-08")))
+        # explicit mode bypasses the clock
+        self.assertEqual(sc.resolve_mode("close", self._et(3, 0)), "close")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

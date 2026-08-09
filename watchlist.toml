@@ -1,0 +1,70 @@
+# 左右侧扫描器 watchlist
+#
+# value_zone = [低, 高] 是"愿意接货"的价值区 — 你的判断, 手工维护。
+# 不设 zone 的标的: 左侧建议(LEFT_ZONE/CSP 接货锚)不启用, 只出技术面/右侧信号。
+# PE-band 表 / sec 分析器的交易区间产出可以直接填进来。
+#
+# kind = "index" | "stock" | "etf"   (LEAP delta 带: index 0.70-0.80, 其余 0.75-0.85)
+# high_beta = true  → LEAP 提示仓位折半 + 财报后入场
+# options = false   → 不出期权票 (无链/流动性差)
+
+[settings]
+gap_alert_pct = 1.5
+volume_surge = 1.5
+near_zone_pct = 5.0
+
+[tickers.QQQ]
+kind = "index"
+two_x = "QLD"   # 趋势中段工具切换提示用 (剧本: 2x 做多, 不是 3x)
+notes = "QQQ LEAP 事件驱动规则适用 (倒挂峰值>=1.10 且 >=3日, 解除+价格确认)"
+
+[tickers.NVDA]
+high_beta = true
+two_x = "NVDL"  # 她自选里的 2倍做多NVDA — 趋势中段工具切换提示用
+
+[tickers.RKLB]
+high_beta = true
+notes = "Rocket Lab — 高波动, LEAP delta 带 0.75-0.85 + 仓位折半适用"
+
+[tickers.GOOG]
+
+[tickers.GLD]
+kind = "etf"
+notes = "黄金剧本标的 — 危机对冲腿, 左右侧规则同样适用"
+
+[tickers.MSFT]
+value_zone = [380.0, 440.0]
+notes = "接货带以 400 加仓位为锚 (2026-08-09 校准, 自行微调); PE带整带 460-615 是估值参考不是接货价"
+
+[tickers.SOFI]
+high_beta = true
+
+[tickers.HOOD]
+high_beta = true
+
+[tickers.COHR]
+high_beta = true
+
+[tickers.TSM]
+
+[tickers.TSLA]
+high_beta = true
+
+[tickers.AAPL]
+value_zone = [176.0, 264.0]
+notes = "作者带 20-30 x FY26 EPS 8.80 — 2026-08 已被实价击穿(313 vs 264), 带子过时, 待你更新"
+
+[tickers.ISRG]
+
+# 期权不流动/无链 — 只出股价信号
+[tickers.DRAM]
+kind = "etf"
+options = false
+
+[tickers.SPCX]
+kind = "etf"
+options = false
+notes = "SpaceX 私募市场 ETF — 数据可能不全"
+
+# 剔除: TQQQ / SOXL (杠杆 ETF, 按你的要求忽略;
+# 2x ETF 只在剧本"趋势中段"章节里作为工具出现, 不是扫描对象)
