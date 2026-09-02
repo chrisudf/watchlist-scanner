@@ -439,5 +439,47 @@ class TestCSPWindow(unittest.TestCase):
         self.assertTrue(sc.csp_window_open([80, 95], False, "STAGE2_WINDOW"))
 
 
+class TestRR25(unittest.TestCase):
+    @staticmethod
+    def _row(strike, iv, delta):
+        return {"strike": strike, "iv": iv, "delta": delta}
+
+    def test_closest_delta_row(self):
+        rows = [self._row(110, 0.30, 0.35), self._row(115, 0.28, 0.24),
+                self._row(120, 0.27, 0.15)]
+        self.assertEqual(sc.closest_delta_row(rows, 0.25)["strike"], 115)
+        # put 侧 delta 为负, 取绝对值
+        puts = [self._row(90, 0.33, -0.26), self._row(85, 0.36, -0.15)]
+        self.assertEqual(sc.closest_delta_row(puts, 0.25)["strike"], 90)
+        # 链稀疏: tol 外 = 无读数, 不硬凑
+        sparse = [self._row(150, 0.5, 0.05)]
+        self.assertIsNone(sc.closest_delta_row(sparse, 0.25))
+        self.assertIsNone(sc.closest_delta_row([], 0.25))
+
+    def test_rr_normal_skew_positive(self):
+        calls = [self._row(115, 0.28, 0.25)]
+        puts = [self._row(90, 0.34, -0.25)]
+        out = sc.rr25(calls, puts)
+        self.assertAlmostEqual(out["rr"], 6.0, places=6)   # put 贵 = 正常
+        self.assertFalse(out["inverted"])
+
+    def test_rr_inverted_call_skew(self):
+        # meme 形态: call 比 put 贵
+        calls = [self._row(115, 0.42, 0.26)]
+        puts = [self._row(90, 0.35, -0.24)]
+        out = sc.rr25(calls, puts)
+        self.assertAlmostEqual(out["rr"], -7.0, places=6)
+        self.assertTrue(out["inverted"])
+        self.assertEqual((out["call_strike"], out["put_strike"]), (115, 90))
+
+    def test_rr_missing_side_is_none(self):
+        calls = [self._row(115, 0.28, 0.25)]
+        self.assertIsNone(sc.rr25(calls, []))
+        self.assertIsNone(sc.rr25([], [self._row(90, 0.3, -0.25)]))
+        # iv 缺失同样无读数
+        self.assertIsNone(
+            sc.rr25([self._row(115, None, 0.25)], [self._row(90, 0.3, -0.25)]))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

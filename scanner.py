@@ -123,6 +123,8 @@ SETTINGS_DEFAULTS = {
     "vvix_halt": 110.0,          # NORMAL 期 VVIX >= 此值 = 停开新 CSP
     "move_divergence": 100.0,    # MOVE > 此值且 VIX 平静 = 债波先行预警
     "move_calm_vix_max": 18.0,   # "VIX 平静"的上限
+    "rr_dte": [20, 60],          # 25Δ risk reversal 取样窗口 (取最接近 35 DTE)
+    "rr_delta_tol": 0.10,        # 链上找不到 |Δ-0.25|<=tol 的行权价 = 无读数
 }
 
 
@@ -790,6 +792,68 @@ def atm_iv30(cc: ChainCache, spot: float) -> float | None:
     return v1 + (v2 - v1) * (30 - d1) / (d2 - d1)
 
 
+def closest_delta_row(rows: list[dict], target: float,
+                      tol: float = 0.10) -> dict | None:
+    """|delta| 最接近 target 的行; 链稀疏到 tol 以外 = 无读数 (None),
+    不硬凑 — 25Δ 读数宁缺毋错。"""
+    if not rows:
+        return None
+    best = min(rows, key=lambda c: abs(abs(c["delta"]) - target))
+    return best if abs(abs(best["delta"]) - target) <= tol else None
+
+
+def rr25(call_rows: list[dict], put_rows: list[dict],
+         tol: float = 0.10) -> dict | None:
+    """25Δ risk reversal = put IV - call IV (vol pts, OTM 两侧)。
+    正常 skew 为正 (put 更贵); 负数 = call skew 倒挂 — 上涨追逐压过
+    下跌对冲 (meme/挤仓形态, 2026-07 曾有 ~55% 的 SPX 成分股 1 月期
+    倒挂, 超过 2021 meme 峰值口径)。"""
+    c = closest_delta_row(call_rows, 0.25, tol)
+    p = closest_delta_row(put_rows, 0.25, tol)
+    if c is None or p is None or not c.get("iv") or not p.get("iv"):
+        return None
+    rr = (p["iv"] - c["iv"]) * 100
+    return {"call_iv": c["iv"], "put_iv": p["iv"],
+            "call_strike": c["strike"], "put_strike": p["strike"],
+            "call_delta": c["delta"], "put_delta": p["delta"],
+            "rr": rr, "inverted": rr < 0}
+
+
+def rr25_snapshot(cc: ChainCache, spot: float, s: dict) -> dict | None:
+    """~35 DTE 的 25Δ risk reversal 快照 (call/put 各取 OTM 侧
+    |Δ| 最接近 0.25 的行权价)。链/报价不可用时返回 None — 例外才
+    报告, 正常 skew 不进报告。"""
+    lo, hi = s["rr_dte"]
+    window = [(e, d) for e, d in cc.expiries() if lo <= d <= hi]
+    if not window:
+        return None
+    exp, dte = min(window, key=lambda x: abs(x[1] - 35))
+    ch = cc.chain(exp)
+    cutoff = _stale_cutoff()
+    T = dte / 365.0
+    sides = []
+    for df, is_call in ((ch.calls, True), (ch.puts, False)):
+        rows = []
+        if df is not None and not df.empty:
+            otm = df[df["strike"] > spot] if is_call else df[df["strike"] < spot]
+            for _, row in otm.iterrows():
+                mid, _src = _mark(row, cutoff)
+                if mid is None:
+                    continue
+                strike = float(row["strike"])
+                iv = contract_iv(row, mid, spot, T, is_call)
+                if iv is None:
+                    continue
+                rows.append({"strike": strike, "iv": iv,
+                             "delta": bs_delta(spot, strike, T, RATE, iv,
+                                               is_call)})
+        sides.append(rows)
+    out = rr25(sides[0], sides[1], s["rr_delta_tol"])
+    if out is not None:
+        out.update({"exp": exp, "dte": dte})
+    return out
+
+
 # --------------------------------------------------------------------------
 # Tickets
 # --------------------------------------------------------------------------
@@ -1174,7 +1238,7 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
     r = {"symbol": sym, "cfg": cfg, "state": "NO_DATA", "notes": [],
          "tech": None, "earnings": "", "iv30": None, "self_ivp": None,
          "csp": None, "leap": None, "spread": None, "ladder": None,
-         "error": None}
+         "rr25": None, "error": None}
     try:
         tech = technical_snapshot(hist, s) if hist is not None else None
         if tech is None:
@@ -1242,6 +1306,22 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
             r["iv30"] = atm_iv30(cc, tech["close"])
         except Exception as e:
             r["notes"].append(f"iv30 获取失败: {type(e).__name__}")
+        # 25Δ RR 倒挂 = 每标的 froth 旗标 — 例外才报告 (正常 skew 沉默);
+        # 获取失败也沉默 (纯提示信号, 不值得占报告版面)
+        try:
+            r["rr25"] = rr25_snapshot(cc, tech["close"], s)
+        except Exception:
+            pass
+        rr = r["rr25"]
+        if rr and rr["inverted"]:
+            r["notes"].append(
+                f"⚠️ 25Δ risk reversal 倒挂 ({rr['exp']}: "
+                f"{rr['call_strike']:g}C IV {rr['call_iv'] * 100:.0f}% > "
+                f"{rr['put_strike']:g}P IV {rr['put_iv'] * 100:.0f}%, "
+                f"RR {rr['rr']:+.1f} pts) — 上涨追逐挤压 (2021 meme 形态): "
+                "CSP 对下行风险结构性少收钱 (行权价放更远或跳过); "
+                "OTM/ATM LEAP 在付倒挂税, 只用 deep ITM/正股; "
+                "covered call/PMCC 短腿溢价异常肥 — 只 covered 不裸卖")
 
         stage = regime["stage"]
         # CSP = 在愿意接货的价位卖 put — 没设价值区就没有接货价, 不出票
@@ -1308,6 +1388,16 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
             if "skip_reason" not in r["spread"]:
                 # 剧本工具切换表: 止损放回踩低点下方
                 r["spread"]["retest_low"] = tech["low_today"]
+        # RR 倒挂时给已出的票追加短提示 (完整解释在上面的 notes 行)
+        if rr and rr["inverted"]:
+            if r["csp"] and "skip_reason" not in r["csp"]:
+                r["csp"]["notes"].append(
+                    "call skew 倒挂中 — 本票对下行风险结构性少收钱: "
+                    "宁可行权价更远/仓位更小, 或跳过这轮")
+            if r["leap"] and "skip_reason" not in r["leap"]:
+                r["leap"]["notes"].append(
+                    "call skew 倒挂中 — 核对外在价值占比, 只要 deep ITM 档 "
+                    "(OTM/ATM 在付倒挂税)")
     except Exception as e:
         r["error"] = f"{type(e).__name__}: {e}"
     return r
