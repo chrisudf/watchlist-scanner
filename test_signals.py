@@ -308,5 +308,82 @@ class TestClock(unittest.TestCase):
         self.assertEqual(sc.resolve_mode("close", self._et(3, 0)), "close")
 
 
+VX_SETTLE_SAMPLE = """Product,Symbol,Expiration Date,Price
+VX,VX35/U6,2026-09-02,17.2528
+VX,VX36/U6,2026-09-09,17.2528
+VX,VX/U6,2026-09-16,17.2528
+VX,VX38/U6,2026-09-23,17.2528
+VX,VX40/V6,2026-10-07,17.2528
+VX,VX/V6,2026-10-21,18.8535
+VX,VX/X6,2026-11-18,19.3489
+VX,VX/Z6,2026-12-16,19.4024
+VX,VX/F7,2027-01-20,20.4496
+VXM,VXM/U6,2026-09-16,17.2528
+VXM,VXM/V6,2026-10-21,18.8535
+VA,VA/U6,2026-09-18,194.25
+"""
+
+
+class TestVXCurve(unittest.TestCase):
+    def test_parse_monthlies_only(self):
+        # weekly 行 (VX35/U6 ...) 带的是前月填充价, 必须剔除; VXM/VA 同剔
+        rows = sc.parse_vx_settlement(VX_SETTLE_SAMPLE)
+        self.assertEqual([e for e, _p in rows],
+                         ["2026-09-16", "2026-10-21", "2026-11-18",
+                          "2026-12-16", "2027-01-20"])
+        self.assertAlmostEqual(rows[0][1], 17.2528)
+        self.assertAlmostEqual(rows[1][1], 18.8535)
+
+    def test_parse_garbage_rows(self):
+        text = ("Product,Symbol,Expiration Date,Price\n"
+                "VX,VX/U6,2026-09-16,bad\nVX,VX/V6\n")
+        self.assertEqual(sc.parse_vx_settlement(text), [])
+
+    def test_curve_state(self):
+        self.assertEqual(sc.vx_curve_state([17.25, 18.85, 19.35, 19.40, 20.45]),
+                         "CONTANGO")                       # 2026-09-01 实况
+        self.assertEqual(sc.vx_curve_state([21.0, 19.0, 19.5, 20.0]),
+                         "PARTIAL_BACKWARDATION")          # M1>M2 但后端翘
+        self.assertEqual(sc.vx_curve_state([28.0, 25.0, 23.5, 22.0, 21.0]),
+                         "FULL_BACKWARDATION")             # 2020-03 形态
+        # n_front 截断: 前5递减、第6个月翘起 → 仍算全曲线倒挂
+        self.assertEqual(
+            sc.vx_curve_state([28, 25, 23.5, 22, 21, 24], n_front=5),
+            "FULL_BACKWARDATION")
+        self.assertIsNone(sc.vx_curve_state([17.0]))       # 合约不足无读数
+
+    def test_gates_full_backwardation_halts(self):
+        s = sc.SETTINGS_DEFAULTS
+        vx = {"state": "FULL_BACKWARDATION", "m1": 28.0, "m2": 25.0,
+              "as_of": "2026-09-01"}
+        g = sc.assess_vol_gates("STAGE1_DEEP", vx, s)
+        self.assertIn("全曲线倒挂", g["halt_csp"])
+        self.assertIn("全曲线倒挂", g["halt_new_longs"])
+        # 开关只放行 CSP (剧本恐慌档), LEAP/spread 仍拦
+        s_off = {**s, "vx_full_backwardation_halt": False}
+        g = sc.assess_vol_gates("STAGE1_DEEP", vx, s_off)
+        self.assertIsNone(g["halt_csp"])
+        self.assertIsNotNone(g["halt_new_longs"])
+
+    def test_gates_partial_warns_contango_silent(self):
+        s = sc.SETTINGS_DEFAULTS
+        g = sc.assess_vol_gates(
+            "NORMAL", {"state": "PARTIAL_BACKWARDATION",
+                       "m1": 21.0, "m2": 19.0, "as_of": "x"}, s)
+        self.assertIsNone(g["halt_csp"])
+        self.assertTrue(any("局部倒挂" in w for w in g["warnings"]))
+        g = sc.assess_vol_gates(
+            "NORMAL", {"state": "CONTANGO", "m1": 17.0, "m2": 19.0,
+                       "as_of": "x"}, s)
+        self.assertEqual((g["halt_csp"], g["halt_new_longs"], g["warnings"]),
+                         (None, None, []))
+
+    def test_gates_degrade_on_feed_error(self):
+        # 数据坏 = 门失效, 不硬拦
+        g = sc.assess_vol_gates("NORMAL", {"error": "HTTPError: 503"},
+                                sc.SETTINGS_DEFAULTS)
+        self.assertEqual((g["halt_csp"], g["halt_new_longs"]), (None, None))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

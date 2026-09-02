@@ -117,6 +117,9 @@ SETTINGS_DEFAULTS = {
     # regime
     "stage2_window_bars": 10,    # trading days after inversion resolves
     "episode_min_days": 3, "episode_min_peak": 1.10,
+    # 倒挂门控矩阵 (2026-09-02 研究: VIX 系族横评 + 回测证据实查)
+    "vx_full_backwardation_halt": True,  # VX 全曲线倒挂 = 停开新票 (21/22 crash filter)
+    "vx_curve_contracts": 5,             # 曲线形态看前 N 个月度合约
 }
 
 
@@ -293,6 +296,104 @@ def _cboe_delayed(name: str) -> tuple[float, datetime]:
     return float(d["current_price"]), datetime.fromisoformat(d["last_trade_time"])
 
 
+VX_SETTLE_URL = ("https://www.cboe.com/us/futures/market_statistics/"
+                 "settlement/csv?dt={}")
+
+
+def parse_vx_settlement(text: str) -> list[tuple[str, float]]:
+    """Monthly VX settlements from the CFE daily settlement CSV
+    (Product,Symbol,Expiration Date,Price), sorted by expiry. Weekly rows
+    (VX35/U6 ...) are excluded — the CSV pads them with the front-month
+    price (observed 2026-09-01: six different weeklies all printing
+    17.2528), so they carry no curve information. VXM/VA rows likewise."""
+    out = []
+    for line in text.splitlines()[1:]:
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 4 or parts[0] != "VX":
+            continue
+        if not parts[1].startswith("VX/"):   # monthly = "VX/U6", weekly = "VX35/U6"
+            continue
+        try:
+            out.append((parts[2], float(parts[3])))
+        except ValueError:
+            continue
+    return sorted(out)
+
+
+def vx_curve_state(prices: list[float], n_front: int = 5) -> str | None:
+    """VX 期货曲线形态, 看前 n_front 个月度合约:
+    FULL_BACKWARDATION   逐对递减 (eco3min 口径 — 2004 年以来 22 次,
+                         21 次在 30 天内伴随 SPX >5% 回撤; 唯一漏网
+                         2013 taper tantrum 只是局部倒挂)
+    PARTIAL_BACKWARDATION  M1 > M2 但未全曲线
+    CONTANGO             其余 (含混合形态)
+    None                 合约不足 2 个, 无读数"""
+    p = prices[:n_front]
+    if len(p) < 2:
+        return None
+    diffs = [p[i + 1] - p[i] for i in range(len(p) - 1)]
+    if all(d < 0 for d in diffs):
+        return "FULL_BACKWARDATION"
+    if diffs[0] < 0:
+        return "PARTIAL_BACKWARDATION"
+    return "CONTANGO"
+
+
+def fetch_vx_curve(n_front: int = 5) -> dict:
+    """Latest CFE settlement curve — walks back up to a week to find the
+    most recent business day with rows (settlement publishes after the
+    close, so intraday the newest file is yesterday's). Returns
+    {'error': ...} instead of raising: the VX gate degrades to
+    advisory-off when the feed is down, mirroring the vxn convention."""
+    today = datetime.now(ET).date()
+    last_err = "no settlement rows found"
+    for back in range(7):
+        dt = today - timedelta(days=back)
+        if dt.weekday() >= 5:
+            continue
+        try:
+            req = urllib.request.Request(VX_SETTLE_URL.format(dt.isoformat()),
+                                         headers={"User-Agent": "Mozilla/5.0"})
+            text = urllib.request.urlopen(req, timeout=30).read().decode()
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            continue
+        rows = parse_vx_settlement(text)
+        if len(rows) >= 2:
+            prices = [p for _e, p in rows]
+            return {
+                "as_of": dt.isoformat(),
+                "state": vx_curve_state(prices, n_front),
+                "m1": prices[0], "m2": prices[1],
+                "m1_exp": rows[0][0], "m2_exp": rows[1][0],
+                "m1_m2_pct": (prices[1] / prices[0] - 1) * 100,
+                "n_contracts": len(rows),
+            }
+    return {"error": last_err}
+
+
+def assess_vol_gates(stage: str, vx: dict, s: dict) -> dict:
+    """Cross-signal gates layered on top of the VIX/VIX3M stage machine.
+    -> {"halt_csp": str|None, "halt_new_longs": str|None, "warnings": [...]}
+    halt_csp 拦新 CSP 票, halt_new_longs 拦 LEAP/回踩 spread —
+    票据以 skip_reason 呈现, 原因随票可见。数据缺失 (error dict) 不拦:
+    门控宁可漏也不能靠坏数据硬拦。"""
+    halt_csp, halt_longs, warnings = None, None, []
+    if vx.get("state") == "FULL_BACKWARDATION":
+        msg = (f"VX 期货全曲线倒挂 (M1 {vx['m1']:.2f} > M2 {vx['m2']:.2f}, "
+               f"结算 {vx['as_of']}) — 2004 年以来 22 次中 21 次在 30 天内 "
+               "SPX 回撤 >5%: 停开新票, 持有对冲")
+        halt_longs = msg
+        if s["vx_full_backwardation_halt"]:
+            halt_csp = msg + " (要恢复剧本恐慌档 CSP 关 vx_full_backwardation_halt)"
+    elif vx.get("state") == "PARTIAL_BACKWARDATION":
+        warnings.append(
+            f"VX 期货 M1 {vx['m1']:.2f} > M2 {vx['m2']:.2f} 局部倒挂 — "
+            "前端承压, 关注是否蔓延成全曲线 (全曲线 = 硬停牌)")
+    return {"halt_csp": halt_csp, "halt_new_longs": halt_longs,
+            "warnings": warnings}
+
+
 def fetch_regime(s: dict) -> dict:
     try:
         vix, vix3m = _cboe_series("VIX"), _cboe_series("VIX3M")
@@ -336,6 +437,8 @@ def fetch_regime(s: dict) -> dict:
     stage, episodes = classify_regime(ratio, s)
     prev = float(ratio.iloc[-2])
     cur = float(ratio.iloc[-1])
+    vx = fetch_vx_curve(s["vx_curve_contracts"])
+    gates = assess_vol_gates(stage, vx, s)
     return {
         "vix": float(vix.iloc[-1]), "vix3m": float(vix3m.iloc[-1]),
         "vxn": vxn_last,
@@ -345,6 +448,10 @@ def fetch_regime(s: dict) -> dict:
         "last_episode": episodes[-1] if episodes else None,
         "as_of": as_of,
         "source": source, "stale_days": age_days, "intraday": intraday,
+        "vx": vx,
+        "halt_csp": gates["halt_csp"],
+        "halt_new_longs": gates["halt_new_longs"],
+        "gate_warnings": gates["warnings"],
     }
 
 
@@ -1012,6 +1119,7 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
         # 首次回踩才算这轮的"首次"
         if state == "TREND" and tech["touched_20dma"] \
                 and not regime["stage"].startswith("STAGE1") \
+                and not regime.get("halt_new_longs") \
                 and not prev_state.get("retested"):
             r["retest"] = True
             how = "票见下" if cfg["options"] else "无期权链 — 按股价操作"
@@ -1080,11 +1188,20 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
         if fresh_confirm and stage.startswith("STAGE1"):
             r["notes"].append("右侧信号出现但倒挂未解除 — 剧本: 倒挂持续期间不加右侧仓, 等阶段2")
 
+        # 倒挂门控矩阵的硬门: 拦截以 skip_reason 呈现, 原因随票可见 —
+        # 不是静默消失 (被拦的票在报告里显示 ⏸ + 原因)
         if want_csp:
-            r["csp"] = csp_ticket(cc, tech["close"], r["iv30"],
-                                  r["earnings"], stage, zone, s)
+            if regime.get("halt_csp"):
+                r["csp"] = {"skip_reason": regime["halt_csp"]}
+            else:
+                r["csp"] = csp_ticket(cc, tech["close"], r["iv30"],
+                                      r["earnings"], stage, zone, s)
         if want_leap:
-            r["leap"] = leap_ticket(cc, tech["close"], cfg, r["earnings"], s)
+            if regime.get("halt_new_longs"):
+                r["leap"] = {"skip_reason": regime["halt_new_longs"]}
+            else:
+                r["leap"] = leap_ticket(cc, tech["close"], cfg,
+                                        r["earnings"], s)
         if r.get("retest"):  # STAGE1 已在回踩检测处拦掉
             r["spread"] = call_spread_ticket(cc, tech["close"], s)
             if "skip_reason" not in r["spread"]:
@@ -1260,6 +1377,23 @@ def regime_block(regime: dict) -> list[str]:
         + (", 含盘中临时点·延迟15min" if regime.get("intraday") else "") + ")",
         f"- 阶段: **{regime['stage']}** — {REGIME_NOTES[regime['stage']]}",
     ]
+    vx = regime.get("vx") or {}
+    if vx.get("error"):
+        lines.append(f"- VX 期货曲线: 获取失败 ({vx['error']}) — 全曲线倒挂门"
+                     "未生效, 手动核对 volchart.io/moomoo")
+    elif vx:
+        vx_label = {"CONTANGO": "contango",
+                    "PARTIAL_BACKWARDATION": "**局部倒挂**",
+                    "FULL_BACKWARDATION": "**全曲线倒挂**"}.get(
+            vx.get("state"), str(vx.get("state")))
+        lines.append(
+            f"- VX 期货: M1 {vx['m1']:.2f} ({vx['m1_exp']}) → "
+            f"M2 {vx['m2']:.2f} ({vx['m2_exp']}), M1→M2 {vx['m1_m2_pct']:+.1f}% "
+            f"— {vx_label} (结算 {vx['as_of']})")
+    for w in regime.get("gate_warnings", []):
+        lines.append(f"- ⚠️ {w}")
+    if regime.get("halt_csp") or regime.get("halt_new_longs"):
+        lines.append(f"- ⛔ {regime.get('halt_csp') or regime.get('halt_new_longs')}")
     if regime["stale_days"] > 5:
         lines.append(f"- ⚠️ **VIX 数据已 {regime['stale_days']} 天未更新** — "
                      "阶段判定不可信, 手动核对 CBOE/moomoo")
