@@ -385,5 +385,23 @@ class TestVXCurve(unittest.TestCase):
         self.assertEqual((g["halt_csp"], g["halt_new_longs"]), (None, None))
 
 
+class TestCSPWindow(unittest.TestCase):
+    def test_no_zone_never_opens(self):
+        # 没有接货价就没有 CSP — 任何 regime 都一样 (ORCL 教训)
+        for stage in ("NORMAL", "STAGE1", "STAGE1_DEEP", "STAGE2_WINDOW"):
+            self.assertFalse(sc.csp_window_open(None, False, stage))
+
+    def test_normal_needs_zone_proximity(self):
+        self.assertTrue(sc.csp_window_open([80, 95], True, "NORMAL"))
+        self.assertFalse(sc.csp_window_open([80, 95], False, "NORMAL"))
+
+    def test_stage1_and_stage2_open_regardless_of_price(self):
+        # 恐慌档 (既有) 和解除窗加成 (新增): 价格在带上方也出票 —
+        # 行权价仍被接货带上沿硬约束, 年化不过线自然拦
+        self.assertTrue(sc.csp_window_open([80, 95], False, "STAGE1"))
+        self.assertTrue(sc.csp_window_open([80, 95], False, "STAGE1_DEEP"))
+        self.assertTrue(sc.csp_window_open([80, 95], False, "STAGE2_WINDOW"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

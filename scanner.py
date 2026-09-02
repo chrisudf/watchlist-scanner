@@ -459,7 +459,9 @@ REGIME_NOTES = {
     "NORMAL": "正常结构 — 左侧看个股价值区, 右侧按确认信号走",
     "STAGE1": "倒挂 (阶段1) — 剧本: 只做卖方 (CSP 第一档), 不加右侧仓",
     "STAGE1_DEEP": "倒挂 >1.1 (历史级恐慌区) — 剧本: CSP 加第二/三档, 周权+16法则, 右侧仍停",
-    "STAGE2_WINDOW": "倒挂解除窗口 (阶段2) — 剧本: buy the relief — 价格确认后 LEAP/risk reversal",
+    "STAGE2_WINDOW": ("倒挂解除窗口 (阶段2) — 剧本: buy the relief — 价格确认后 "
+                      "LEAP/risk reversal; CSP 常规档解锁 (解除窗 = 统计最强"
+                      "卖权入场窗: 解除日起 SPX 5日 +3.04%/88%, 21日 +4.38%/91%)"),
 }
 
 
@@ -769,6 +771,20 @@ def _finish_csp(c: dict, spot: float, s: dict, zone, panic: bool,
         notes.append(f"行权价高于价值区上沿 {zone[1]:g} — 被行权成本不在接货区, 可下移到 <= {zone[1]:g}")
     c["notes"] = notes
     return c
+
+
+def csp_window_open(zone, in_or_near_zone: bool, stage: str) -> bool:
+    """CSP 出票窗口: 有接货价, 且 (价格在/近区 或 恐慌档 或 阶段2解除窗口)。
+
+    阶段2 加入依据 (2026-09-02 研究, options.cafe 2009 年以来 43 次倒挂
+    事件): 解除日买入 SPX 前瞻 5日 +3.04%/胜率88%, 21日 +4.38%/91%,
+    63日 +6.93%/88%, 每个周期都碾压基线 (+0.26%/60%, +1.07%/68%,
+    +3.10%/75%) — 解除窗口是全数据里胜率最高的卖权入场窗, 且 IV 尚未
+    塌完时权利金最肥。倒挂开始日反而无短期边际 (5日 -0.15%/51%,
+    74% 的 episode 期间继续跌) — 所以加成给解除, 不给开始。"""
+    return zone is not None and (
+        in_or_near_zone or stage.startswith("STAGE1")
+        or stage == "STAGE2_WINDOW")
 
 
 def csp_ticket(cc: ChainCache, spot: float, iv30: float | None,
@@ -1162,11 +1178,21 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
         # CSP = 在愿意接货的价位卖 put — 没设价值区就没有接货价, 不出票
         # (剧本 ORCL 教训: 不想接货的 put 本来就不该卖)。与状态标签解耦:
         # 价格在/近价值区就出, 趋势上方也一样 — 接货限价单与趋势方向无关。
-        want_csp = zone is not None and (
-            in_or_near_zone or stage.startswith("STAGE1"))
+        want_csp = csp_window_open(zone, in_or_near_zone, stage)
         if zone is None and stage.startswith("STAGE1"):
             r["notes"].append("倒挂期但未设价值区 — 剧本: 不想接货的 put 不该卖; "
                               "在 watchlist.toml 设好 value_zone 才出 CSP 票")
+        if stage == "STAGE2_WINDOW":
+            if want_csp and not in_or_near_zone:
+                r["notes"].append(
+                    "阶段2解除窗口 = 统计最强卖权入场窗 (解除日起 SPX 5日 "
+                    "+3.04%/88%, 21日 +4.38%/91% — options.cafe 2009-2025 "
+                    "43 次事件): 价格虽在接货带上方仍试出 CSP 常规档, "
+                    "行权价仍卡接货带上沿, 年化不过线自然拦")
+            elif zone is None:
+                r["notes"].append(
+                    "阶段2解除窗口 (统计最强卖权窗: 解除日起 5日 +3.04%/88%) "
+                    "但未设价值区 — 设好 value_zone 才出 CSP 票")
 
         fresh_confirm = state == "CONFIRMED" and prev not in ("CONFIRMED", "TREND")
         if stage == "STAGE2_WINDOW":
@@ -1400,7 +1426,11 @@ def regime_block(regime: dict) -> list[str]:
     if regime["crossed_up"]:
         lines.append("- ⚠️ **ratio 上穿 1.0** — 新一轮倒挂开始: CSP 第一档启动, 右侧停")
     if regime["crossed_down"]:
-        lines.append("- ⚠️ **ratio 下穿 1.0** — 倒挂解除: 等价格确认 (收复20日线/不再新低) 后进阶段2")
+        lines.append(
+            "- ⚠️ **ratio 下穿 1.0** — 倒挂解除: 历史上是统计最强入场窗 "
+            "(2009 年以来解除日买 SPX: 5日 +3.04%/88%, 21日 +4.38%/91% vs "
+            "基线 +0.26%/60%); 达标 episode (≥3日, 峰值≥1.10) 进阶段2 → "
+            "CSP 常规档 + LEAP 窗口, 浅倒挂解除无加成")
     ep = regime["last_episode"]
     if ep and (ep["ongoing"] or regime["stage"] == "STAGE2_WINDOW"):
         lines.append(
