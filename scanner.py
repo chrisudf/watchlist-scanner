@@ -120,6 +120,9 @@ SETTINGS_DEFAULTS = {
     # 倒挂门控矩阵 (2026-09-02 研究: VIX 系族横评 + 回测证据实查)
     "vx_full_backwardation_halt": True,  # VX 全曲线倒挂 = 停开新票 (21/22 crash filter)
     "vx_curve_contracts": 5,             # 曲线形态看前 N 个月度合约
+    "vvix_halt": 110.0,          # NORMAL 期 VVIX >= 此值 = 停开新 CSP
+    "move_divergence": 100.0,    # MOVE > 此值且 VIX 平静 = 债波先行预警
+    "move_calm_vix_max": 18.0,   # "VIX 平静"的上限
 }
 
 
@@ -269,12 +272,15 @@ CBOE_HISTORY_URL = ("https://cdn.cboe.com/api/global/us_indices/"
 def _cboe_series(name: str) -> pd.Series:
     """Official CBOE daily closes. Primary source for the VIX complex —
     Yahoo's ^VIX3M/^VIX9D feeds go stale for weeks at a time (observed
-    2026-08: ^VIX3M frozen since 07-17 while ^VIX stayed current)."""
+    2026-08: ^VIX3M frozen since 07-17 while ^VIX stayed current).
+    VIX/VIX3M/VXN files carry an OHLC 的 CLOSE 列; VVIX 只有两列
+    (DATE,VVIX) — 没有 CLOSE 时取第二列。"""
     req = urllib.request.Request(CBOE_HISTORY_URL.format(name),
                                  headers={"User-Agent": "Mozilla/5.0"})
     text = urllib.request.urlopen(req, timeout=30).read().decode()
     df = pd.read_csv(io.StringIO(text))
-    ser = pd.Series(df["CLOSE"].astype(float).values,
+    col = "CLOSE" if "CLOSE" in df.columns else df.columns[1]
+    ser = pd.Series(df[col].astype(float).values,
                     index=pd.to_datetime(df["DATE"], format="%m/%d/%Y"))
     return ser.tail(400)
 
@@ -372,7 +378,46 @@ def fetch_vx_curve(n_front: int = 5) -> dict:
     return {"error": last_err}
 
 
-def assess_vol_gates(stage: str, vx: dict, s: dict) -> dict:
+def fetch_vvix() -> dict:
+    """VVIX (VIX 期权隐含的 vol-of-vol) — CBOE 日收盘 + 同日盘中临时点,
+    与 VIX 的 intraday graft 同约定. -> {'value','as_of'} or {'error'}."""
+    try:
+        ser = _cboe_series("VVIX")
+        val, as_of = float(ser.iloc[-1]), str(ser.index[-1].date())
+        try:
+            v_now, v_ts = _cboe_delayed("VVIX")
+            if v_ts.date() == datetime.now(ET).date():
+                val, as_of = v_now, f"{v_ts.date()} 盘中"
+        except Exception:
+            pass
+        return {"value": val, "as_of": as_of}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def fetch_move() -> dict:
+    """^MOVE (ICE BofA 美债波动率) — 只有 Yahoo 源, 无 CBOE 兜底。
+    Yahoo 指数 feed 会断更 (见 ^VIX3M 前科): 最新点老于 5 个交易日
+    按 error 报, 不当读数用. -> {'value','as_of'} or {'error'}."""
+    try:
+        ser = yf.download("^MOVE", period="3mo", interval="1d",
+                          auto_adjust=False, progress=False)["Close"]
+        if hasattr(ser, "columns"):     # 单 ticker 也可能回 DataFrame
+            ser = ser.iloc[:, 0]
+        ser = ser.dropna()
+        if ser.empty:
+            return {"error": "empty feed"}
+        last_date = ser.index[-1].date()
+        age = int(np.busday_count(last_date, datetime.now(ET).date()))
+        if age > 5:
+            return {"error": f"stale (最新 {last_date})"}
+        return {"value": float(ser.iloc[-1]), "as_of": str(last_date)}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def assess_vol_gates(stage: str, vx: dict, vvix: dict, move: dict,
+                     vix_level: float, s: dict) -> dict:
     """Cross-signal gates layered on top of the VIX/VIX3M stage machine.
     -> {"halt_csp": str|None, "halt_new_longs": str|None, "warnings": [...]}
     halt_csp 拦新 CSP 票, halt_new_longs 拦 LEAP/回踩 spread —
@@ -390,6 +435,25 @@ def assess_vol_gates(stage: str, vx: dict, s: dict) -> dict:
         warnings.append(
             f"VX 期货 M1 {vx['m1']:.2f} > M2 {vx['m2']:.2f} 局部倒挂 — "
             "前端承压, 关注是否蔓延成全曲线 (全曲线 = 硬停牌)")
+
+    # VVIX 停牌线: 只管 NORMAL — 平静表面下 vol-of-vol 抢跑 = 对冲拥挤/
+    # 裂缝先兆, 不该再开新短 put。STAGE1 恐慌档 (16法则) 与 STAGE2 解除窗
+    # (统计加成) 都按剧本走, VVIX 高是那两个 regime 的常态, 不加拦。
+    v = vvix.get("value")
+    if halt_csp is None and stage == "NORMAL" \
+            and v is not None and v >= s["vvix_halt"]:
+        halt_csp = (f"VVIX {v:.1f} >= {s['vvix_halt']:g} 而 regime 仍 NORMAL "
+                    "— vol-of-vol 抢跑 (对冲拥挤/裂缝先兆): 停开新 CSP, "
+                    "等 VVIX 回落或 regime 表态")
+    # MOVE 背离预警: 债波先行于股波 (2023-03 SVB: MOVE 130→200 两天,
+    # VIX 晚数日; 2025-04 basis trade: MOVE ~172 先到) — 预警不拦票。
+    m = move.get("value")
+    if m is not None and m > s["move_divergence"] \
+            and vix_level < s["move_calm_vix_max"]:
+        warnings.append(
+            f"MOVE {m:.1f} > {s['move_divergence']:g} 而 VIX 仅 "
+            f"{vix_level:.1f} — 债券波动率先行 (2023-03 SVB / 2025-04 "
+            "序列): 缩短 put 名义, 对冲前移到长期限指数 put")
     return {"halt_csp": halt_csp, "halt_new_longs": halt_longs,
             "warnings": warnings}
 
@@ -438,10 +502,15 @@ def fetch_regime(s: dict) -> dict:
     prev = float(ratio.iloc[-2])
     cur = float(ratio.iloc[-1])
     vx = fetch_vx_curve(s["vx_curve_contracts"])
-    gates = assess_vol_gates(stage, vx, s)
+    vvix = fetch_vvix()
+    move = fetch_move()
+    gates = assess_vol_gates(stage, vx, vvix, move, float(vix.iloc[-1]), s)
     return {
         "vix": float(vix.iloc[-1]), "vix3m": float(vix3m.iloc[-1]),
         "vxn": vxn_last,
+        "vvix": vvix, "move": move,
+        "gate_lines": {"vvix_halt": s["vvix_halt"],
+                       "move_divergence": s["move_divergence"]},
         "ratio": cur, "ratio_prev": prev,
         "crossed_up": prev < 1.0 <= cur, "crossed_down": prev >= 1.0 > cur,
         "stage": stage,
@@ -1213,6 +1282,12 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
             want_leap = fresh_confirm and stage == "NORMAL"
         if fresh_confirm and stage.startswith("STAGE1"):
             r["notes"].append("右侧信号出现但倒挂未解除 — 剧本: 倒挂持续期间不加右侧仓, 等阶段2")
+        vvix_now = (regime.get("vvix") or {}).get("value")
+        if want_leap and vvix_now is not None and vvix_now >= s["vvix_halt"]:
+            r["notes"].append(
+                f"VVIX {vvix_now:.0f} >= {s['vvix_halt']:g} — vega 贵: LEAP "
+                "只要 deep ITM 低外在档 (票内过滤器已管), 或等 VVIX 回落; "
+                "<90 才是囤凸性的窗口")
 
         # 倒挂门控矩阵的硬门: 拦截以 skip_reason 呈现, 原因随票可见 —
         # 不是静默消失 (被拦的票在报告里显示 ⏸ + 原因)
@@ -1416,6 +1491,17 @@ def regime_block(regime: dict) -> list[str]:
             f"- VX 期货: M1 {vx['m1']:.2f} ({vx['m1_exp']}) → "
             f"M2 {vx['m2']:.2f} ({vx['m2_exp']}), M1→M2 {vx['m1_m2_pct']:+.1f}% "
             f"— {vx_label} (结算 {vx['as_of']})")
+    vvix, move = regime.get("vvix") or {}, regime.get("move") or {}
+    if vvix or move:
+        def _gauge(d, name, line_val, line_label):
+            if d.get("error"):
+                return f"{name} 获取失败"
+            return (f"{name} **{d['value']:.1f}** ({line_label} {line_val:g}, "
+                    f"as of {d['as_of']})")
+        gl = regime.get("gate_lines", SETTINGS_DEFAULTS)
+        lines.append(
+            "- " + _gauge(vvix, "VVIX", gl["vvix_halt"], "停牌线")
+            + " | " + _gauge(move, "MOVE", gl["move_divergence"], "背离线"))
     for w in regime.get("gate_warnings", []):
         lines.append(f"- ⚠️ {w}")
     if regime.get("halt_csp") or regime.get("halt_new_longs"):

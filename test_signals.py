@@ -352,37 +352,73 @@ class TestVXCurve(unittest.TestCase):
             "FULL_BACKWARDATION")
         self.assertIsNone(sc.vx_curve_state([17.0]))       # 合约不足无读数
 
+    @staticmethod
+    def _gates(stage, vx, vvix=None, move=None, vix_level=16.0, s=None):
+        return sc.assess_vol_gates(stage, vx, vvix or {}, move or {},
+                                   vix_level, s or sc.SETTINGS_DEFAULTS)
+
     def test_gates_full_backwardation_halts(self):
-        s = sc.SETTINGS_DEFAULTS
         vx = {"state": "FULL_BACKWARDATION", "m1": 28.0, "m2": 25.0,
               "as_of": "2026-09-01"}
-        g = sc.assess_vol_gates("STAGE1_DEEP", vx, s)
+        g = self._gates("STAGE1_DEEP", vx)
         self.assertIn("全曲线倒挂", g["halt_csp"])
         self.assertIn("全曲线倒挂", g["halt_new_longs"])
         # 开关只放行 CSP (剧本恐慌档), LEAP/spread 仍拦
-        s_off = {**s, "vx_full_backwardation_halt": False}
-        g = sc.assess_vol_gates("STAGE1_DEEP", vx, s_off)
+        s_off = {**sc.SETTINGS_DEFAULTS, "vx_full_backwardation_halt": False}
+        g = self._gates("STAGE1_DEEP", vx, s=s_off)
         self.assertIsNone(g["halt_csp"])
         self.assertIsNotNone(g["halt_new_longs"])
 
     def test_gates_partial_warns_contango_silent(self):
-        s = sc.SETTINGS_DEFAULTS
-        g = sc.assess_vol_gates(
-            "NORMAL", {"state": "PARTIAL_BACKWARDATION",
-                       "m1": 21.0, "m2": 19.0, "as_of": "x"}, s)
+        g = self._gates("NORMAL", {"state": "PARTIAL_BACKWARDATION",
+                                   "m1": 21.0, "m2": 19.0, "as_of": "x"})
         self.assertIsNone(g["halt_csp"])
         self.assertTrue(any("局部倒挂" in w for w in g["warnings"]))
-        g = sc.assess_vol_gates(
-            "NORMAL", {"state": "CONTANGO", "m1": 17.0, "m2": 19.0,
-                       "as_of": "x"}, s)
+        g = self._gates("NORMAL", {"state": "CONTANGO", "m1": 17.0,
+                                   "m2": 19.0, "as_of": "x"})
         self.assertEqual((g["halt_csp"], g["halt_new_longs"], g["warnings"]),
                          (None, None, []))
 
     def test_gates_degrade_on_feed_error(self):
         # 数据坏 = 门失效, 不硬拦
-        g = sc.assess_vol_gates("NORMAL", {"error": "HTTPError: 503"},
-                                sc.SETTINGS_DEFAULTS)
-        self.assertEqual((g["halt_csp"], g["halt_new_longs"]), (None, None))
+        g = self._gates("NORMAL", {"error": "HTTPError: 503"},
+                        {"error": "x"}, {"error": "y"})
+        self.assertEqual((g["halt_csp"], g["halt_new_longs"], g["warnings"]),
+                         (None, None, []))
+
+    def test_vvix_halt_only_in_normal(self):
+        # NORMAL 期 VVIX >= 110 = 平静表面下的对冲拥挤 → 停开新 CSP;
+        # STAGE1 恐慌档 / STAGE2 解除窗 VVIX 高是常态, 不拦 (剧本优先)
+        vx = {"state": "CONTANGO", "m1": 17.0, "m2": 19.0, "as_of": "x"}
+        g = self._gates("NORMAL", vx, {"value": 115.0, "as_of": "x"})
+        self.assertIn("VVIX", g["halt_csp"])
+        self.assertIsNone(g["halt_new_longs"])
+        for stage in ("STAGE1", "STAGE1_DEEP", "STAGE2_WINDOW"):
+            g = self._gates(stage, vx, {"value": 150.0, "as_of": "x"})
+            self.assertIsNone(g["halt_csp"], stage)
+        g = self._gates("NORMAL", vx, {"value": 109.9, "as_of": "x"})
+        self.assertIsNone(g["halt_csp"])
+
+    def test_vx_halt_message_wins_over_vvix(self):
+        g = self._gates("NORMAL",
+                        {"state": "FULL_BACKWARDATION", "m1": 28.0,
+                         "m2": 25.0, "as_of": "x"},
+                        {"value": 150.0, "as_of": "x"})
+        self.assertIn("全曲线倒挂", g["halt_csp"])
+
+    def test_move_divergence_warns_not_halts(self):
+        # MOVE 破线且 VIX 平静 = 债波先行预警; VIX 已经起来就不是背离
+        vx = {"state": "CONTANGO", "m1": 17.0, "m2": 19.0, "as_of": "x"}
+        g = self._gates("NORMAL", vx, move={"value": 105.0, "as_of": "x"},
+                        vix_level=16.0)
+        self.assertTrue(any("MOVE" in w for w in g["warnings"]))
+        self.assertIsNone(g["halt_csp"])
+        g = self._gates("NORMAL", vx, move={"value": 105.0, "as_of": "x"},
+                        vix_level=22.0)
+        self.assertEqual(g["warnings"], [])
+        g = self._gates("NORMAL", vx, move={"value": 95.0, "as_of": "x"},
+                        vix_level=16.0)
+        self.assertEqual(g["warnings"], [])
 
 
 class TestCSPWindow(unittest.TestCase):
