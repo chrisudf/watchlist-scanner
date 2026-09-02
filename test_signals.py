@@ -439,6 +439,74 @@ class TestCSPWindow(unittest.TestCase):
         self.assertTrue(sc.csp_window_open([80, 95], False, "STAGE2_WINDOW"))
 
 
+class TestStage2LeapGate(unittest.TestCase):
+    def test_halt_shows_ticket_but_keeps_key(self):
+        # halt 期间: want_leap=True (⏸ skip 行可见) 但不烧 dedup key —
+        # VX 结算滞后一天, 解除窗第一天常读到恐慌尾巴的旧曲线,
+        # 烧了 key 整个 episode 的 LEAP 补发窗静默丢失 (评审 finding #1)
+        want, burn = sc.stage2_leap_gate(True, None, "2026-08-28", halted=True)
+        self.assertTrue(want)
+        self.assertFalse(burn)
+        # halt 解除后同窗口内: 补发 + 烧 key
+        want, burn = sc.stage2_leap_gate(True, None, "2026-08-28", halted=False)
+        self.assertTrue(want)
+        self.assertTrue(burn)
+
+    def test_key_already_burned_dedups(self):
+        want, burn = sc.stage2_leap_gate(True, "2026-08-28", "2026-08-28",
+                                         halted=False)
+        self.assertFalse(want)
+        self.assertFalse(burn)
+
+    def test_price_not_ok(self):
+        want, burn = sc.stage2_leap_gate(False, None, "2026-08-28",
+                                         halted=False)
+        self.assertFalse(want)
+        self.assertFalse(burn)
+
+
+class TestVVIXStaleness(unittest.TestCase):
+    def _frozen_series(self, bdays_ago, val=118.0):
+        end = pd.Timestamp(np.busday_offset(
+            np.datetime64(datetime.now(sc.ET).date()), -bdays_ago,
+            roll="backward"))
+        idx = pd.bdate_range(end=end, periods=90)
+        return pd.Series([val] * 90, index=idx)
+
+    def test_frozen_feed_is_error_not_reading(self):
+        # 冻结 15 个交易日 + 盘中点也挂 → error, 门自动失效 (评审 finding #2:
+        # 这是唯一在 NORMAL 期硬拦 CSP 的门, 不能拿旧数当读数)
+        from unittest.mock import patch
+        with patch.object(sc, "_cboe_series",
+                          return_value=self._frozen_series(15)), \
+             patch.object(sc, "_cboe_delayed",
+                          side_effect=RuntimeError("down")):
+            out = sc.fetch_vvix()
+        self.assertIn("error", out)
+        self.assertIn("stale", out["error"])
+
+    def test_fresh_close_passes(self):
+        from unittest.mock import patch
+        with patch.object(sc, "_cboe_series",
+                          return_value=self._frozen_series(1, val=91.25)), \
+             patch.object(sc, "_cboe_delayed",
+                          side_effect=RuntimeError("down")):
+            out = sc.fetch_vvix()
+        self.assertAlmostEqual(out["value"], 91.25)
+
+    def test_intraday_graft_rescues_frozen_history(self):
+        # 历史 CSV 冻结但今天的盘中点拿得到 → 用盘中点, 不报 error
+        from unittest.mock import patch
+        today = datetime.now(sc.ET)
+        with patch.object(sc, "_cboe_series",
+                          return_value=self._frozen_series(15)), \
+             patch.object(sc, "_cboe_delayed",
+                          return_value=(95.5, today)):
+            out = sc.fetch_vvix()
+        self.assertAlmostEqual(out["value"], 95.5)
+        self.assertIn("盘中", out["as_of"])
+
+
 class TestRR25(unittest.TestCase):
     @staticmethod
     def _row(strike, iv, delta):

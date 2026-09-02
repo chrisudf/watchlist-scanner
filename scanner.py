@@ -382,16 +382,23 @@ def fetch_vx_curve(n_front: int = 5) -> dict:
 
 def fetch_vvix() -> dict:
     """VVIX (VIX 期权隐含的 vol-of-vol) — CBOE 日收盘 + 同日盘中临时点,
-    与 VIX 的 intraday graft 同约定. -> {'value','as_of'} or {'error'}."""
+    与 VIX 的 intraday graft 同约定. -> {'value','as_of'} or {'error'}.
+    历史 CSV 冻结 (>5 交易日) 且盘中点也拿不到时按 error 报 — 这是唯一
+    在 NORMAL 期硬拦 CSP 的门, 绝不能拿旧数当读数 (与 fetch_move 同约定;
+    CBOE/Yahoo 指数 feed 断更有前科)."""
     try:
         ser = _cboe_series("VVIX")
         val, as_of = float(ser.iloc[-1]), str(ser.index[-1].date())
+        fresh = int(np.busday_count(ser.index[-1].date(),
+                                    datetime.now(ET).date())) <= 5
         try:
             v_now, v_ts = _cboe_delayed("VVIX")
             if v_ts.date() == datetime.now(ET).date():
-                val, as_of = v_now, f"{v_ts.date()} 盘中"
+                val, as_of, fresh = v_now, f"{v_ts.date()} 盘中", True
         except Exception:
             pass
+        if not fresh:
+            return {"error": f"stale (最新 {as_of})"}
         return {"value": val, "as_of": as_of}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
@@ -444,9 +451,10 @@ def assess_vol_gates(stage: str, vx: dict, vvix: dict, move: dict,
     v = vvix.get("value")
     if halt_csp is None and stage == "NORMAL" \
             and v is not None and v >= s["vvix_halt"]:
-        halt_csp = (f"VVIX {v:.1f} >= {s['vvix_halt']:g} 而 regime 仍 NORMAL "
-                    "— vol-of-vol 抢跑 (对冲拥挤/裂缝先兆): 停开新 CSP, "
-                    "等 VVIX 回落或 regime 表态")
+        halt_csp = (f"VVIX {v:.1f} (as of {vvix.get('as_of', '?')}) >= "
+                    f"{s['vvix_halt']:g} 而 regime 仍 NORMAL — vol-of-vol "
+                    "抢跑 (对冲拥挤/裂缝先兆): 停开新 CSP, 等 VVIX 回落"
+                    "或 regime 表态")
     # MOVE 背离预警: 债波先行于股波 (2023-03 SVB: MOVE 130→200 两天,
     # VIX 晚数日; 2025-04 basis trade: MOVE ~172 先到) — 预警不拦票。
     m = move.get("value")
@@ -906,6 +914,19 @@ def _finish_csp(c: dict, spot: float, s: dict, zone, panic: bool,
     return c
 
 
+def stage2_leap_gate(price_ok: bool, prev_leap_window, ep_end: str,
+                     halted: bool) -> tuple[bool, bool]:
+    """阶段2 LEAP 决策 -> (want_leap, burn_key)。
+
+    halted (VX 全曲线倒挂等硬门) 时票仍走 skip_reason 呈现 (⏸ 行可见),
+    但**不烧**每窗口一次的 leap_window dedup key — 硬门是暂态市场条件,
+    且 VX 结算滞后一个交易日, 解除窗第一天常读到恐慌尾巴的旧曲线;
+    烧了 key 会让整个 episode 的 LEAP 补发窗静默丢失。与 retest
+    一次性标记的处理一致 (halt 期间不置位)。"""
+    want = price_ok and prev_leap_window != ep_end
+    return want, want and not halted
+
+
 def csp_window_open(zone, in_or_near_zone: bool, stage: str) -> bool:
     """CSP 出票窗口: 有接货价, 且 (价格在/近区 或 恐慌档 或 阶段2解除窗口)。
 
@@ -1352,8 +1373,10 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
             ep_end = str(regime["last_episode"]["end"].date())
             price_ok = tech["close"] > tech["sma20"] \
                 or tech["signals"]["no_new_low"]
-            want_leap = price_ok and prev_state.get("leap_window") != ep_end
-            if want_leap:
+            want_leap, burn_key = stage2_leap_gate(
+                price_ok, prev_state.get("leap_window"), ep_end,
+                bool(regime.get("halt_new_longs")))
+            if burn_key:
                 r["leap_window"] = ep_end
                 r["notes"].append("阶段2解除窗口 — buy the relief: 价格条件"
                                   "(收上20日线/不再新低 二选一)已满足; 工具: "
