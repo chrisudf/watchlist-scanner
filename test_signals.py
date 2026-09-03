@@ -290,6 +290,20 @@ class TestPersistedState(unittest.TestCase):
         e = sc.next_persisted_state(prev, {"state": "TREND"}, "2026-08-09")
         self.assertTrue(e["retested"])
 
+    def test_leap_pending_lifecycle(self):
+        # 二轮评审 finding: NORMAL 期 fresh_confirm 被硬停牌吞掉 —
+        # 被拦当日置 leap_pending, 随右侧状态存活
+        e = sc.next_persisted_state(
+            {}, {"state": "CONFIRMED", "leap_pending": True}, "2026-09-03")
+        self.assertTrue(e["leap_pending"])
+        # halt 解除、真票发出当日: r 不再带标记 → 自然清除
+        e2 = sc.next_persisted_state(e, {"state": "TREND"}, "2026-09-04")
+        self.assertNotIn("leap_pending", e2)
+        # 止损出局: 即使当日仍被拦, 标记不得跟进 PULLBACK (确认周期已死)
+        e3 = sc.next_persisted_state(
+            e, {"state": "PULLBACK", "leap_pending": True}, "2026-09-04")
+        self.assertNotIn("leap_pending", e3)
+
 
 class TestClock(unittest.TestCase):
     def _et(self, h, m, weekday_date="2026-08-07"):  # a Friday
@@ -352,6 +366,16 @@ class TestVXCurve(unittest.TestCase):
             "FULL_BACKWARDATION")
         self.assertIsNone(sc.vx_curve_state([17.0]))       # 合约不足无读数
 
+    def test_curve_state_ties(self):
+        # 二轮评审 finding: feed 会填充未成交行造成相邻平价 (tie) —
+        # 全程非升且至少一段真跌 = 实质全曲线倒挂, 不因 tie 降级/静默
+        self.assertEqual(sc.vx_curve_state([28, 25, 25, 22, 21]),
+                         "FULL_BACKWARDATION")             # tie 在中段
+        self.assertEqual(sc.vx_curve_state([25, 25, 22, 21, 20]),
+                         "FULL_BACKWARDATION")             # tie 开头
+        self.assertEqual(sc.vx_curve_state([25.0, 25.0, 25.0, 25.0]),
+                         "CONTANGO")                       # 全平 ≠ 倒挂
+
     @staticmethod
     def _gates(stage, vx, vvix=None, move=None, vix_level=16.0, s=None):
         return sc.assess_vol_gates(stage, vx, vvix or {}, move or {},
@@ -363,11 +387,14 @@ class TestVXCurve(unittest.TestCase):
         g = self._gates("STAGE1_DEEP", vx)
         self.assertIn("全曲线倒挂", g["halt_csp"])
         self.assertIn("全曲线倒挂", g["halt_new_longs"])
-        # 开关只放行 CSP (剧本恐慌档), LEAP/spread 仍拦
+        # 开关只放行 CSP (剧本恐慌档), LEAP/spread 仍拦 — 且消息必须
+        # 与实际拦截范围一致 (二轮评审: 不能一边发 CSP 票一边写"停开新票")
         s_off = {**sc.SETTINGS_DEFAULTS, "vx_full_backwardation_halt": False}
         g = self._gates("STAGE1_DEEP", vx, s=s_off)
         self.assertIsNone(g["halt_csp"])
-        self.assertIsNotNone(g["halt_new_longs"])
+        self.assertIn("CSP 已按", g["halt_new_longs"])
+        self.assertIn("放行", g["halt_new_longs"])
+        self.assertNotIn("停开新 CSP", g["halt_new_longs"])
 
     def test_gates_partial_warns_contango_silent(self):
         g = self._gates("NORMAL", {"state": "PARTIAL_BACKWARDATION",
@@ -465,6 +492,42 @@ class TestStage2LeapGate(unittest.TestCase):
         self.assertFalse(burn)
 
 
+class TestActionBlockHaltDedup(unittest.TestCase):
+    def _r(self, sym, **kw):
+        base = {"symbol": sym, "error": None, "tech": {"close": 100},
+                "notes": [], "state": "LEFT_ZONE", "leap": None, "csp": None,
+                "iv30": None,
+                "cfg": {"value_zone": [80, 95], "options": True}}
+        base.update(kw)
+        return base
+
+    def test_regime_halt_merges_into_one_line(self):
+        # 二轮评审 finding: 全市场硬停牌逐票重复 ~150 字长文 — 合并一行,
+        # 全文只留在市场状态 ⛔ 行
+        ivdf = pd.DataFrame(columns=["date", "symbol", "iv30", "rv30"])
+        halt = {"skip_reason": "VX 期货全曲线倒挂 (M1 28.00 > M2 25.00) — 停开新票",
+                "regime_halt": True}
+        rs = [self._r("AAA", csp=dict(halt)),
+              self._r("BBB", csp=dict(halt), leap=dict(halt)),
+              self._r("CCC", state="UPTREND")]
+        text = "\n".join(sc.action_block(rs, ivdf))
+        self.assertEqual(text.count("全市场硬停牌"), 1)
+        self.assertIn("AAA", text)
+        self.assertIn("BBB", text)
+        self.assertNotIn("VX 期货全曲线倒挂", text)   # 长文不进今日动作
+        self.assertIn("其余今日无动作: CCC", text)
+
+    def test_non_regime_skip_still_itemized(self):
+        # 普通 skip (年化不足等) 照旧逐票 ⏸, 且 LEAP 行带工具前缀
+        ivdf = pd.DataFrame(columns=["date", "symbol", "iv30", "rv30"])
+        rs = [self._r("AAA", csp={"skip_reason": "年化仅 6.0%"},
+                      leap={"skip_reason": "财报 2026-09-09 就在 6 天后"})]
+        text = "\n".join(sc.action_block(rs, ivdf))
+        self.assertIn("⏸ **AAA** CSP: 年化仅", text)
+        self.assertIn("⏸ **AAA** LEAP: 财报", text)
+        self.assertNotIn("全市场硬停牌", text)
+
+
 class TestVVIXStaleness(unittest.TestCase):
     def _frozen_series(self, bdays_ago, val=118.0):
         end = pd.Timestamp(np.busday_offset(
@@ -539,6 +602,17 @@ class TestRR25(unittest.TestCase):
         self.assertAlmostEqual(out["rr"], -7.0, places=6)
         self.assertTrue(out["inverted"])
         self.assertEqual((out["call_strike"], out["put_strike"]), (115, 90))
+
+    def test_rr_noise_floor(self):
+        # 二轮评审 finding (high): 延迟报价 RR 有 ~1 pt run-to-run 漂移,
+        # 零阈值在真实 skew≈0 时反复亮假旗标 — 地板内不亮, 地板外才亮
+        calls = [self._row(115, 0.304, 0.25)]
+        puts = [self._row(90, 0.300, -0.25)]
+        out = sc.rr25(calls, puts, invert_floor=1.0)
+        self.assertAlmostEqual(out["rr"], -0.4, places=6)
+        self.assertFalse(out["inverted"])       # -0.4 pts = 噪声, 不亮
+        out = sc.rr25([self._row(115, 0.315, 0.25)], puts, invert_floor=1.0)
+        self.assertTrue(out["inverted"])        # -1.5 pts = 真倒挂
 
     def test_rr_missing_side_is_none(self):
         calls = [self._row(115, 0.28, 0.25)]
