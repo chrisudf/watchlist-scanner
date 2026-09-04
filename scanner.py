@@ -2179,6 +2179,208 @@ def render_open(results, regime, now_et, s: dict) -> str:
 # Main
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# Email rendering
+# --------------------------------------------------------------------------
+
+# 邮件客户端 (尤其 Gmail 手机版) 会剥掉 <style> 块, 所以样式一律内联。
+# 也不用 flex/grid —— 老客户端不认。
+_FONT = ("-apple-system,BlinkMacSystemFont,'Segoe UI',"
+         "'PingFang SC','Microsoft YaHei',Roboto,sans-serif")
+_MONO = "ui-monospace,SFMono-Regular,Menlo,Consolas,monospace"
+
+# 行首状态标记 -> 卡片色 (手机上扫一眼靠它)
+_MARK_COLORS = {
+    "⛔": ("#fef2f2", "#dc2626"),   # 硬拦/停牌 — 红
+    "🔴": ("#fef2f2", "#dc2626"),
+    "⚠️": ("#fffbeb", "#d97706"),   # 预警 — 琥珀
+    "🟡": ("#fffbeb", "#d97706"),
+    "⏸": ("#f8fafc", "#94a3b8"),   # 被拦的票 — 灰
+    "🟢": ("#f0fdf4", "#16a34a"),   # LEAP 票 — 绿
+    "🔵": ("#eff6ff", "#2563eb"),   # CSP 票 — 蓝
+    "👀": ("#f5f3ff", "#7c3aed"),   # 关注 — 紫
+}
+
+
+def _md_inline(text: str) -> str:
+    """**粗体** / `代码` -> HTML, 其余转义。"""
+    import html as _html
+    import re
+    out = _html.escape(text)
+    out = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", out)
+    out = re.sub(
+        r"`(.+?)`",
+        r"<code style=\"font-family:" + _MONO +
+        r";font-size:12px;background:#f1f5f9;padding:1px 4px;"
+        r"border-radius:3px\">\1</code>", out)
+    return out
+
+
+def _mark_style(text: str):
+    """行首若是状态标记, 返回 (背景色, 左边框色), 否则 None。"""
+    for mark, colors in _MARK_COLORS.items():
+        if text.startswith(mark):
+            return colors
+    return None
+
+
+def _is_numeric_cell(s: str) -> bool:
+    import re
+    return bool(re.fullmatch(r"[+\-—–]?[\d.,]*%?x?", s.strip())) and any(
+        c.isdigit() for c in s)
+
+
+def _html_table(rows: list[list[str]]) -> str:
+    """真表格 + 横向滚动。概览表有 11 列, 手机上必须能横拖, 否则挤成一团。"""
+    head, body = rows[0], rows[1:]
+    th = "".join(
+        f'<th style="padding:7px 9px;text-align:left;font-weight:600;'
+        f'font-size:12px;color:#475569;border-bottom:2px solid #cbd5e1;'
+        f'white-space:nowrap">{_md_inline(c)}</th>' for c in head)
+    trs = []
+    for i, row in enumerate(body):
+        bg = "#ffffff" if i % 2 == 0 else "#f8fafc"
+        tds = "".join(
+            f'<td style="padding:7px 9px;font-size:13px;color:#0f172a;'
+            f'border-bottom:1px solid #e2e8f0;white-space:nowrap;'
+            f'text-align:{"right" if _is_numeric_cell(c) else "left"};'
+            f'font-family:{_MONO if _is_numeric_cell(c) else _FONT}">'
+            f'{_md_inline(c)}</td>' for c in row)
+        trs.append(f'<tr style="background:{bg}">{tds}</tr>')
+    return (
+        '<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;'
+        'margin:12px 0;border:1px solid #e2e8f0;border-radius:6px">'
+        '<table cellpadding="0" cellspacing="0" border="0" '
+        'style="border-collapse:collapse;width:100%;min-width:560px">'
+        f'<thead><tr style="background:#f1f5f9">{th}</tr></thead>'
+        f'<tbody>{"".join(trs)}</tbody></table></div>')
+
+
+def _split_row(line: str) -> list[str]:
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def _is_table_sep(line: str) -> bool:
+    body = line.replace("|", "").replace("-", "").replace(":", "").strip()
+    return "|" in line and "-" in line and body == ""
+
+
+def md_to_email_html(md: str) -> str:
+    """把报告的 markdown 子集转成邮件 HTML。
+
+    纯文本邮件里 11 列的表格就是一堆竖线, **粗体** 显示成星号 —— 手机上
+    基本没法读。这里只处理 render_close/render_open 实际会产出的子集:
+    #/##/### 标题、- 与两级缩进列表、表格、> 引用、--- 分隔线、行内
+    **粗体** 和 `代码`。不引第三方 markdown 库: 子集是我们自己生成的,
+    而且 droplet 上少一个依赖少一处会坏的地方。"""
+    lines = md.split("\n")
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        stripped = ln.strip()
+        if not stripped:
+            i += 1
+            continue
+
+        # 表格
+        if stripped.startswith("|") and i + 1 < len(lines) \
+                and _is_table_sep(lines[i + 1]):
+            rows = [_split_row(stripped)]
+            i += 2
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                rows.append(_split_row(lines[i]))
+                i += 1
+            out.append(_html_table(rows))
+            continue
+
+        # 标题
+        if stripped.startswith("### "):
+            out.append(
+                f'<h3 style="margin:22px 0 6px;font-size:15px;font-weight:600;'
+                f'color:#0f172a;border-left:3px solid #334155;padding-left:8px">'
+                f'{_md_inline(stripped[4:])}</h3>')
+            i += 1
+            continue
+        if stripped.startswith("## "):
+            out.append(
+                f'<h2 style="margin:26px 0 8px;font-size:17px;font-weight:700;'
+                f'color:#0f172a">{_md_inline(stripped[3:])}</h2>')
+            i += 1
+            continue
+        if stripped.startswith("# "):
+            out.append(
+                f'<h1 style="margin:0 0 4px;font-size:19px;font-weight:700;'
+                f'color:#0f172a;line-height:1.35">'
+                f'{_md_inline(stripped[2:])}</h1>')
+            i += 1
+            continue
+
+        # 分隔线
+        if stripped == "---":
+            out.append('<hr style="border:0;border-top:1px solid #e2e8f0;'
+                       'margin:22px 0">')
+            i += 1
+            continue
+
+        # 引用 (表格下面那行图例)
+        if stripped.startswith("> "):
+            buf = []
+            while i < len(lines) and lines[i].strip().startswith("> "):
+                buf.append(lines[i].strip()[2:])
+                i += 1
+            out.append(
+                f'<div style="margin:10px 0;padding:9px 11px;background:#f8fafc;'
+                f'border-left:3px solid #cbd5e1;font-size:12px;color:#475569;'
+                f'line-height:1.6">{_md_inline(" ".join(buf))}</div>')
+            continue
+
+        # 列表 (含两级缩进)
+        if stripped.startswith("- "):
+            items = []
+            while i < len(lines) and lines[i].strip().startswith("- "):
+                indent = len(lines[i]) - len(lines[i].lstrip())
+                items.append((indent, lines[i].strip()[2:]))
+                i += 1
+            for indent, text in items:
+                colors = _mark_style(text)
+                if indent >= 2:
+                    out.append(
+                        f'<div style="margin:2px 0 2px 20px;font-size:12px;'
+                        f'color:#64748b;line-height:1.65">· '
+                        f'{_md_inline(text)}</div>')
+                elif colors:
+                    bg, bar = colors
+                    out.append(
+                        f'<div style="margin:6px 0;padding:9px 11px;'
+                        f'background:{bg};border-left:4px solid {bar};'
+                        f'border-radius:0 4px 4px 0;font-size:13px;'
+                        f'color:#0f172a;line-height:1.6">'
+                        f'{_md_inline(text)}</div>')
+                else:
+                    out.append(
+                        f'<div style="margin:4px 0;padding-left:14px;'
+                        f'font-size:13px;color:#1e293b;line-height:1.65;'
+                        f'text-indent:-14px">• {_md_inline(text)}</div>')
+            continue
+
+        # 其余按段落
+        out.append(f'<p style="margin:8px 0;font-size:13px;color:#475569;'
+                   f'line-height:1.65">{_md_inline(stripped)}</p>')
+        i += 1
+
+    return (
+        f'<div style="margin:0;padding:14px;background:#f1f5f9">'
+        f'<div style="max-width:680px;margin:0 auto;background:#ffffff;'
+        f'padding:18px 20px;border-radius:8px;font-family:{_FONT};'
+        f'-webkit-text-size-adjust:100%">'
+        + "".join(out) +
+        f'<p style="margin:20px 0 0;padding-top:12px;'
+        f'border-top:1px solid #e2e8f0;font-size:11px;color:#94a3b8">'
+        f'watchlist-scanner · 自动发送, 请勿回复</p>'
+        f'</div></div>')
+
+
 def send_via_resend(api_key: str, sender: str, to: str, subject: str,
                     body: str) -> None:
     """Resend 的 HTTPS API (443)。
@@ -2191,8 +2393,11 @@ def send_via_resend(api_key: str, sender: str, to: str, subject: str,
     import json as _json
     import urllib.error
 
-    payload = _json.dumps({"from": sender, "to": [to],
-                           "subject": subject, "text": body}).encode("utf-8")
+    # text + html 都带: html 给正常客户端 (markdown 纯文本在手机上没法读),
+    # text 作为纯文本客户端和摘要预览的回落
+    payload = _json.dumps({"from": sender, "to": [to], "subject": subject,
+                           "text": body,
+                           "html": md_to_email_html(body)}).encode("utf-8")
     req = urllib.request.Request(
         "https://api.resend.com/emails", data=payload, method="POST",
         headers={"Authorization": f"Bearer {api_key}",
@@ -2245,7 +2450,9 @@ def send_email_report(report_path: Path, subject: str) -> None:
     msg["From"] = os.environ.get(
         "SCAN_EMAIL_FROM", os.environ.get("SCAN_SMTP_USER", "watchlist-scanner"))
     msg["To"] = to
-    msg.set_content(report_path.read_text(encoding="utf-8"))
+    report_md = report_path.read_text(encoding="utf-8")
+    msg.set_content(report_md)
+    msg.add_alternative(md_to_email_html(report_md), subtype="html")
     with smtplib.SMTP(host, int(os.environ.get("SCAN_SMTP_PORT", "587")),
                       timeout=30) as smtp:
         smtp.starttls()
