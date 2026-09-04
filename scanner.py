@@ -162,7 +162,12 @@ def next_persisted_state(prev: dict, r: dict, today: str) -> dict:
     """close 收盘后单标的 state.json 条目 (纯函数, 便于测试).
     - since: 状态变了才刷新
     - leap_window: 阶段2窗口 dedup key, 跨日携带
-    - retested: 回踩一次性提示 — 新一轮确认重新计数, 本日回踩置位, 否则沿用"""
+    - retested: 回踩一次性提示 — 新一轮确认重新计数, 本日回踩置位, 否则沿用
+    - leap_pending / retest_pending: 被硬停牌拦下的一次性事件补发标记 —
+      默认跨日**沿用**, 只在显式消耗 (真票发出 / 回踩已提示) 或确认周期
+      死亡 (状态离开 CONFIRMED/TREND) 时清除。不能拿"本次结果没带标记"
+      当消耗信号: --no-options 的非 manual 收盘跑在期权分析前就 return,
+      会静默抹掉所有在途标记 (三轮评审)"""
     since = prev.get("since")
     if prev.get("state") != r["state"]:
         since = today
@@ -173,16 +178,24 @@ def next_persisted_state(prev: dict, r: dict, today: str) -> dict:
     # NORMAL 期 LEAP 被硬停牌拦下的补发标记: 确认转换是一次性的且会被
     # state.json 无条件消耗, halt 不该吞掉它 — 标记随右侧状态存活,
     # 止损出局 (转 PULLBACK) 即失效; 真票发出当日不再置位, 自然清除
-    if r.get("leap_pending") and entry["state"] in ("CONFIRMED", "TREND"):
+    leap_pending = bool(prev.get("leap_pending") or r.get("leap_pending"))
+    if r.get("leap_emitted"):           # 真票已发 = 显式消耗
+        leap_pending = False
+    if leap_pending and entry["state"] in ("CONFIRMED", "TREND"):
         entry["leap_pending"] = True
     retested = prev.get("retested", False)
+    retest_pending = bool(prev.get("retest_pending") or r.get("retest_pending"))
     if r["state"] == "CONFIRMED" \
             and prev.get("state") not in ("CONFIRMED", "TREND"):
-        retested = False
-    if r.get("retest"):
+        retested = False                # 新一轮确认: 一次性提示重新计数
+        retest_pending = False
+    if r.get("retest"):                 # 回踩已提示 = 显式消耗
         retested = True
+        retest_pending = False
     if retested:
         entry["retested"] = True
+    if retest_pending and entry["state"] in ("CONFIRMED", "TREND"):
+        entry["retest_pending"] = True
     return entry
 
 
@@ -350,7 +363,11 @@ def vx_curve_state(prices: list[float], n_front: int = 5) -> str | None:
     # 非升且至少一段真跌 = 实质全曲线倒挂, 严格 < 会被一个 tie 静默降级
     if all(d <= 0 for d in diffs) and any(d < 0 for d in diffs):
         return "FULL_BACKWARDATION"
-    if diffs[0] < 0 or (diffs[0] == 0 and any(d < 0 for d in diffs)):
+    # tie 容忍只给 FULL (全程非升的曲线里一个填充平价不该静默降级)。
+    # PARTIAL 是"前端承压"的判断, 必须真的 M1 > M2 — 平价前端 + 后段
+    # 单点回落但整体上行是混合曲线, 归 CONTANGO; 否则警告会渲染出
+    # "25.00 > 25.00" 这种自相矛盾的读数 (三轮评审)
+    if diffs[0] < 0:
         return "PARTIAL_BACKWARDATION"
     return "CONTANGO"
 
@@ -445,18 +462,27 @@ def assess_vol_gates(stage: str, vx: dict, vvix: dict, move: dict,
     门控宁可漏也不能靠坏数据硬拦。"""
     halt_csp, halt_longs, warnings = None, None, []
     if vx.get("state") == "FULL_BACKWARDATION":
-        base = (f"VX 期货全曲线倒挂 (M1 {vx['m1']:.2f} > M2 {vx['m2']:.2f}, "
+        # FULL 容忍相邻平价, 前端可能 m1 == m2 — 只渲染观测值, 不写 ">"
+        base = (f"VX 期货全曲线倒挂 (M1 {vx['m1']:.2f} / M2 {vx['m2']:.2f}, "
                 f"结算 {vx['as_of']}) — 2004 年以来 22 次中 21 次在 30 天内 "
                 "SPX 回撤 >5%")
         # 消息必须与实际拦截范围一致 — 开关关闭时 CSP 在流, 不能仍写"停开新票"
+        # 开关的语义是"放行**剧本恐慌档** CSP" (README) — 而 VX 全曲线
+        # 倒挂恰恰可以与 VIX/VIX3M NORMAL 并存 (这正是本门存在的理由),
+        # 所以不能让它在 NORMAL 期放行普通 CSP: 那正是本门要拦的场景
         if s["vx_full_backwardation_halt"]:
             halt_csp = halt_longs = (
                 base + ": 停开新 CSP/LEAP/回踩 spread, 持有对冲 "
                 "(恢复剧本恐慌档 CSP 关 vx_full_backwardation_halt)")
-        else:
+        elif stage.startswith("STAGE1"):
             halt_longs = (
                 base + ": 停开新 LEAP/回踩 spread, 持有对冲 — CSP 已按 "
-                "vx_full_backwardation_halt=false 放行 (档位跟随当前阶段)")
+                "vx_full_backwardation_halt=false 放行 (剧本恐慌档)")
+        else:
+            halt_csp = halt_longs = (
+                base + ": 停开新 CSP/LEAP/回踩 spread, 持有对冲 — "
+                f"vx_full_backwardation_halt=false 只放行剧本恐慌档 "
+                f"(STAGE1) CSP, 当前 {stage} 不适用")
     elif vx.get("state") == "PARTIAL_BACKWARDATION":
         warnings.append(
             f"VX 期货 M1 {vx['m1']:.2f} > M2 {vx['m2']:.2f} 局部倒挂 — "
@@ -865,8 +891,12 @@ def rr25_snapshot(cc: ChainCache, spot: float, s: dict) -> dict | None:
         if df is not None and not df.empty:
             otm = df[df["strike"] > spot] if is_call else df[df["strike"] < spot]
             for _, row in otm.iterrows():
-                mid, _src = _mark(row, cutoff)
-                if mid is None:
+                # _mark 会退回到最多 MAX_STALE_TRADE_DAYS 天前的 lastPrice —
+                # 一腿陈旧成交价 vs 另一腿实时 mid, 反解出的 IV 差正是本补丁
+                # 要消灭的假倒挂来源。RR 两腿一律只认 live bid/ask mid, 取不
+                # 到就放弃该腿 (例外才报告, 漏报优于假旗标)
+                mid, src = _mark(row, cutoff)
+                if mid is None or src != "live":
                     continue
                 strike = float(row["strike"])
                 # RR 是两腿 IV 的**符号敏感差值** — 两腿必须同源: 一律从
@@ -951,6 +981,31 @@ def stage2_leap_gate(price_ok: bool, prev_leap_window, ep_end: str,
     一次性标记的处理一致 (halt 期间不置位)。"""
     want = price_ok and prev_leap_window != ep_end
     return want, want and not halted
+
+
+def normal_leap_gate(fresh_confirm: bool, prev_leap_pending: bool,
+                     state: str) -> bool:
+    """NORMAL 期 LEAP 决策 (纯函数)。
+
+    fresh_confirm 是一次性转换, 硬停牌当天会被 state.json 无条件消耗 —
+    leap_pending 把被拦的确认带到解除后补发。补发前必须复核**当日**右侧
+    状态: 标的在 halt 期间跌破 20 日线时 next_state 已经给出 PULLBACK,
+    而 state.json 里的失效要等本次扫描之后才写 — 不复核就会在止损出局
+    当天补一张新多头票 (三轮评审)。"""
+    return fresh_confirm or (prev_leap_pending
+                             and state in ("CONFIRMED", "TREND"))
+
+
+def retest_gate(state: str, touched_20dma: bool, prev_retested: bool,
+                prev_retest_pending: bool, stage: str) -> bool:
+    """首次回踩提示决策 (纯函数)。
+
+    touched_20dma 是**当日**事件: 只看它的话, 价格在 halt 期间离开 20 日
+    线之后这轮回踩就再也发不出来, 承诺的"解除后再提示"落空 — 被拦当日落
+    retest_pending, 跨日沿用, 解除后补发 (三轮评审)。STAGE1 不提示 (纪律:
+    倒挂持续期间不加右侧仓), 且每轮确认只提示一次。"""
+    return state == "TREND" and not stage.startswith("STAGE1") \
+        and not prev_retested and (touched_20dma or prev_retest_pending)
 
 
 def csp_window_open(zone, in_or_near_zone: bool, stage: str) -> bool:
@@ -1313,10 +1368,11 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
         # 首次回踩 (收盘口径, 每轮确认只提示一次): 剧本首选入场/加仓点
         # 倒挂期不提示也不烧一次性标记 (纪律: 阶段1不加右侧仓) — 解除后的
         # 首次回踩才算这轮的"首次"
-        retest_seen = state == "TREND" and tech["touched_20dma"] \
-            and not regime["stage"].startswith("STAGE1") \
-            and not prev_state.get("retested")
+        retest_seen = retest_gate(
+            state, tech["touched_20dma"], bool(prev_state.get("retested")),
+            bool(prev_state.get("retest_pending")), regime["stage"])
         if retest_seen and regime.get("halt_new_longs"):
+            r["retest_pending"] = True
             # 呈现被拦的回踩 (⏸ skip_reason) 但不烧一次性 retested 标记 —
             # halt 解除后同一轮回踩仍可提示, 不是静默消失
             if cfg["options"]:
@@ -1426,8 +1482,8 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
         else:
             # fresh_confirm 是一次性转换, 硬停牌那天会被 state.json 无条件
             # 消耗 — leap_pending 把被拦的确认带到 halt 解除后补发
-            want_leap = stage == "NORMAL" and (
-                fresh_confirm or bool(prev_state.get("leap_pending")))
+            want_leap = stage == "NORMAL" and normal_leap_gate(
+                fresh_confirm, bool(prev_state.get("leap_pending")), state)
         if fresh_confirm and stage.startswith("STAGE1"):
             r["notes"].append("右侧信号出现但倒挂未解除 — 剧本: 倒挂持续期间不加右侧仓, 等阶段2")
         vvix_now = (regime.get("vvix") or {}).get("value")
@@ -1456,6 +1512,7 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
             else:
                 r["leap"] = leap_ticket(cc, tech["close"], cfg,
                                         r["earnings"], s)
+                r["leap_emitted"] = True
         if r.get("retest"):  # STAGE1 已在回踩检测处拦掉
             r["spread"] = call_spread_ticket(cc, tech["close"], s)
             if "skip_reason" not in r["spread"]:
@@ -1629,8 +1686,11 @@ def action_block(results: list[dict], ivdf) -> list[str]:
             items.append((sym, f"- 👀 **{sym}** 首次回踩20日线不破 — 剧本首选"
                                "加仓点 (3-6个月 call spread, 手动构造)"))
     if halted:
-        items.append(("", f"- ⏸ 全市场硬停牌: 新票暂停 ({', '.join(halted)}) "
-                          "— 原因见下方市场状态 ⛔ 行"))
+        # regime_halt 也可能是 VVIX 的"只拦 CSP"或 VX 开关下的"只拦 LEAP/
+        # spread" — 同一标的可以一边被拦一边有别的有效票, 写死"全市场/新票
+        # 暂停"会与上面刚发出的票自相矛盾 (三轮评审)
+        items.append(("", f"- ⏸ 市场门拦下部分新票 ({', '.join(halted)}) "
+                          "— 拦截范围与原因见下方市场状态 ⛔ 行"))
     if items:
         lines += [line for _sym, line in items]
         mentioned = {sym for sym, _line in items} | set(halted)

@@ -296,13 +296,35 @@ class TestPersistedState(unittest.TestCase):
         e = sc.next_persisted_state(
             {}, {"state": "CONFIRMED", "leap_pending": True}, "2026-09-03")
         self.assertTrue(e["leap_pending"])
-        # halt 解除、真票发出当日: r 不再带标记 → 自然清除
+        # 三轮评审 (Copilot): "结果没带标记" != 已消耗 — --no-options 的非
+        # manual 收盘跑在期权分析前就 return, 不得静默抹掉在途标记
         e2 = sc.next_persisted_state(e, {"state": "TREND"}, "2026-09-04")
-        self.assertNotIn("leap_pending", e2)
-        # 止损出局: 即使当日仍被拦, 标记不得跟进 PULLBACK (确认周期已死)
+        self.assertTrue(e2["leap_pending"])
+        # 真票发出 = 显式消耗
         e3 = sc.next_persisted_state(
-            e, {"state": "PULLBACK", "leap_pending": True}, "2026-09-04")
+            e, {"state": "TREND", "leap_emitted": True}, "2026-09-04")
         self.assertNotIn("leap_pending", e3)
+        # 止损出局: 即使当日仍被拦, 标记不得跟进 PULLBACK (确认周期已死)
+        e4 = sc.next_persisted_state(
+            e, {"state": "PULLBACK", "leap_pending": True}, "2026-09-04")
+        self.assertNotIn("leap_pending", e4)
+
+    def test_retest_pending_lifecycle(self):
+        # 三轮评审 (Copilot): 被拦的回踩若不落盘, 价格离开 20 日线后这轮
+        # 就再也发不出来 — 承诺的"解除后再提示"落空
+        prev = {"state": "TREND", "since": "2026-08-01"}
+        e = sc.next_persisted_state(
+            prev, {"state": "TREND", "retest_pending": True}, "2026-09-03")
+        self.assertTrue(e["retest_pending"])
+        self.assertNotIn("retested", e)        # 被拦不烧一次性标记
+        e2 = sc.next_persisted_state(e, {"state": "TREND"}, "2026-09-04")
+        self.assertTrue(e2["retest_pending"])  # 跨日沿用
+        e3 = sc.next_persisted_state(
+            e, {"state": "TREND", "retest": True}, "2026-09-04")
+        self.assertTrue(e3["retested"])        # 补发 = 显式消耗
+        self.assertNotIn("retest_pending", e3)
+        e4 = sc.next_persisted_state(e, {"state": "PULLBACK"}, "2026-09-04")
+        self.assertNotIn("retest_pending", e4)
 
 
 class TestClock(unittest.TestCase):
@@ -376,6 +398,13 @@ class TestVXCurve(unittest.TestCase):
         self.assertEqual(sc.vx_curve_state([25.0, 25.0, 25.0, 25.0]),
                          "CONTANGO")                       # 全平 ≠ 倒挂
 
+    def test_partial_needs_inverted_front_pair(self):
+        # 三轮评审 (Copilot): 平价前端 + 后段单点回落但整体上行 = 混合曲线,
+        # 判成"前端承压"会让警告渲染出 "25.00 > 25.00" 的自相矛盾读数
+        self.assertEqual(sc.vx_curve_state([25, 25, 24, 30, 31]), "CONTANGO")
+        self.assertEqual(sc.vx_curve_state([25, 24, 26, 27, 28]),
+                         "PARTIAL_BACKWARDATION")
+
     @staticmethod
     def _gates(stage, vx, vvix=None, move=None, vix_level=16.0, s=None):
         return sc.assess_vol_gates(stage, vx, vvix or {}, move or {},
@@ -448,6 +477,60 @@ class TestVXCurve(unittest.TestCase):
         self.assertEqual(g["warnings"], [])
 
 
+class TestVXHaltScope(unittest.TestCase):
+    VX = {"state": "FULL_BACKWARDATION", "m1": 28.0, "m2": 25.0,
+          "as_of": "2026-09-01"}
+
+    def _gates(self, stage, halt=True, m1=28.0, m2=25.0):
+        s = dict(sc.SETTINGS_DEFAULTS, vx_full_backwardation_halt=halt)
+        vx = dict(self.VX, m1=m1, m2=m2)
+        return sc.assess_vol_gates(stage, vx, {}, {}, 16.0, s)
+
+    def test_override_only_releases_panic_stage_csp(self):
+        # 三轮评审 (Copilot, critical): 开关的语义是"放行**剧本恐慌档**
+        # CSP", 而 VX 全曲线倒挂可以与 VIX/VIX3M NORMAL 并存 — 让它在
+        # NORMAL 期放行普通 CSP 正好放掉本门要拦的场景
+        g1 = self._gates("STAGE1_DEEP", halt=False)
+        self.assertIsNone(g1["halt_csp"])          # 恐慌档 CSP 放行
+        self.assertIsNotNone(g1["halt_new_longs"])  # LEAP/spread 仍拦
+        g2 = self._gates("NORMAL", halt=False)
+        self.assertIsNotNone(g2["halt_csp"])       # NORMAL 期不放行
+        self.assertIn("只放行剧本恐慌档", g2["halt_csp"])
+        self.assertIn("NORMAL", g2["halt_csp"])
+        g3 = self._gates("STAGE2_WINDOW", halt=False)
+        self.assertIsNotNone(g3["halt_csp"])
+
+    def test_full_message_never_asserts_strict_inequality(self):
+        # FULL 容忍相邻平价 → 前端可能 m1 == m2, 消息只渲染观测值
+        msg = self._gates("NORMAL", m1=25.0, m2=25.0)["halt_csp"]
+        self.assertIn("M1 25.00 / M2 25.00", msg)
+        self.assertNotIn("25.00 > ", msg)
+
+
+class TestLeapAndRetestGates(unittest.TestCase):
+    def test_pending_leap_rechecks_todays_state(self):
+        # 三轮评审 (Copilot, critical): halt 期间跌破 20 日线 → 当日已是
+        # PULLBACK, 而 state.json 的失效要等本次扫描之后才写 — 不复核就会
+        # 在止损出局当天补一张新多头票
+        self.assertTrue(sc.normal_leap_gate(False, True, "CONFIRMED"))
+        self.assertTrue(sc.normal_leap_gate(False, True, "TREND"))
+        self.assertFalse(sc.normal_leap_gate(False, True, "PULLBACK"))
+        self.assertFalse(sc.normal_leap_gate(False, True, "LEFT_ZONE"))
+        self.assertTrue(sc.normal_leap_gate(True, False, "CONFIRMED"))
+        self.assertFalse(sc.normal_leap_gate(False, False, "TREND"))
+
+    def test_retest_deferred_after_price_leaves_20dma(self):
+        # 被拦当日落 pending; 次日价格已离开 20 日线仍要补发
+        self.assertTrue(sc.retest_gate("TREND", True, False, False, "NORMAL"))
+        self.assertTrue(sc.retest_gate("TREND", False, False, True, "NORMAL"))
+        self.assertFalse(sc.retest_gate("TREND", False, False, False, "NORMAL"))
+        self.assertFalse(sc.retest_gate("TREND", True, True, True, "NORMAL"))
+        self.assertFalse(
+            sc.retest_gate("TREND", True, False, True, "STAGE1_DEEP"))
+        self.assertFalse(
+            sc.retest_gate("PULLBACK", True, False, True, "NORMAL"))
+
+
 class TestCSPWindow(unittest.TestCase):
     def test_no_zone_never_opens(self):
         # 没有接货价就没有 CSP — 任何 regime 都一样 (ORCL 教训)
@@ -511,7 +594,10 @@ class TestActionBlockHaltDedup(unittest.TestCase):
               self._r("BBB", csp=dict(halt), leap=dict(halt)),
               self._r("CCC", state="UPTREND")]
         text = "\n".join(sc.action_block(rs, ivdf))
-        self.assertEqual(text.count("全市场硬停牌"), 1)
+        self.assertEqual(text.count("市场门拦下部分新票"), 1)
+        # 三轮评审 (Copilot): VVIX 只拦 CSP、VX 开关下只拦 LEAP/spread —
+        # 同一标的可以一边被拦一边有别的有效票, 汇总行不得写死"全市场停牌"
+        self.assertNotIn("全市场", text)
         self.assertIn("AAA", text)
         self.assertIn("BBB", text)
         self.assertNotIn("VX 期货全曲线倒挂", text)   # 长文不进今日动作
@@ -526,6 +612,56 @@ class TestActionBlockHaltDedup(unittest.TestCase):
         self.assertIn("⏸ **AAA** CSP: 年化仅", text)
         self.assertIn("⏸ **AAA** LEAP: 财报", text)
         self.assertNotIn("全市场硬停牌", text)
+
+
+class _FakeChain:
+    def __init__(self, calls, puts):
+        self.calls, self.puts = calls, puts
+
+
+class _FakeCC:
+    def __init__(self, chain):
+        self._chain = chain
+
+    def expiries(self):
+        return [("2026-10-16", 35)]
+
+    def chain(self, exp):
+        return self._chain
+
+
+class TestRR25Snapshot(unittest.TestCase):
+    SPOT = 100.0
+
+    def _df(self, strikes, sigma, is_call, live):
+        T = 35 / 365.0
+        traded = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=1)
+        rows = []
+        for k in strikes:
+            px = sc.bs_price(self.SPOT, float(k), T, sc.RATE, sigma, is_call)
+            rows.append({"strike": float(k),
+                         "bid": px * 0.98 if live else 0.0,
+                         "ask": px * 1.02 if live else 0.0,
+                         "lastPrice": px, "lastTradeDate": traded})
+        return pd.DataFrame(rows)
+
+    def test_stale_leg_kills_the_reading(self):
+        # 三轮评审 (Copilot): _mark 会退回到最多 MAX_STALE_TRADE_DAYS 天前的
+        # lastPrice — 一腿陈旧成交价 vs 另一腿实时 mid, 反解出的 IV 差正是
+        # 本补丁要消灭的假倒挂来源
+        s = sc.SETTINGS_DEFAULTS
+        calls = self._df(range(101, 116), 0.30, True, live=True)
+        puts_live = self._df(range(85, 100), 0.32, False, live=True)
+        self.assertIsNotNone(
+            sc.rr25_snapshot(_FakeCC(_FakeChain(calls, puts_live)),
+                             self.SPOT, s))
+        puts_stale = self._df(range(85, 100), 0.32, False, live=False)
+        # 陈旧腿仍是"可用价" (5 日内), 但 RR 不接受 — 整体放弃读数
+        self.assertEqual(
+            sc._mark(puts_stale.iloc[0], sc._stale_cutoff())[1], "last")
+        self.assertIsNone(
+            sc.rr25_snapshot(_FakeCC(_FakeChain(calls, puts_stale)),
+                             self.SPOT, s))
 
 
 class TestVVIXStaleness(unittest.TestCase):

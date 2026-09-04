@@ -248,8 +248,8 @@ crontab -e   # 粘贴 deploy/crontab.example 的内容, 路径按实际改
 
 | 门 | 数据 | 触发 | 动作 |
 |---|---|---|---|
-| VX 全曲线倒挂 | CFE 日结算 CSV (仅月度合约 — weekly 行价格是前月填充值, 已剔除; 不足 5 个月度合约的盘中/假日 stub 视为未发布, 自动回看上一交易日) | 前 5 个月度合约逐对非升且至少一段真跌 (相邻平价 tie 是 feed 填充形态, 不降级) | ⛔ 停开新 CSP + LEAP + 回踩 spread。依据: 2004 年以来 22 次全曲线倒挂, 21 次在 30 天内伴随 SPX >5% 回撤 (唯一漏网 2013 taper tantrum 只是局部倒挂)。比 VIX/VIX3M 多出的信号: 2024-08~11 曾出现 VX 期货倒挂而现货指数 contango 的背离。CSP 档想保留剧本恐慌档: `vx_full_backwardation_halt = false` (LEAP/spread 仍拦) |
-| VX 局部倒挂 (M1>M2) | 同上 | M1 > M2 但未全曲线 | ⚠️ 预警: 前端承压, 关注是否蔓延 |
+| VX 全曲线倒挂 | CFE 日结算 CSV (仅月度合约 — weekly 行价格是前月填充值, 已剔除; 不足 5 个月度合约的盘中/假日 stub 视为未发布, 自动回看上一交易日) | 前 5 个月度合约逐对非升且至少一段真跌 (相邻平价 tie 是 feed 填充形态, 不降级) | ⛔ 停开新 CSP + LEAP + 回踩 spread。依据: 2004 年以来 22 次全曲线倒挂, 21 次在 30 天内伴随 SPX >5% 回撤 (唯一漏网 2013 taper tantrum 只是局部倒挂)。比 VIX/VIX3M 多出的信号: 2024-08~11 曾出现 VX 期货倒挂而现货指数 contango 的背离。CSP 档想保留剧本恐慌档: `vx_full_backwardation_halt = false` — **只在 STAGE1 生效**, LEAP/spread 仍拦; NORMAL/STAGE2 期照拦 CSP (全曲线倒挂可与 VIX/VIX3M NORMAL 并存, 那正是本门要拦的场景) |
+| VX 局部倒挂 (M1>M2) | 同上 | M1 > M2 但未全曲线 (前端必须真倒挂 — 平价前端不算) | ⚠️ 预警: 前端承压, 关注是否蔓延 |
 | 倒挂解除加成 | 既有 VIX/VIX3M ratio | 进入 STAGE2_WINDOW (达标 episode 解除后 10 个交易日内) | 🟢 CSP 常规档解锁 (不再要求价格在/近接货带)。依据: options.cafe 2009-2025 年 43 次倒挂事件 — 解除日买入 SPX 前瞻 5日 +3.04%/胜率88%, 21日 +4.38%/91%, 63日 +6.93%/88%, 全部碾压基线; 倒挂**开始**日反而无短期边际 (5日 -0.15%/51%, 74% 的 episode 继续跌) — 加成给解除不给开始, 与剧本 "buy the relief, not the panic" 同向 |
 | VVIX 停牌线 | CBOE VVIX 日收盘 + 盘中临时点 (历史 CSV 冻结 >5 交易日且盘中点拿不到 = 按失败报, 门自动失效) | **NORMAL 期** VVIX ≥ 110 (`vvix_halt`) | ⛔ 停开新 CSP — 平静表面下 vol-of-vol 抢跑 = 对冲拥挤/裂缝先兆。只管 NORMAL: STAGE1 恐慌档与 STAGE2 解除窗 VVIX 高是常态, 剧本优先不加拦。参考档: <90 = VIX call/尾部对冲便宜 (囤凸性窗口), 90-110 中性, >140-150 = 恐慌对冲拥挤顶 (反而是左侧分批区) — 后两档只影响判断不进代码 |
 | MOVE 背离 | Yahoo ^MOVE (无 CBOE 源, 断更 >5 交易日按失败报) | MOVE > 100 (`move_divergence`) 且 VIX < 18 (`move_calm_vix_max`) | ⚠️ 预警不拦票: 债券波动率先行于股票 (2023-03 SVB: MOVE 130→200 两天, VIX 晚数日; 2025-04 basis trade: MOVE ~172 先到) — 动作是缩短 put 名义、对冲前移, 人工判断 |
