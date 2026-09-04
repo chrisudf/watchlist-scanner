@@ -2196,7 +2196,12 @@ def send_via_resend(api_key: str, sender: str, to: str, subject: str,
     req = urllib.request.Request(
         "https://api.resend.com/emails", data=payload, method="POST",
         headers={"Authorization": f"Bearer {api_key}",
-                 "Content-Type": "application/json"})
+                 "Content-Type": "application/json",
+                 # 必须显式给 UA: urllib 默认发 "Python-urllib/3.x", 会被
+                 # Resend 前面的 Cloudflare 按 UA 签名拦掉, 返回 403 且正文
+                 # 是 "error code: 1010" —— 那是 Cloudflare 的码不是 Resend
+                 # 的业务码, 很容易被误读成 api key 有问题
+                 "User-Agent": "watchlist-scanner/1.0"})
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             if resp.status not in (200, 201):
