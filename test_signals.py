@@ -565,6 +565,44 @@ class TestClock(unittest.TestCase):
         self.assertEqual(sc.resolve_mode("close", self._et(3, 0)), "close")
 
 
+class _FakeTk:
+    def __init__(self, calendar):
+        self.calendar = calendar
+
+
+class TestNextEarnings(unittest.TestCase):
+    def test_et_clock_not_host_clock(self):
+        # 布里斯班机上 close 扫描时本机日历日 = ET+1 — date.today() 会把
+        # 当天 AMC 财报当过去滤掉, 在公布前几小时放行跨财报 CSP (五轮评审)。
+        # 把 scanner 的 date.today 钉成 ET+1 模拟那台机器: 修复后不再引用它
+        from unittest.mock import patch
+        et_today = datetime.now(sc.ET).date()
+
+        class _BrisbaneDate(sc.date):
+            @classmethod
+            def today(cls):
+                return et_today + timedelta(days=1)
+
+        with patch.object(sc, "date", _BrisbaneDate):
+            out = sc.next_earnings(_FakeTk({"Earnings Date": [et_today]}))
+        self.assertEqual(out, et_today.isoformat())
+
+    def test_no_upcoming_is_empty_string(self):
+        past = datetime.now(sc.ET).date() - timedelta(days=30)
+        self.assertEqual(sc.next_earnings(_FakeTk({"Earnings Date": [past]})), "")
+
+    def test_failed_lookup_is_none(self):
+        # yfinance 吞 HTTP 错回空 calendar — 契约: None=失败, caller 必须 warn
+        self.assertIsNone(sc.next_earnings(_FakeTk({})))
+        self.assertIsNone(sc.next_earnings(_FakeTk(None)))
+
+    def test_nearest_of_multiple(self):
+        t = datetime.now(sc.ET).date()
+        cal = {"Earnings Date": [t + timedelta(days=95), t + timedelta(days=4)]}
+        self.assertEqual(sc.next_earnings(_FakeTk(cal)),
+                         (t + timedelta(days=4)).isoformat())
+
+
 VX_SETTLE_SAMPLE = """Product,Symbol,Expiration Date,Price
 VX,VX35/U6,2026-09-02,17.2528
 VX,VX36/U6,2026-09-09,17.2528

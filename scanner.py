@@ -1414,13 +1414,21 @@ def next_earnings(tk) -> str | None:
     None = lookup FAILED — callers must warn, not treat as no-earnings.
     yfinance swallows HTTP errors and hands back calendar == {}, so an
     empty/non-dict calendar counts as failed (ETFs legitimately 404 — the
-    caller downgrades None to '' for kind etf/index)."""
+    caller downgrades None to '' for kind etf/index).
+
+    "今天"必须是 ET 日历日, 不是本机的 — 布里斯班机器上跑 close 扫描
+    (15:45 ET = 本地次日 05:45/06:45) 时 date.today() 已经是 ET+1,
+    会把**当天 AMC 财报**当过去过滤掉: earnings_iso 变成下季/空,
+    csp_ticket 的"short 不跨财报"剔除失效, 在财报公布前几小时放行
+    跨财报的 CSP 票 (五轮评审; 全文件唯一一处非 ET 时钟)。UTC 主机上
+    扫描窗内两个日历日恰好相等, 所以 droplet 上潜伏未爆。"""
     try:
         cal = tk.calendar
         if not isinstance(cal, dict) or not cal:
             return None
         dates = cal.get("Earnings Date")
-        future = [d for d in dates or [] if d >= date.today()]
+        today_et = datetime.now(ET).date()
+        future = [d for d in dates or [] if d >= today_et]
         return min(future).isoformat() if future else ""
     except Exception:
         return None
