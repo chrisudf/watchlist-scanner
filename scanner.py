@@ -774,10 +774,16 @@ def csp_annualized(mid: float, strike: float, dte: int) -> float:
 
 
 def _mark(row, stale_cutoff):
-    """Usable option price: live bid/ask mid, else a recent last trade."""
+    """Usable option price: live bid/ask mid, else a recent last trade.
+
+    crossed 报价 (bid > ask, Yahoo 实测会出) 不算有盘口 — mid 无意义,
+    落到 lastPrice 路径 (src=\"last\" 自动带\"下单前实查\"提示)。此前只有
+    _rr_mark 拒 crossed, CSP/LEAP/spread 的票价照收: 一档 bid 10.60 /
+    ask 10.00 出来的 mid 10.30 标成 \"live\", 派生的 delta/外在/年化全
+    是编的, 且负 spread_pct 反而通过 LEAP 的 <=5% 清洁过滤 (五轮评审)。"""
     bid = float(row.get("bid") or 0)
     ask = float(row.get("ask") or 0)
-    if bid > 0 and ask > 0:
+    if 0 < bid <= ask:
         return (bid + ask) / 2.0, "live"
     last = float(row.get("lastPrice") or 0)
     traded = row.get("lastTradeDate")
@@ -901,8 +907,8 @@ def _rr_mark(row, cutoff, s: dict) -> float | None:
     """RR 专用的报价过滤 — 比 _mark 严得多, 因为 RR 是两腿 IV 的**符号
     敏感差值**, 一腿的坏报价就能凭空造出倒挂旗标:
 
-    - 只认 live bid/ask mid (陈旧 lastPrice 与另一腿的实时 mid 不同源)
-    - 拒绝 crossed 报价 (bid > ask): Yahoo 实测会出, mid 无意义
+    - 只认 live bid/ask mid (陈旧 lastPrice 与另一腿的实时 mid 不同源;
+      crossed 报价已在 _mark 统一拒掉 — 不再有 \"live\" 的 crossed mid)
     - 相对价差上限: bid>0 and ask>0 只证明"有两个正数", 不证明 mid 可用;
       任意宽的报价照样过, 而宽报价的 mid 正是假倒挂的来源 (三轮评审)
     - 未平仓量地板: 无人持有的行权价报价不可信"""
@@ -910,8 +916,6 @@ def _rr_mark(row, cutoff, s: dict) -> float | None:
     if mid is None or src != "live":
         return None
     bid, ask = float(row.get("bid") or 0), float(row.get("ask") or 0)
-    if bid > ask:                                   # crossed
-        return None
     if mid <= 0 or (ask - bid) / mid > s["rr_max_rel_spread"]:
         return None
     if _oi(row) < s["rr_min_oi"]:
@@ -1077,7 +1081,9 @@ def _put_candidates(cc: ChainCache, exp: str, dte: int, spot: float):
             "exp": exp, "dte": dte, "strike": strike, "mid": mid, "src": src,
             "iv": iv, "delta": delta,
             "oi": _oi(row),
-            "spread_pct": (ask - bid) / mid * 100 if bid > 0 and ask > 0 else None,
+            # crossed 行经 lastPrice 路径进来时 bid/ask 仍是脏的 — 价差
+            # 只对健康盘口有意义 (负价差曾冒充"干净"通过过滤)
+            "spread_pct": (ask - bid) / mid * 100 if 0 < bid <= ask else None,
         })
     return out
 
@@ -1290,7 +1296,8 @@ def leap_ticket(cc: ChainCache, spot: float, cfg: dict,
             "exp": exp, "dte": dte, "strike": strike, "mid": mid, "src": src,
             "iv": iv, "delta": delta,
             "oi": _oi(row),
-            "spread_pct": (ask - bid) / mid * 100 if bid > 0 and ask > 0 else None,
+            # 同 _put_candidates: 价差只对健康盘口有意义
+            "spread_pct": (ask - bid) / mid * 100 if 0 < bid <= ask else None,
             "extrinsic_pct": extrinsic / mid * 100 if mid > 0 else None,
             "lam": spot * delta / mid if mid > 0 else None,
             "breakeven": strike + mid,

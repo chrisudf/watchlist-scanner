@@ -145,6 +145,30 @@ class TestOptionMath(unittest.TestCase):
         iv = sc.implied_vol(price, 100, 90, 1.5, 0.04, is_call=True)
         self.assertAlmostEqual(iv, 0.42, places=3)
 
+    def _quote_row(self, bid, ask, last=0.0, traded_days_ago=1):
+        return pd.Series({
+            "bid": bid, "ask": ask, "lastPrice": last,
+            "lastTradeDate": pd.Timestamp.now(tz="UTC")
+            - pd.Timedelta(days=traded_days_ago)})
+
+    def test_mark_healthy_book(self):
+        mid, src = sc._mark(self._quote_row(1.00, 1.10), sc._stale_cutoff())
+        self.assertAlmostEqual(mid, 1.05)
+        self.assertEqual(src, "live")
+
+    def test_mark_rejects_crossed_book(self):
+        # bid > ask (Yahoo 实测会出): mid 无意义 — 此前只有 _rr_mark 拒,
+        # CSP/LEAP/spread 票价照收且负价差还通过 LEAP <=5% 过滤 (五轮评审)。
+        # crossed 落到 lastPrice 路径 → src="last" 自动带"下单前实查"提示
+        mid, src = sc._mark(self._quote_row(1.10, 1.00, last=1.02),
+                            sc._stale_cutoff())
+        self.assertEqual((mid, src), (1.02, "last"))
+        # crossed 且无近期成交 → 无可用价
+        mid, src = sc._mark(self._quote_row(1.10, 1.00, last=1.02,
+                                            traded_days_ago=10),
+                            sc._stale_cutoff())
+        self.assertIsNone(mid)
+
     def test_stock_ladder(self):
         s = sc.SETTINGS_DEFAULTS
         ladder = sc.stock_ladder([380.0, 440.0], s)
