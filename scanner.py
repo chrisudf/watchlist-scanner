@@ -117,6 +117,22 @@ SETTINGS_DEFAULTS = {
     # regime
     "stage2_window_bars": 10,    # trading days after inversion resolves
     "episode_min_days": 3, "episode_min_peak": 1.10,
+    # 倒挂门控矩阵 (2026-09-02 研究: VIX 系族横评 + 回测证据实查)
+    "vx_full_backwardation_halt": True,  # VX 全曲线倒挂 = 停开新票 (21/22 crash filter)
+    "vx_curve_contracts": 5,             # 曲线形态看前 N 个月度合约
+    "vvix_halt": 110.0,          # NORMAL 期 VVIX >= 此值 = 停开新 CSP
+    "move_divergence": 100.0,    # MOVE > 此值且 VIX 平静 = 债波先行预警
+    "move_calm_vix_max": 18.0,   # "VIX 平静"的上限
+    "rr_dte": [20, 60],          # 25Δ risk reversal 取样窗口 (取最接近 35 DTE)
+    "rr_delta_tol": 0.10,        # 链上找不到 |Δ-0.25|<=tol 的行权价 = 无读数
+    "rr_invert_min_pts": 1.0,    # RR < -此值才亮倒挂旗标 (延迟报价噪声地板)
+    "rr_max_rel_spread": 0.25,   # (ask-bid)/mid 超此值的报价不用于 RR
+    "rr_min_oi": 10,             # RR 两腿的未平仓量地板
+    # forward 反解 spot 与日线收盘的差超此值 = 日线陈旧。35 DTE 的正常持有
+    # 成本 |F/S-1| = |e^((r-q)T)-1| 约 0.3%, 1.5% 已是其 5 倍; 难借券的负
+    # rebate 可能触发, 但那种标的本来也值得看一眼 (2026-09-04 实测: 陈旧
+    # 一天的日线造成 2.0%~16.5% 的差, 3% 会漏掉 MSFT 这档)
+    "rr_spot_gap_warn": 0.015,
 }
 
 
@@ -153,7 +169,12 @@ def next_persisted_state(prev: dict, r: dict, today: str) -> dict:
     """close 收盘后单标的 state.json 条目 (纯函数, 便于测试).
     - since: 状态变了才刷新
     - leap_window: 阶段2窗口 dedup key, 跨日携带
-    - retested: 回踩一次性提示 — 新一轮确认重新计数, 本日回踩置位, 否则沿用"""
+    - retested: 回踩一次性提示 — 新一轮确认重新计数, 本日回踩置位, 否则沿用
+    - leap_pending / retest_pending: 被硬停牌拦下的一次性事件补发标记 —
+      默认跨日**沿用**, 只在显式消耗 (真票发出 / 回踩已提示) 或确认周期
+      死亡 (状态离开 CONFIRMED/TREND) 时清除。不能拿"本次结果没带标记"
+      当消耗信号: --no-options 的非 manual 收盘跑在期权分析前就 return,
+      会静默抹掉所有在途标记 (三轮评审)"""
     since = prev.get("since")
     if prev.get("state") != r["state"]:
         since = today
@@ -161,14 +182,27 @@ def next_persisted_state(prev: dict, r: dict, today: str) -> dict:
     lw = r.get("leap_window") or prev.get("leap_window")
     if lw:
         entry["leap_window"] = lw
+    # NORMAL 期 LEAP 被硬停牌拦下的补发标记: 确认转换是一次性的且会被
+    # state.json 无条件消耗, halt 不该吞掉它 — 标记随右侧状态存活,
+    # 止损出局 (转 PULLBACK) 即失效; 真票发出当日不再置位, 自然清除
+    leap_pending = bool(prev.get("leap_pending") or r.get("leap_pending"))
+    if r.get("leap_emitted"):           # 真票已发 = 显式消耗
+        leap_pending = False
+    if leap_pending and entry["state"] in ("CONFIRMED", "TREND"):
+        entry["leap_pending"] = True
     retested = prev.get("retested", False)
+    retest_pending = bool(prev.get("retest_pending") or r.get("retest_pending"))
     if r["state"] == "CONFIRMED" \
             and prev.get("state") not in ("CONFIRMED", "TREND"):
-        retested = False
-    if r.get("retest"):
+        retested = False                # 新一轮确认: 一次性提示重新计数
+        retest_pending = False
+    if r.get("retest"):                 # 回踩已提示 = 显式消耗
         retested = True
+        retest_pending = False
     if retested:
         entry["retested"] = True
+    if retest_pending and entry["state"] in ("CONFIRMED", "TREND"):
+        entry["retest_pending"] = True
     return entry
 
 
@@ -266,12 +300,15 @@ CBOE_HISTORY_URL = ("https://cdn.cboe.com/api/global/us_indices/"
 def _cboe_series(name: str) -> pd.Series:
     """Official CBOE daily closes. Primary source for the VIX complex —
     Yahoo's ^VIX3M/^VIX9D feeds go stale for weeks at a time (observed
-    2026-08: ^VIX3M frozen since 07-17 while ^VIX stayed current)."""
+    2026-08: ^VIX3M frozen since 07-17 while ^VIX stayed current).
+    VIX/VIX3M/VXN files carry an OHLC 的 CLOSE 列; VVIX 只有两列
+    (DATE,VVIX) — 没有 CLOSE 时取第二列。"""
     req = urllib.request.Request(CBOE_HISTORY_URL.format(name),
                                  headers={"User-Agent": "Mozilla/5.0"})
     text = urllib.request.urlopen(req, timeout=30).read().decode()
     df = pd.read_csv(io.StringIO(text))
-    ser = pd.Series(df["CLOSE"].astype(float).values,
+    col = "CLOSE" if "CLOSE" in df.columns else df.columns[1]
+    ser = pd.Series(df[col].astype(float).values,
                     index=pd.to_datetime(df["DATE"], format="%m/%d/%Y"))
     return ser.tail(400)
 
@@ -291,6 +328,211 @@ def _cboe_delayed(name: str) -> tuple[float, datetime]:
                                  headers={"User-Agent": "Mozilla/5.0"})
     d = json.loads(urllib.request.urlopen(req, timeout=30).read())["data"]
     return float(d["current_price"]), datetime.fromisoformat(d["last_trade_time"])
+
+
+VX_SETTLE_URL = ("https://www.cboe.com/us/futures/market_statistics/"
+                 "settlement/csv?dt={}")
+
+
+def parse_vx_settlement(text: str) -> list[tuple[str, float]]:
+    """Monthly VX settlements from the CFE daily settlement CSV
+    (Product,Symbol,Expiration Date,Price), sorted by expiry. Weekly rows
+    (VX35/U6 ...) are excluded — the CSV pads them with the front-month
+    price (observed 2026-09-01: six different weeklies all printing
+    17.2528), so they carry no curve information. VXM/VA rows likewise."""
+    out = []
+    for line in text.splitlines()[1:]:
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 4 or parts[0] != "VX":
+            continue
+        if not parts[1].startswith("VX/"):   # monthly = "VX/U6", weekly = "VX35/U6"
+            continue
+        try:
+            out.append((parts[2], float(parts[3])))
+        except ValueError:
+            continue
+    return sorted(out)
+
+
+def vx_curve_state(prices: list[float], n_front: int = 5) -> str | None:
+    """VX 期货曲线形态, 看前 n_front 个月度合约:
+    FULL_BACKWARDATION   逐对递减 (eco3min 口径 — 2004 年以来 22 次,
+                         21 次在 30 天内伴随 SPX >5% 回撤; 唯一漏网
+                         2013 taper tantrum 只是局部倒挂)
+    PARTIAL_BACKWARDATION  M1 > M2 但未全曲线
+    CONTANGO             其余 (含混合形态)
+    None                 合约不足 2 个, 无读数"""
+    p = prices[:n_front]
+    if len(p) < 2:
+        return None
+    diffs = [p[i + 1] - p[i] for i in range(len(p) - 1)]
+    # 相邻月度平价 (tie) 是这个 feed 的实测形态 (未成交行填充) — 全程
+    # 非升且至少一段真跌 = 实质全曲线倒挂, 严格 < 会被一个 tie 静默降级
+    if all(d <= 0 for d in diffs) and any(d < 0 for d in diffs):
+        return "FULL_BACKWARDATION"
+    # tie 容忍只给 FULL (全程非升的曲线里一个填充平价不该静默降级)。
+    # PARTIAL 是"前端承压"的判断, 必须真的 M1 > M2 — 平价前端 + 后段
+    # 单点回落但整体上行是混合曲线, 归 CONTANGO; 否则警告会渲染出
+    # "25.00 > 25.00" 这种自相矛盾的读数 (三轮评审)
+    if diffs[0] < 0:
+        return "PARTIAL_BACKWARDATION"
+    return "CONTANGO"
+
+
+def fetch_vx_curve(n_front: int = 5) -> dict:
+    """Latest CFE settlement curve — walks back up to a week to find the
+    most recent business day with rows (settlement publishes after the
+    close, so intraday the newest file is yesterday's). Returns
+    {'error': ...} instead of raising: the VX gate degrades to
+    advisory-off when the feed is down, mirroring the vxn convention."""
+    today = datetime.now(ET).date()
+    last_err = "no settlement rows found"
+    for back in range(7):
+        dt = today - timedelta(days=back)
+        if dt.weekday() >= 5:
+            continue
+        try:
+            req = urllib.request.Request(VX_SETTLE_URL.format(dt.isoformat()),
+                                         headers={"User-Agent": "Mozilla/5.0"})
+            text = urllib.request.urlopen(req, timeout=30).read().decode()
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            continue
+        rows = parse_vx_settlement(text)
+        # VX 月度到期日当天上午结算之后, 前一交易日的文件里那份**已到期**
+        # 合约仍在, sorted 之后会被当成 M1。临到期合约收敛到现货 VIX,
+        # VIX 一跳就把曲线前端顶起来 — 长得像倒挂, 而它已经不可交易 →
+        # 误报硬停牌。必须在完整性检查**之前**滤掉 (顺序反了的话, 滤完
+        # 不足 n_front 会被当成"结算未发布"而多回看一天)
+        rows = [(e, px) for e, px in rows if e > today.isoformat()]
+        # 盘中/假日/未来日期该端点会回 1-2 行的 stub (HTTP 200) — 不足
+        # n_front 个月度合约视为"当日结算未发布", 回看上一交易日, 绝不
+        # 拿残缺曲线宣判 FULL_BACKWARDATION 硬停牌
+        if len(rows) >= n_front:
+            prices = [p for _e, p in rows]
+            return {
+                "as_of": dt.isoformat(),
+                "state": vx_curve_state(prices, n_front),
+                "m1": prices[0], "m2": prices[1],
+                "m1_exp": rows[0][0], "m2_exp": rows[1][0],
+                "m1_m2_pct": (prices[1] / prices[0] - 1) * 100,
+                "n_contracts": len(rows),
+            }
+    return {"error": last_err}
+
+
+def fetch_vvix() -> dict:
+    """VVIX (VIX 期权隐含的 vol-of-vol) — CBOE 日收盘 + 同日盘中临时点,
+    与 VIX 的 intraday graft 同约定. -> {'value','as_of'} or {'error'}.
+    历史 CSV 冻结 (>5 交易日) 且盘中点也拿不到时按 error 报 — 这是唯一
+    在 NORMAL 期硬拦 CSP 的门, 绝不能拿旧数当读数 (与 fetch_move 同约定;
+    CBOE/Yahoo 指数 feed 断更有前科)."""
+    # 两条路径必须**独立**: 历史 CSP 请求失败时盘中点仍可能是健康的,
+    # 把它嵌在 CSV 成功之后的内层 try 里, 等于把文档写的"且"做成了"或"。
+    # 而且失效方向是 fail-open — 这是 NORMAL 期唯一硬拦 CSP 的门, CSV
+    # 端点打个嗝就静默关掉整道门 (三轮评审)
+    val = as_of = None
+    fresh = False
+    errs = []
+    try:
+        ser = _cboe_series("VVIX")
+        val, as_of = float(ser.iloc[-1]), str(ser.index[-1].date())
+        fresh = int(np.busday_count(ser.index[-1].date(),
+                                    datetime.now(ET).date())) <= 5
+        if not fresh:
+            errs.append(f"history stale (最新 {as_of})")
+    except Exception as e:
+        errs.append(f"history {type(e).__name__}: {e}")
+    try:
+        v_now, v_ts = _cboe_delayed("VVIX")
+        if v_ts.date() == datetime.now(ET).date():
+            val, as_of, fresh = v_now, f"{v_ts.date()} 盘中", True
+        else:
+            errs.append(f"delayed 非当日 ({v_ts.date()})")
+    except Exception as e:
+        errs.append(f"delayed {type(e).__name__}: {e}")
+    if not fresh or val is None:
+        return {"error": "; ".join(errs) or "no reading"}
+    return {"value": val, "as_of": as_of}
+
+
+def fetch_move() -> dict:
+    """^MOVE (ICE BofA 美债波动率) — 只有 Yahoo 源, 无 CBOE 兜底。
+    Yahoo 指数 feed 会断更 (见 ^VIX3M 前科): 最新点老于 5 个交易日
+    按 error 报, 不当读数用. -> {'value','as_of'} or {'error'}."""
+    try:
+        ser = yf.download("^MOVE", period="3mo", interval="1d",
+                          auto_adjust=False, progress=False)["Close"]
+        if hasattr(ser, "columns"):     # 单 ticker 也可能回 DataFrame
+            ser = ser.iloc[:, 0]
+        ser = ser.dropna()
+        if ser.empty:
+            return {"error": "empty feed"}
+        last_date = ser.index[-1].date()
+        age = int(np.busday_count(last_date, datetime.now(ET).date()))
+        if age > 5:
+            return {"error": f"stale (最新 {last_date})"}
+        return {"value": float(ser.iloc[-1]), "as_of": str(last_date)}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def assess_vol_gates(stage: str, vx: dict, vvix: dict, move: dict,
+                     vix_level: float, s: dict) -> dict:
+    """Cross-signal gates layered on top of the VIX/VIX3M stage machine.
+    -> {"halt_csp": str|None, "halt_new_longs": str|None, "warnings": [...]}
+    halt_csp 拦新 CSP 票, halt_new_longs 拦 LEAP/回踩 spread —
+    票据以 skip_reason 呈现, 原因随票可见。数据缺失 (error dict) 不拦:
+    门控宁可漏也不能靠坏数据硬拦。"""
+    halt_csp, halt_longs, warnings = None, None, []
+    if vx.get("state") == "FULL_BACKWARDATION":
+        # FULL 容忍相邻平价, 前端可能 m1 == m2 — 只渲染观测值, 不写 ">"
+        base = (f"VX 期货全曲线倒挂 (M1 {vx['m1']:.2f} / M2 {vx['m2']:.2f}, "
+                f"结算 {vx['as_of']}) — 2004 年以来 22 次中 21 次在 30 天内 "
+                "SPX 回撤 >5%")
+        # 消息必须与实际拦截范围一致 — 开关关闭时 CSP 在流, 不能仍写"停开新票"
+        # 开关的语义是"放行**剧本恐慌档** CSP" (README) — 而 VX 全曲线
+        # 倒挂恰恰可以与 VIX/VIX3M NORMAL 并存 (这正是本门存在的理由),
+        # 所以不能让它在 NORMAL 期放行普通 CSP: 那正是本门要拦的场景
+        if s["vx_full_backwardation_halt"]:
+            halt_csp = halt_longs = (
+                base + ": 停开新 CSP/LEAP/回踩 spread, 持有对冲 "
+                "(恢复剧本恐慌档 CSP 关 vx_full_backwardation_halt)")
+        elif stage.startswith("STAGE1"):
+            halt_longs = (
+                base + ": 停开新 LEAP/回踩 spread, 持有对冲 — CSP 已按 "
+                "vx_full_backwardation_halt=false 放行 (剧本恐慌档)")
+        else:
+            halt_csp = halt_longs = (
+                base + ": 停开新 CSP/LEAP/回踩 spread, 持有对冲 — "
+                f"vx_full_backwardation_halt=false 只放行剧本恐慌档 "
+                f"(STAGE1) CSP, 当前 {stage} 不适用")
+    elif vx.get("state") == "PARTIAL_BACKWARDATION":
+        warnings.append(
+            f"VX 期货 M1 {vx['m1']:.2f} > M2 {vx['m2']:.2f} 局部倒挂 — "
+            "前端承压, 关注是否蔓延成全曲线 (全曲线 = 硬停牌)")
+
+    # VVIX 停牌线: 只管 NORMAL — 平静表面下 vol-of-vol 抢跑 = 对冲拥挤/
+    # 裂缝先兆, 不该再开新短 put。STAGE1 恐慌档 (16法则) 与 STAGE2 解除窗
+    # (统计加成) 都按剧本走, VVIX 高是那两个 regime 的常态, 不加拦。
+    v = vvix.get("value")
+    if halt_csp is None and stage == "NORMAL" \
+            and v is not None and v >= s["vvix_halt"]:
+        halt_csp = (f"VVIX {v:.1f} (as of {vvix.get('as_of', '?')}) >= "
+                    f"{s['vvix_halt']:g} 而 regime 仍 NORMAL — vol-of-vol "
+                    "抢跑 (对冲拥挤/裂缝先兆): 停开新 CSP, 等 VVIX 回落"
+                    "或 regime 表态")
+    # MOVE 背离预警: 债波先行于股波 (2023-03 SVB: MOVE 130→200 两天,
+    # VIX 晚数日; 2025-04 basis trade: MOVE ~172 先到) — 预警不拦票。
+    m = move.get("value")
+    if m is not None and m > s["move_divergence"] \
+            and vix_level < s["move_calm_vix_max"]:
+        warnings.append(
+            f"MOVE {m:.1f} > {s['move_divergence']:g} 而 VIX 仅 "
+            f"{vix_level:.1f} — 债券波动率先行 (2023-03 SVB / 2025-04 "
+            "序列): 缩短 put 名义, 对冲前移到长期限指数 put")
+    return {"halt_csp": halt_csp, "halt_new_longs": halt_longs,
+            "warnings": warnings}
 
 
 def fetch_regime(s: dict) -> dict:
@@ -336,15 +578,26 @@ def fetch_regime(s: dict) -> dict:
     stage, episodes = classify_regime(ratio, s)
     prev = float(ratio.iloc[-2])
     cur = float(ratio.iloc[-1])
+    vx = fetch_vx_curve(s["vx_curve_contracts"])
+    vvix = fetch_vvix()
+    move = fetch_move()
+    gates = assess_vol_gates(stage, vx, vvix, move, float(vix.iloc[-1]), s)
     return {
         "vix": float(vix.iloc[-1]), "vix3m": float(vix3m.iloc[-1]),
         "vxn": vxn_last,
+        "vvix": vvix, "move": move,
+        "gate_lines": {"vvix_halt": s["vvix_halt"],
+                       "move_divergence": s["move_divergence"]},
         "ratio": cur, "ratio_prev": prev,
         "crossed_up": prev < 1.0 <= cur, "crossed_down": prev >= 1.0 > cur,
         "stage": stage,
         "last_episode": episodes[-1] if episodes else None,
         "as_of": as_of,
         "source": source, "stale_days": age_days, "intraday": intraday,
+        "vx": vx,
+        "halt_csp": gates["halt_csp"],
+        "halt_new_longs": gates["halt_new_longs"],
+        "gate_warnings": gates["warnings"],
     }
 
 
@@ -352,7 +605,9 @@ REGIME_NOTES = {
     "NORMAL": "正常结构 — 左侧看个股价值区, 右侧按确认信号走",
     "STAGE1": "倒挂 (阶段1) — 剧本: 只做卖方 (CSP 第一档), 不加右侧仓",
     "STAGE1_DEEP": "倒挂 >1.1 (历史级恐慌区) — 剧本: CSP 加第二/三档, 周权+16法则, 右侧仍停",
-    "STAGE2_WINDOW": "倒挂解除窗口 (阶段2) — 剧本: buy the relief — 价格确认后 LEAP/risk reversal",
+    "STAGE2_WINDOW": ("倒挂解除窗口 (阶段2) — 剧本: buy the relief — 价格确认后 "
+                      "LEAP/risk reversal; CSP 常规档解锁 (解除窗 = 统计最强"
+                      "卖权入场窗: 解除日起 SPX 5日 +3.04%/88%, 21日 +4.38%/91%)"),
 }
 
 
@@ -612,9 +867,193 @@ def atm_iv30(cc: ChainCache, spot: float) -> float | None:
     return v1 + (v2 - v1) * (30 - d1) / (d2 - d1)
 
 
+def closest_delta_row(rows: list[dict], target: float,
+                      tol: float = 0.10) -> dict | None:
+    """|delta| 最接近 target 的行; 链稀疏到 tol 以外 = 无读数 (None),
+    不硬凑 — 25Δ 读数宁缺毋错。"""
+    if not rows:
+        return None
+    best = min(rows, key=lambda c: abs(abs(c["delta"]) - target))
+    return best if abs(abs(best["delta"]) - target) <= tol else None
+
+
+def rr25(call_rows: list[dict], put_rows: list[dict],
+         tol: float = 0.10, invert_floor: float = 0.0) -> dict | None:
+    """25Δ risk reversal = put IV - call IV (vol pts, OTM 两侧)。
+    正常 skew 为正 (put 更贵); 负数 = call skew 倒挂 — 上涨追逐压过
+    下跌对冲 (meme/挤仓形态, 2026-07 曾有 ~55% 的 SPX 成分股 1 月期
+    倒挂, 超过 2021 meme 峰值口径)。"""
+    c = closest_delta_row(call_rows, 0.25, tol)
+    p = closest_delta_row(put_rows, 0.25, tol)
+    if c is None or p is None or not c.get("iv") or not p.get("iv"):
+        return None
+    rr = (p["iv"] - c["iv"]) * 100
+    # 噪声地板: Yahoo 延迟报价的 RR 读数有 ~1 vol pt 的 run-to-run 漂移
+    # (2026-09-02 实测), 零阈值会在真实 skew ≈ 0 时反复亮假旗标 —
+    # 倒挂旗标是"少卖 CSP/别买 LEAP"的行动信号, 假阳性直接烧权利金收入
+    return {"call_iv": c["iv"], "put_iv": p["iv"],
+            "call_strike": c["strike"], "put_strike": p["strike"],
+            "call_delta": c["delta"], "put_delta": p["delta"],
+            "rr": rr, "inverted": rr < -invert_floor}
+
+
+def _rr_mark(row, cutoff, s: dict) -> float | None:
+    """RR 专用的报价过滤 — 比 _mark 严得多, 因为 RR 是两腿 IV 的**符号
+    敏感差值**, 一腿的坏报价就能凭空造出倒挂旗标:
+
+    - 只认 live bid/ask mid (陈旧 lastPrice 与另一腿的实时 mid 不同源)
+    - 拒绝 crossed 报价 (bid > ask): Yahoo 实测会出, mid 无意义
+    - 相对价差上限: bid>0 and ask>0 只证明"有两个正数", 不证明 mid 可用;
+      任意宽的报价照样过, 而宽报价的 mid 正是假倒挂的来源 (三轮评审)
+    - 未平仓量地板: 无人持有的行权价报价不可信"""
+    mid, src = _mark(row, cutoff)
+    if mid is None or src != "live":
+        return None
+    bid, ask = float(row.get("bid") or 0), float(row.get("ask") or 0)
+    if bid > ask:                                   # crossed
+        return None
+    if mid <= 0 or (ask - bid) / mid > s["rr_max_rel_spread"]:
+        return None
+    if _oi(row) < s["rr_min_oi"]:
+        return None
+    return mid
+
+
+def forward_from_parity(calls, puts, T: float, cutoff, s: dict) -> float | None:
+    """由 put-call parity 反解该到期日的 forward: C - P = e^(-rT)(F - K)
+    → F = K + e^(rT)(C - P), 取 |C - P| 最小的行权价 (构造上离 F 最近,
+    也是最活跃的那档)。
+
+    这样 IV 与 delta 都从**期权市场自己**出发, 一次性消掉两个偏置:
+    ① 零股息 BS 用 S 而非 S·e^(-qT), 会压低 call IV/抬高 put IV, 把
+       RR 系统性推向"不倒挂", 可能盖掉真信号;
+    ② 更要命的是外部 spot 本身可能陈旧 — 实测 yfinance 日线最新一根
+       返回 NaN 时会退回前一日收盘, 用昨天的股价去反解今天的期权报价,
+       spot 偏低使 call 抬高/put 压低, 恰好是 RR 倒挂的形态 (2026-09-04
+       盘后 11 个标的亮了 10 个假旗标, 见 lesson.md)。"""
+    if calls is None or puts is None or calls.empty or puts.empty:
+        return None
+    cmid, pmid = {}, {}
+    for df, out in ((calls, cmid), (puts, pmid)):
+        for _, row in df.iterrows():
+            mid = _rr_mark(row, cutoff, s)
+            if mid is not None:
+                out[float(row["strike"])] = mid
+    common = set(cmid) & set(pmid)
+    if not common:
+        return None
+    k = min(common, key=lambda x: abs(cmid[x] - pmid[x]))
+    return k + math.exp(RATE * T) * (cmid[k] - pmid[k])
+
+
+def rr25_snapshot(cc: ChainCache, spot: float, s: dict) -> dict | None:
+    """~35 DTE 的 25Δ risk reversal 快照 (call/put 各取 OTM 侧
+    |Δ| 最接近 0.25 的行权价)。链/报价不可用时返回 None — 例外才
+    报告, 正常 skew 不进报告。"""
+    lo, hi = s["rr_dte"]
+    window = [(e, d) for e, d in cc.expiries() if lo <= d <= hi]
+    if not window:
+        return None
+    exp, dte = min(window, key=lambda x: abs(x[1] - 35))
+    ch = cc.chain(exp)
+    cutoff = _stale_cutoff()
+    T = dte / 365.0
+    # forward 拿不到就没有读数 — 绝不退回可能陈旧的外部 spot
+    fwd = forward_from_parity(ch.calls, ch.puts, T, cutoff, s)
+    if fwd is None:
+        return None
+    # 零股息 BS 里代入 S_eff = F·e^(-rT) 就等价于带股息/持有成本的定价
+    # (S·e^(-qT) = F·e^(-rT)), 不必改 bs_price/bs_delta 的签名
+    s_eff = fwd * math.exp(-RATE * T)
+    sides = []
+    for df, is_call in ((ch.calls, True), (ch.puts, False)):
+        rows = []
+        if df is not None and not df.empty:
+            # OTM 的分界是 forward 而不是现货 — 两腿必须对称于同一个中心
+            otm = df[df["strike"] > fwd] if is_call else df[df["strike"] < fwd]
+            for _, row in otm.iterrows():
+                mid = _rr_mark(row, cutoff, s)
+                if mid is None:
+                    continue
+                strike = float(row["strike"])
+                # RR 是两腿 IV 的**符号敏感差值** — 两腿必须同源: 一律从
+                # bid/ask mid 反解, 不用 Yahoo 预算的 impliedVolatility 列
+                # (实测与 mid 反解值差 +1.9~2.3 pts 且方向恰在 put-call 上,
+                # 曾把 MSFT/GOOG 的正常 skew 翻成假倒挂)。contract_iv 只留
+                # 给关心绝对水平的 atm_iv30。
+                iv = implied_vol(mid, s_eff, strike, T, RATE, is_call)
+                if iv is None:
+                    continue
+                rows.append({"strike": strike, "iv": iv,
+                             "delta": bs_delta(s_eff, strike, T, RATE, iv,
+                                               is_call)})
+        sides.append(rows)
+    out = rr25(sides[0], sides[1], s["rr_delta_tol"],
+               s["rr_invert_min_pts"])
+    if out is not None:
+        # forward 反解出的现货 vs 传进来的日线收盘 — 正常只差个股息/借券,
+        # 差得多就是那根日线陈旧/缺失, 意味着**整份报告**的价格与状态都不
+        # 可信 (RR 本身已改用 forward, 不受影响)
+        gap = (s_eff / spot - 1) * 100 if spot else None
+        out.update({"exp": exp, "dte": dte, "forward": fwd,
+                    "fwd_spot": s_eff, "spot_gap_pct": gap})
+    return out
+
+
 # --------------------------------------------------------------------------
 # Tickets
 # --------------------------------------------------------------------------
+
+def daily_bar_stale(cc: ChainCache, bar_date: str) -> str | None:
+    """日线是否落后于期权链的最新成交 -> 落后时给出说明, 否则 None。
+
+    判据是**日期比对**, 不是"forward 反解现货 vs 日线收盘"的价差。价差
+    判据分不开两件事: 借券费在定价上等同于股息 (F = S·e^((r-q-b)T)), 难
+    借券的高借券费会让 forward 合法地低于现货好几个百分点, 拿价差硬拦会
+    把那些标的永久静音, 而且给出的理由还是错的。日期不一样 —— 借券费再
+    贵也不会让"日线停在哪天"和"期权链最新成交在哪天"对不上 (三轮评审)。
+
+    单向判断: 只有期权**比日线新**才算陈旧。反过来 (期权好几天没成交)
+    是流动性问题, 不是数据问题, 不报。
+
+    到期日取**最近的**, 不借用 rr_dte 的 20-60 DTE 窗口: 借用的话, 没有
+    到期日落在窗口内的标的会让整道门静默失效, 而它照样能出 CSP/LEAP 票 —
+    那些票就建立在过期价格上 (四轮评审)。最近的一档没有成交记录时往后
+    再试两档就停, 免得为一道校验多拉一堆链。"""
+    chain_date = None
+    for exp, _dte in cc.expiries()[:3]:
+        dates = []
+        ch = cc.chain(exp)
+        for df in (ch.calls, ch.puts):
+            if df is None or df.empty or "lastTradeDate" not in df:
+                continue
+            ts = pd.to_datetime(df["lastTradeDate"], errors="coerce",
+                                utc=True).max()
+            if pd.notna(ts):
+                dates.append(ts.tz_convert(ET).date())
+        if dates:
+            chain_date = max(dates)
+            break
+    if chain_date is None:
+        return None
+    if str(chain_date) <= bar_date:
+        return None
+    # 短句: 这条会按标的 (乃至票种) 重复, 长解释只放在"今日动作"的合并行
+    # 里一次 — 和 regime halt 同一个教训 (三轮评审 :1640)
+    return (f"日线陈旧: 停在 {bar_date}, 而期权链已有 {chain_date} 的成交 "
+            "— 停出票直到日线补齐")
+
+
+def blocked_ticket(stale_msg: str | None, regime_msg: str | None) -> dict:
+    """被拦票的统一构造。
+
+    陈旧数据优先于市场门 — 价格都不可信时, 市场门拦没拦这一票已无意义。
+    且陈旧是**每标的**问题: 不打 regime_halt 标记, 免得被 action_block
+    合并进"全市场"那一行 (那行专给市场级硬停牌去重)。"""
+    if stale_msg:
+        return {"skip_reason": stale_msg, "stale_data": True}
+    return {"skip_reason": regime_msg, "regime_halt": True}
+
 
 def _put_candidates(cc: ChainCache, exp: str, dte: int, spot: float):
     ch = cc.chain(exp)
@@ -662,6 +1101,58 @@ def _finish_csp(c: dict, spot: float, s: dict, zone, panic: bool,
         notes.append(f"行权价高于价值区上沿 {zone[1]:g} — 被行权成本不在接货区, 可下移到 <= {zone[1]:g}")
     c["notes"] = notes
     return c
+
+
+def stage2_leap_gate(price_ok: bool, prev_leap_window, ep_end: str,
+                     halted: bool) -> tuple[bool, bool]:
+    """阶段2 LEAP 决策 -> (want_leap, burn_key)。
+
+    halted (VX 全曲线倒挂等硬门) 时票仍走 skip_reason 呈现 (⏸ 行可见),
+    但**不烧**每窗口一次的 leap_window dedup key — 硬门是暂态市场条件,
+    且 VX 结算滞后一个交易日, 解除窗第一天常读到恐慌尾巴的旧曲线;
+    烧了 key 会让整个 episode 的 LEAP 补发窗静默丢失。与 retest
+    一次性标记的处理一致 (halt 期间不置位)。"""
+    want = price_ok and prev_leap_window != ep_end
+    return want, want and not halted
+
+
+def normal_leap_gate(fresh_confirm: bool, prev_leap_pending: bool,
+                     state: str) -> bool:
+    """NORMAL 期 LEAP 决策 (纯函数)。
+
+    fresh_confirm 是一次性转换, 硬停牌当天会被 state.json 无条件消耗 —
+    leap_pending 把被拦的确认带到解除后补发。补发前必须复核**当日**右侧
+    状态: 标的在 halt 期间跌破 20 日线时 next_state 已经给出 PULLBACK,
+    而 state.json 里的失效要等本次扫描之后才写 — 不复核就会在止损出局
+    当天补一张新多头票 (三轮评审)。"""
+    return fresh_confirm or (prev_leap_pending
+                             and state in ("CONFIRMED", "TREND"))
+
+
+def retest_gate(state: str, touched_20dma: bool, prev_retested: bool,
+                prev_retest_pending: bool, stage: str) -> bool:
+    """首次回踩提示决策 (纯函数)。
+
+    touched_20dma 是**当日**事件: 只看它的话, 价格在 halt 期间离开 20 日
+    线之后这轮回踩就再也发不出来, 承诺的"解除后再提示"落空 — 被拦当日落
+    retest_pending, 跨日沿用, 解除后补发 (三轮评审)。STAGE1 不提示 (纪律:
+    倒挂持续期间不加右侧仓), 且每轮确认只提示一次。"""
+    return state == "TREND" and not stage.startswith("STAGE1") \
+        and not prev_retested and (touched_20dma or prev_retest_pending)
+
+
+def csp_window_open(zone, in_or_near_zone: bool, stage: str) -> bool:
+    """CSP 出票窗口: 有接货价, 且 (价格在/近区 或 恐慌档 或 阶段2解除窗口)。
+
+    阶段2 加入依据 (2026-09-02 研究, options.cafe 2009 年以来 43 次倒挂
+    事件): 解除日买入 SPX 前瞻 5日 +3.04%/胜率88%, 21日 +4.38%/91%,
+    63日 +6.93%/88%, 每个周期都碾压基线 (+0.26%/60%, +1.07%/68%,
+    +3.10%/75%) — 解除窗口是全数据里胜率最高的卖权入场窗, 且 IV 尚未
+    塌完时权利金最肥。倒挂开始日反而无短期边际 (5日 -0.15%/51%,
+    74% 的 episode 期间继续跌) — 所以加成给解除, 不给开始。"""
+    return zone is not None and (
+        in_or_near_zone or stage.startswith("STAGE1")
+        or stage == "STAGE2_WINDOW")
 
 
 def csp_ticket(cc: ChainCache, spot: float, iv30: float | None,
@@ -960,6 +1451,9 @@ def technical_snapshot(hist: pd.DataFrame, s: dict) -> dict | None:
     low_today = float(low.iloc[-1])
     return {
         "bars": len(hist),
+        # 最后一根**有效**日线的日期 (dropna 之后取, NaN 行不会冒充"今天的
+        # 价") — 与期权链的 lastTradeDate 比对即可直接证明日线陈旧
+        "as_of": str(hist.index[-1].date()),
         # 当日下探过20日线但收盘守住 — 回踩提示的原料
         "touched_20dma": low_today <= sma20 <= last,
         "low_today": low_today,
@@ -982,7 +1476,7 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
     r = {"symbol": sym, "cfg": cfg, "state": "NO_DATA", "notes": [],
          "tech": None, "earnings": "", "iv30": None, "self_ivp": None,
          "csp": None, "leap": None, "spread": None, "ladder": None,
-         "error": None}
+         "rr25": None, "error": None}
     try:
         tech = technical_snapshot(hist, s) if hist is not None else None
         if tech is None:
@@ -1007,12 +1501,37 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
         if not fetch_options:
             return r
 
+        cc = ChainCache(sym)
+        # 日线陈旧 = 本标的的价格/状态/票据全部建立在过期价格上 → 硬拦
+        # (⏸), 不是提示。判据见 daily_bar_stale 的 docstring
+        stale_msg = daily_bar_stale(cc, tech["as_of"]) \
+            if cfg["options"] else None
+        if stale_msg:
+            # 硬拦只在"本来就要出票"时才看得见 — 而多数标的当天并不出票,
+            # 那时陈旧会完全静默, 而概览表照样印着过期的收盘价和据此判定
+            # 的右侧状态。陈旧本身就是结论, 必须无条件出声
+            r["stale_data"] = True
+            r["notes"].append(f"⛔ {stale_msg}")
+
         # 首次回踩 (收盘口径, 每轮确认只提示一次): 剧本首选入场/加仓点
         # 倒挂期不提示也不烧一次性标记 (纪律: 阶段1不加右侧仓) — 解除后的
         # 首次回踩才算这轮的"首次"
-        if state == "TREND" and tech["touched_20dma"] \
-                and not regime["stage"].startswith("STAGE1") \
-                and not prev_state.get("retested"):
+        retest_seen = retest_gate(
+            state, tech["touched_20dma"], bool(prev_state.get("retested")),
+            bool(prev_state.get("retest_pending")), regime["stage"])
+        if retest_seen and (stale_msg or regime.get("halt_new_longs")):
+            r["retest_pending"] = True
+            # 呈现被拦的回踩 (⏸ skip_reason) 但不烧一次性 retested 标记 —
+            # 恢复后同一轮回踩仍可提示, 不是静默消失
+            if cfg["options"]:
+                r["spread"] = blocked_ticket(stale_msg,
+                                             regime.get("halt_new_longs"))
+            else:
+                r["notes"].append(
+                    "首次回踩20日线不破, 但"
+                    + ("日线数据陈旧" if stale_msg else "硬停牌中 (见市场状态 ⛔)")
+                    + " — 恢复后再按股价操作")
+        elif retest_seen:
             r["retest"] = True
             how = "票见下" if cfg["options"] else "无期权链 — 按股价操作"
             r["notes"].append("首次回踩20日线不破 — 剧本首选入场/加仓点 "
@@ -1027,11 +1546,18 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
             days_in = (datetime.now(ET).date()
                        - date.fromisoformat(prev_state["since"])).days
             if days_in >= s["trend_middle_days"]:
-                two_x = (f"2x ETF {cfg['two_x']} / " if cfg.get("two_x") else "")
-                r["notes"].append(
-                    f"趋势中段 (右侧已 {days_in} 天): 剧本工具切换 → {two_x}"
-                    "PMCC 金字塔加仓 — 绝不摊低成本; 硬止损: 破20日线无条件; "
-                    "环境止损: 指数破200日线 / VIX 持续>25 / 倒挂重现即清")
+                if regime.get("halt_new_longs"):
+                    # PMCC/2x 都是开新多头 — 硬停牌期间不给可执行建议
+                    r["notes"].append(
+                        f"趋势中段条件已满足 (右侧已 {days_in} 天) 但硬停牌中 "
+                        "(见市场状态 ⛔) — 解除后再切换 2x/PMCC")
+                else:
+                    two_x = (f"2x ETF {cfg['two_x']} / "
+                             if cfg.get("two_x") else "")
+                    r["notes"].append(
+                        f"趋势中段 (右侧已 {days_in} 天): 剧本工具切换 → {two_x}"
+                        "PMCC 金字塔加仓 — 绝不摊低成本; 硬止损: 破20日线无条件; "
+                        "环境止损: 指数破200日线 / VIX 持续>25 / 倒挂重现即清")
 
         # 正股分批档位只要 zone, 不依赖期权链 — options=false 的标的也要出
         in_or_near_zone = zone is not None \
@@ -1039,7 +1565,6 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
         if in_or_near_zone:
             r["ladder"] = stock_ladder(zone, s)
 
-        cc = ChainCache(sym)
         r["earnings"] = next_earnings(cc.tk)
         if r["earnings"] is None and cfg["kind"] in ("etf", "index"):
             r["earnings"] = ""  # ETF/指数无财报 — 404 是常态不是失败
@@ -1049,16 +1574,54 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
             r["iv30"] = atm_iv30(cc, tech["close"])
         except Exception as e:
             r["notes"].append(f"iv30 获取失败: {type(e).__name__}")
+        # 25Δ RR 倒挂 = 每标的 froth 旗标 — 例外才报告 (正常 skew 沉默);
+        # 获取失败也沉默 (纯提示信号, 不值得占报告版面)
+        try:
+            r["rr25"] = rr25_snapshot(cc, tech["close"], s)
+        except Exception:
+            pass
+        rr = r["rr25"]
+        gap = (rr or {}).get("spot_gap_pct")
+        # 日线**不**陈旧 (日期对得上) 却仍有大幅 forward/现货背离 = 持有成本
+        # 异常, 最常见的原因是难借券的高借券费 (F = S·e^((r-q-b)T))。这不是
+        # 数据问题而是信息: 借券贵 = 做空拥挤, 且卖 put 的净收益会被这块成本
+        # 侵蚀。陈旧那条路已经在上面硬拦掉了, 到这里的都是真背离
+        if stale_msg is None and gap is not None \
+                and abs(gap) >= s["rr_spot_gap_warn"] * 100:
+            r["notes"].append(
+                f"期权 forward 反解现货 ~{rr['fwd_spot']:.2f} vs 日线收盘 "
+                f"{tech['close']:.2f} ({gap:+.1f}%), 而日线并不陈旧 — 持有成本"
+                "异常, 常见于难借券的高借券费: 做空拥挤的信号, 且卖 put 的净"
+                "收益会被借券成本侵蚀, 下单前核对券商的借券费率")
+        if rr and rr["inverted"]:
+            r["notes"].append(
+                f"⚠️ 25Δ risk reversal 倒挂 ({rr['exp']}: "
+                f"{rr['call_strike']:g}C IV {rr['call_iv'] * 100:.1f}% > "
+                f"{rr['put_strike']:g}P IV {rr['put_iv'] * 100:.1f}%, "
+                f"RR {rr['rr']:+.1f} pts) — 上涨追逐挤压 (2021 meme 形态): "
+                "CSP 对下行风险结构性少收钱 (行权价放更远或跳过); "
+                "OTM/ATM LEAP 在付倒挂税, 只用 deep ITM/正股; "
+                "covered call/PMCC 短腿溢价异常肥 — 只 covered 不裸卖")
 
         stage = regime["stage"]
         # CSP = 在愿意接货的价位卖 put — 没设价值区就没有接货价, 不出票
         # (剧本 ORCL 教训: 不想接货的 put 本来就不该卖)。与状态标签解耦:
         # 价格在/近价值区就出, 趋势上方也一样 — 接货限价单与趋势方向无关。
-        want_csp = zone is not None and (
-            in_or_near_zone or stage.startswith("STAGE1"))
+        want_csp = csp_window_open(zone, in_or_near_zone, stage)
         if zone is None and stage.startswith("STAGE1"):
             r["notes"].append("倒挂期但未设价值区 — 剧本: 不想接货的 put 不该卖; "
                               "在 watchlist.toml 设好 value_zone 才出 CSP 票")
+        if stage == "STAGE2_WINDOW":
+            if want_csp and not in_or_near_zone:
+                r["notes"].append(
+                    "阶段2解除窗口 = 统计最强卖权入场窗 (解除日起 SPX 5日 "
+                    "+3.04%/88%, 21日 +4.38%/91% — options.cafe 2009-2025 "
+                    "43 次事件): 价格虽在接货带上方仍试出 CSP 常规档, "
+                    "行权价仍卡接货带上沿, 年化不过线自然拦")
+            elif zone is None:
+                r["notes"].append(
+                    "阶段2解除窗口 (统计最强卖权窗: 解除日起 5日 +3.04%/88%) "
+                    "但未设价值区 — 设好 value_zone 才出 CSP 票")
 
         fresh_confirm = state == "CONFIRMED" and prev not in ("CONFIRMED", "TREND")
         if stage == "STAGE2_WINDOW":
@@ -1069,27 +1632,76 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
             ep_end = str(regime["last_episode"]["end"].date())
             price_ok = tech["close"] > tech["sma20"] \
                 or tech["signals"]["no_new_low"]
-            want_leap = price_ok and prev_state.get("leap_window") != ep_end
-            if want_leap:
+            # 陈旧日同样不能烧掉每窗口一次的 dedup key — 否则日线补齐后
+            # 整个 episode 的 LEAP 补发窗静默丢失 (与 halt 同一个理由,
+            # 0005 修过 halt 那条, 陈旧这条是四轮评审补上的)
+            want_leap, burn_key = stage2_leap_gate(
+                price_ok, prev_state.get("leap_window"), ep_end,
+                bool(stale_msg or regime.get("halt_new_longs")))
+            if burn_key:
                 r["leap_window"] = ep_end
                 r["notes"].append("阶段2解除窗口 — buy the relief: 价格条件"
                                   "(收上20日线/不再新低 二选一)已满足; 工具: "
                                   "deep ITM LEAP / risk reversal (卖put融资买call)")
         else:
-            want_leap = fresh_confirm and stage == "NORMAL"
+            # fresh_confirm 是一次性转换, 硬停牌那天会被 state.json 无条件
+            # 消耗 — leap_pending 把被拦的确认带到 halt 解除后补发
+            want_leap = stage == "NORMAL" and normal_leap_gate(
+                fresh_confirm, bool(prev_state.get("leap_pending")), state)
         if fresh_confirm and stage.startswith("STAGE1"):
             r["notes"].append("右侧信号出现但倒挂未解除 — 剧本: 倒挂持续期间不加右侧仓, 等阶段2")
+        vvix_now = (regime.get("vvix") or {}).get("value")
+        if want_leap and vvix_now is not None and vvix_now >= s["vvix_halt"]:
+            r["notes"].append(
+                f"VVIX {vvix_now:.0f} >= {s['vvix_halt']:g} — vega 贵: LEAP "
+                "只要 deep ITM 低外在档 (票内过滤器已管), 或等 VVIX 回落; "
+                "<90 才是囤凸性的窗口")
 
+        # 倒挂门控矩阵的硬门: 拦截以 skip_reason 呈现, 原因随票可见 —
+        # 不是静默消失 (被拦的票在报告里显示 ⏸ + 原因)。regime_halt 标记
+        # 让 action_block 把全市场硬停牌合并成一行, 免得每票重复长文
         if want_csp:
-            r["csp"] = csp_ticket(cc, tech["close"], r["iv30"],
-                                  r["earnings"], stage, zone, s)
+            if stale_msg or regime.get("halt_csp"):
+                r["csp"] = blocked_ticket(stale_msg, regime.get("halt_csp"))
+            else:
+                r["csp"] = csp_ticket(cc, tech["close"], r["iv30"],
+                                      r["earnings"], stage, zone, s)
         if want_leap:
-            r["leap"] = leap_ticket(cc, tech["close"], cfg, r["earnings"], s)
+            if stale_msg or regime.get("halt_new_longs"):
+                r["leap"] = blocked_ticket(stale_msg,
+                                           regime.get("halt_new_longs"))
+                if stage == "NORMAL":
+                    r["leap_pending"] = True
+            else:
+                r["leap"] = leap_ticket(cc, tech["close"], cfg,
+                                        r["earnings"], s)
+                # 只有**真票**才算消耗 pending — 财报缓冲期内/无可用合约都
+                # 是临时约束, 清掉标记就等于约束解除后不再补发, 与"显式消耗"
+                # 的生命周期自相矛盾 (三轮评审)。仍由"状态离开 CONFIRMED/
+                # TREND"兜底失效, 不会无限挂着
+                emitted = "skip_reason" not in r["leap"]
+                r["leap_emitted"] = emitted
+                # leap_emitted=False 只保住**已存在**的标记, 不会新建一个 —
+                # 首次 NORMAL 确认当天就撞上财报缓冲/暂无合约时, 一次性的
+                # fresh_confirm 会被 state.json 消耗掉而没有任何补发标记,
+                # 约束解除后再也发不出来 (四轮评审)
+                if not emitted and stage == "NORMAL":
+                    r["leap_pending"] = True
         if r.get("retest"):  # STAGE1 已在回踩检测处拦掉
             r["spread"] = call_spread_ticket(cc, tech["close"], s)
             if "skip_reason" not in r["spread"]:
                 # 剧本工具切换表: 止损放回踩低点下方
                 r["spread"]["retest_low"] = tech["low_today"]
+        # RR 倒挂时给已出的票追加短提示 (完整解释在上面的 notes 行)
+        if rr and rr["inverted"]:
+            if r["csp"] and "skip_reason" not in r["csp"]:
+                r["csp"]["notes"].append(
+                    "call skew 倒挂中 — 本票对下行风险结构性少收钱: "
+                    "宁可行权价更远/仓位更小, 或跳过这轮")
+            if r["leap"] and "skip_reason" not in r["leap"]:
+                r["leap"]["notes"].append(
+                    "call skew 倒挂中 — 核对外在价值占比, 只要 deep ITM 档 "
+                    "(OTM/ATM 在付倒挂税)")
     except Exception as e:
         r["error"] = f"{type(e).__name__}: {e}"
     return r
@@ -1109,7 +1721,9 @@ def append_iv_history(results: list[dict], scan_date: str) -> pd.DataFrame:
     df = load_iv_history()
     rows = []
     for r in results:
-        if r["iv30"] is None:
+        # iv30 的 ATM 档位是按 tech["close"] 选的 — 陈旧价选出的档位和据此
+        # 算的 IV 一样不可信, 不能进自建 IVP 的历史样本 (四轮评审)
+        if r["iv30"] is None or r.get("stale_data"):
             continue
         dup = ((df["date"] == scan_date) & (df["symbol"] == r["symbol"])).any()
         if not dup:
@@ -1192,12 +1806,33 @@ def action_label(r: dict, ivp) -> str:
     return "别追·等回调"  # 趋势里无入场事件: 空仓不追高, 持有继续拿
 
 
+def _regime_halted(ticket) -> bool:
+    return bool(ticket) and "skip_reason" in ticket and ticket.get("regime_halt")
+
+
+def ticket_skip_line(label: str, ticket: dict) -> str:
+    """被拦票在明细区的一行。
+
+    全市场硬停牌的 ~150 字理由只在市场状态的 ⛔ 行出现一次 — 明细区按
+    标的 x 票种 重复 (10 个标的各有 CSP+LEAP 就是 20 遍) 会把报告淹掉,
+    而手机上扫一眼就能看懂正是当初做合并的初衷 (三轮评审)。"""
+    if _regime_halted(ticket):
+        return f"- {label}: ⏸ 市场门拦下 — 完整理由见市场状态 ⛔ 行"
+    return f"- {label}: {ticket['skip_reason']}"
+
+
 def action_block(results: list[dict], ivdf) -> list[str]:
-    """报告最顶上的 3-6 行 — 手机上扫一眼就知道今天要不要动手."""
+    """报告最顶上的 3-6 行 — 手机上扫一眼就知道今天要不要动手.
+    全市场硬停牌 (regime_halt 票) 合并成一行 — 同一段 ~150 字的拦截
+    理由不逐票重复, 全文只在市场状态的 ⛔ 行出现一次."""
     lines = ["## 今日动作", ""]
     items: list[tuple[str, str]] = []
+    halted: list[str] = []
+    stale: list[str] = []
     for r in by_actionability(results):
         sym = r["symbol"]
+        if r.get("stale_data"):
+            stale.append(sym)
         if _has_stop(r):
             items.append((sym, f"- ⚠️ **{sym}** 右侧止损: 收盘跌破20日线 — "
                                "凸性档减半 / 结构破清仓"))
@@ -1211,13 +1846,19 @@ def action_block(results: list[dict], ivdf) -> list[str]:
                 items.append((sym, f"- 🟢 **{sym}** LEAP: BUY {leap['exp']} "
                                    f"{leap['strike']:g}C @ ~{leap['mid']:.2f} "
                                    f"(delta {leap['delta']:.2f}, 详见下)"))
+        elif _regime_halted(leap):
+            if sym not in halted:
+                halted.append(sym)
         elif leap:
-            items.append((sym, f"- ⏸ **{sym}** {leap['skip_reason']}"))
+            items.append((sym, f"- ⏸ **{sym}** LEAP: {leap['skip_reason']}"))
         if csp and "skip_reason" not in csp:
             items.append((sym, f"- 🔵 **{sym}** CSP: SELL {csp['exp']} "
                                f"{csp['strike']:g}P @ ~{csp['mid']:.2f} "
                                f"(delta {csp['delta']:.2f}, 年化 "
                                f"~{csp['annualized_pct']:.0f}%, 详见下)"))
+        elif _regime_halted(csp):
+            if sym not in halted:
+                halted.append(sym)
         elif csp:
             items.append((sym, f"- ⏸ **{sym}** CSP: {csp['skip_reason']}"))
         spread = r.get("spread")
@@ -1226,14 +1867,30 @@ def action_block(results: list[dict], ivdf) -> list[str]:
                                f"{spread['long_strike']:g}C / SELL "
                                f"{spread['short_strike']:g}C 净支出 "
                                f"~{spread['debit']:.2f} (详见下)"))
+        elif _regime_halted(spread):
+            if sym not in halted:
+                halted.append(sym)
         elif spread:
             items.append((sym, f"- ⏸ **{sym}** 回踩 spread: {spread['skip_reason']}"))
         elif r.get("retest"):
             items.append((sym, f"- 👀 **{sym}** 首次回踩20日线不破 — 剧本首选"
                                "加仓点 (3-6个月 call spread, 手动构造)"))
+    if stale:
+        # 手机上扫一眼的那一屏必须看得到 — 概览表里这些标的的收盘价与
+        # 右侧状态都建立在过期日线上
+        items.append(("", f"- ⛔ 日线陈旧, 已停出票: {', '.join(stale)} — "
+                          "Yahoo 日线与期权链是两个端点, 会不同步; 这些标的"
+                          "的收盘价、概览表里的右侧状态判定与全部票据读数"
+                          "都建立在过期价格上, 等日线补齐再看"))
+    if halted:
+        # regime_halt 也可能是 VVIX 的"只拦 CSP"或 VX 开关下的"只拦 LEAP/
+        # spread" — 同一标的可以一边被拦一边有别的有效票, 写死"全市场/新票
+        # 暂停"会与上面刚发出的票自相矛盾 (三轮评审)
+        items.append(("", f"- ⏸ 市场门拦下部分新票 ({', '.join(halted)}) "
+                          "— 拦截范围与原因见下方市场状态 ⛔ 行"))
     if items:
         lines += [line for _sym, line in items]
-        mentioned = {sym for sym, _line in items}
+        mentioned = {sym for sym, _line in items} | set(halted) | set(stale)
         others = [r["symbol"] for r in results if r["symbol"] not in mentioned]
         if others:
             lines.append(f"- 其余今日无动作: {', '.join(others)}")
@@ -1260,13 +1917,52 @@ def regime_block(regime: dict) -> list[str]:
         + (", 含盘中临时点·延迟15min" if regime.get("intraday") else "") + ")",
         f"- 阶段: **{regime['stage']}** — {REGIME_NOTES[regime['stage']]}",
     ]
+    vx = regime.get("vx") or {}
+    if vx.get("error"):
+        lines.append(f"- VX 期货曲线: 获取失败 ({vx['error']}) — 全曲线倒挂门"
+                     "未生效, 手动核对 volchart.io/moomoo")
+    elif vx:
+        vx_label = {"CONTANGO": "contango",
+                    "PARTIAL_BACKWARDATION": "**局部倒挂**",
+                    "FULL_BACKWARDATION": "**全曲线倒挂**"}.get(
+            vx.get("state"), str(vx.get("state")))
+        lines.append(
+            f"- VX 期货: M1 {vx['m1']:.2f} ({vx['m1_exp']}) → "
+            f"M2 {vx['m2']:.2f} ({vx['m2_exp']}), M1→M2 {vx['m1_m2_pct']:+.1f}% "
+            f"— {vx_label} (结算 {vx['as_of']})")
+    vvix, move = regime.get("vvix") or {}, regime.get("move") or {}
+    if vvix or move:
+        def _gauge(d, name, line_val, line_label):
+            if d.get("error"):
+                # 与 VX 错误行同规格: 带原因 + 明示门未生效 (README 承诺)
+                return (f"{name} 获取失败 ({d['error']}) — "
+                        f"{line_label}门未生效, 手动核对")
+            return (f"{name} **{d['value']:.1f}** ({line_label} {line_val:g}, "
+                    f"as of {d['as_of']})")
+        gl = regime.get("gate_lines", SETTINGS_DEFAULTS)
+        lines.append(
+            "- " + _gauge(vvix, "VVIX", gl["vvix_halt"], "停牌线")
+            + " | " + _gauge(move, "MOVE", gl["move_divergence"], "背离线"))
+    for w in regime.get("gate_warnings", []):
+        lines.append(f"- ⚠️ {w}")
+    # 两道硬门可能同时活跃且消息不同 (如 VVIX 拦 CSP + VX 拦 LEAP/spread
+    # 当 vx_full_backwardation_halt=false) — 各渲染一行, 相同消息去重
+    seen_halts = []
+    for h in (regime.get("halt_csp"), regime.get("halt_new_longs")):
+        if h and h not in seen_halts:
+            seen_halts.append(h)
+            lines.append(f"- ⛔ {h}")
     if regime["stale_days"] > 5:
         lines.append(f"- ⚠️ **VIX 数据已 {regime['stale_days']} 天未更新** — "
                      "阶段判定不可信, 手动核对 CBOE/moomoo")
     if regime["crossed_up"]:
         lines.append("- ⚠️ **ratio 上穿 1.0** — 新一轮倒挂开始: CSP 第一档启动, 右侧停")
     if regime["crossed_down"]:
-        lines.append("- ⚠️ **ratio 下穿 1.0** — 倒挂解除: 等价格确认 (收复20日线/不再新低) 后进阶段2")
+        lines.append(
+            "- ⚠️ **ratio 下穿 1.0** — 倒挂解除: 历史上是统计最强入场窗 "
+            "(2009 年以来解除日买 SPX: 5日 +3.04%/88%, 21日 +4.38%/91% vs "
+            "基线 +0.26%/60%); 达标 episode (≥3日, 峰值≥1.10) 进阶段2 → "
+            "CSP 常规档 + LEAP 窗口, 浅倒挂解除无加成")
     ep = regime["last_episode"]
     if ep and (ep["ongoing"] or regime["stage"] == "STAGE2_WINDOW"):
         lines.append(
@@ -1355,7 +2051,7 @@ def render_close(results, regime, ivdf, now_et) -> str:
         csp = r["csp"]
         if csp:
             if "skip_reason" in csp:
-                lines.append(f"- CSP: {csp['skip_reason']}")
+                lines.append(ticket_skip_line("CSP", csp))
             else:
                 tag = "恐慌档" if csp["panic_mode"] else "常规"
                 lines.append(
@@ -1388,7 +2084,7 @@ def render_close(results, regime, ivdf, now_et) -> str:
         if leap:
             ivp = self_ivp(ivdf, r["symbol"], r["iv30"]) if r["iv30"] else None
             if "skip_reason" in leap:
-                lines.append(f"- LEAP: {leap['skip_reason']}")
+                lines.append(ticket_skip_line("LEAP", leap))
             elif ivp is not None and ivp > 60:
                 # 剧本 IV 档位: IVP >60 连 deep ITM 都改用 spread/PMCC/RR
                 lines.append(
@@ -1411,7 +2107,7 @@ def render_close(results, regime, ivdf, now_et) -> str:
         spread = r.get("spread")
         if spread:
             if "skip_reason" in spread:
-                lines.append(f"- 回踩 spread: {spread['skip_reason']}")
+                lines.append(ticket_skip_line("回踩 spread", spread))
             else:
                 lines.append(
                     f"- **Call spread (回踩)**: BUY {r['symbol']} {spread['exp']} "
@@ -1611,6 +2307,13 @@ def main() -> int:
             # persist state transitions (close-basis only, per the playbook)
             for r in results:
                 if r["error"] or r["tech"] is None:
+                    continue
+                if r.get("stale_data"):
+                    # r["state"] 是拿过期价格算出来的 — 落盘会覆盖
+                    # state/since 并消耗一次性转换, 等于用昨天的价把今天的
+                    # 信号用掉。报告已声明这些读数不可信, 持久化更不能收
+                    # (四轮评审)
+                    r["state_since"] = state.get(r["symbol"], {}).get("since")
                     continue
                 prev = state.get(r["symbol"], {})
                 state[r["symbol"]] = next_persisted_state(prev, r, d)
