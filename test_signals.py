@@ -396,20 +396,50 @@ class TestEmailHtml(unittest.TestCase):
         # 剥掉之后剩下的内联样式必须仍然是一份完整可读的桌面版
         h = sc.md_to_email_html("# 标题\n- 一行")
         self.assertIn("@media", h)
-        head, _, rest = h.partition("</style>")
+        _, _, rest = h.partition("</style>")
         self.assertNotIn("@media", rest)          # 媒体查询只此一处
         self.assertIn("style=", rest)             # 正文仍是内联样式
 
-    def test_table_ships_wide_and_narrow_versions(self):
+    def test_cards_are_the_default_table_needs_a_wide_screen(self):
         md = "| 标的 | 状态 | 收盘 |\n|---|---|---|\n| QQQ | 回调中 | 709.24 |"
         h = sc.md_to_email_html(md)
-        # 宽版默认可见, 窄版默认隐藏 —— 剥掉 <style> 时退回原来的宽表,
-        # 绝不会比改之前更差
-        self.assertIn('class="wl-wide" style="display:block', h)
-        self.assertIn('class="wl-narrow" style="display:none', h)
-        self.assertIn(".wl-wide{display:none!important}", h)
-        self.assertIn(".wl-narrow{display:block!important}", h)
+        # 默认状态必须选"CSS 全被剥掉时仍可读"的那个 = 卡片。实测默认给
+        # 宽表时, Gmail 手机版看到的是一张截断的表 (媒体查询被剥掉)
+        self.assertIn('class="wl-wide" style="display:none', h)
+        self.assertNotIn('class="wl-narrow" style="display:none', h)
+        self.assertIn("min-width:601px", h)
+        self.assertIn(".wl-wide{display:block!important}", h)
+        self.assertIn(".wl-narrow{display:none!important}", h)
         self.assertEqual(h.count("QQQ"), 2)       # 两版各一次
+
+    def test_html_stays_well_under_gmail_clip_limit(self):
+        # Gmail 超过 ~102KB 会截断成 "[Message clipped]" — 报告被静默切掉
+        # 一半比不发还糟。20 只标的的概览表 + 每只两行 note 是个偏悲观的
+        # 规模, 留足余量。
+        head = "| 标的 | 状态 | 操作 | 收盘 | Δ% | vs20日 | 量比 | 三选二 | 价值区 | iv/rv | IVP |"
+        sep = "|" + "---|" * 11
+        rows = ["| SYM%02d | 回调中(20日线下) | 设区间 | 709.24 | +1.2 | -0.0%% "
+                "| 1.0x | 低✓ 收· 破· | 380-440 (上方+16%%) | 25/47%% | 62 |" % i
+                for i in range(20)]
+        notes = []
+        for i in range(20):
+            notes += [f"### SYM{i:02d} — 右侧确认",
+                      "- 位置: 收盘 124.72 (+16.6%) · 20日线 +22.4% · 200日线 +31.2%",
+                      "- **今日右侧确认**: 不再新低 + 突破20日高 (量比 2.8x)"]
+        md = "\n".join(["# 标题", "", head, sep] + rows + [""] + notes)
+        size = len(sc.md_to_email_html(md).encode("utf-8"))
+        self.assertLess(size, 90_000, f"{size} 字节, 逼近 Gmail 102KB 截断线")
+
+    def test_style_lives_in_head_of_a_full_document(self):
+        # Gmail 只认 <head> 里的 <style>, 正文里的会被直接剥掉 —— 这正是
+        # 手机端媒体查询完全不生效的原因
+        h = sc.md_to_email_html("# 标题\n- 一行")
+        self.assertTrue(h.startswith("<!DOCTYPE html>"))
+        head = h[:h.index("</head>")]
+        self.assertIn("<style>", head)
+        self.assertIn("@media", head)
+        self.assertIn('name="viewport"', head)
+        self.assertNotIn("<style", h[h.index("</head>"):])
 
     def test_narrow_cards_label_each_value(self):
         md = ("| 标的 | 状态 | 收盘 | 量比 | 价值区 |\n|---|---|---|---|---|\n"
