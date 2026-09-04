@@ -20,12 +20,21 @@ if [ "${1:-}" = "watchdog" ]; then
   et_date=$(TZ=America/New_York date +%F)   # the US trading day just ended
   et_dow=$(TZ=America/New_York date +%u)
   if [ "$et_dow" -le 5 ]; then
+    # 送达凭证 (.sent, 发信成功后才写) 与报告文件 (.md, 发信前就写) 分开
+    # 查: .md 在而 .sent 不在 = 扫描跑了但报告没到收件箱 — 这正是
+    # "Resend 抖动一次, 整天静默丢报"的洞 (五轮评审)。scanner 会在下一
+    # 个 --email fire 自动补发, 这里报的是补发也没救回来的情况
     missing=""
-    [ -f "reports/$et_date-open.md" ] || missing="open "
-    [ -f "reports/$et_date-close.md" ] || missing="${missing}close"
+    for m in open close; do
+      if [ ! -f "reports/$et_date-$m.md" ]; then
+        missing="${missing}${m} "
+      elif [ ! -f "reports/$et_date-$m.sent" ]; then
+        missing="${missing}${m}(已写盘未送达) "
+      fi
+    done
     if [ -n "$missing" ]; then
       body=$(mktemp)
-      echo "missing: $missing ($et_date ET) — cron 未跑成或美股假日; 检查 $PWD/$log" > "$body"
+      echo "missing: $missing($et_date ET) — cron 未跑成/发信失败/美股假日; 检查 $PWD/$log" > "$body"
       notify "[watchlist] MISSED $et_date" "$body"
       rm -f "$body"
     fi

@@ -3,6 +3,13 @@
 # entries survive US DST: whichever lands in-window runs, the rest exit 3.
 # UTC 13-22h = same-calendar-day US Eastern, so 1-5 (Mon-Fri) aligns with
 # US trading days. --email inside run_scan.sh pushes the report.
+#
+# 投递闭环: 发信成功后 scanner 写 reports/{date}-{mode}.sent; 每次
+# --email fire 先补发当日 .md 在而 .sent 不在的报告 (窗口外的 fire 也
+# 补 — 投递不需要市场开着), watchdog 按 .sent 报"已写盘未送达"。
+# 可选带外心跳: .env 里设 SCAN_HEARTBEAT_URL=https://hc-ping.com/<uuid>
+# (healthchecks.io 建 1 day period / 12h grace 的 check) — 邮件商故障时
+# FAILED/MISSED 告警和报告走同一条坏通道, 只有心跳服务能从外面报警。
 45 13 * * 1-5 /opt/watchlist-scanner/deploy/run_scan.sh   # 09:45 EDT open  (US summer)
 45 14 * * 1-5 /opt/watchlist-scanner/deploy/run_scan.sh   # 09:45 EST open  (US winter; EDT=10:45 also in-window, dedup skips)
 45 19 * * 1-5 /opt/watchlist-scanner/deploy/run_scan.sh   # 15:45 EDT close (US summer)

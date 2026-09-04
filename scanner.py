@@ -2531,6 +2531,66 @@ def send_email_report(report_path: Path, subject: str) -> None:
         smtp.send_message(msg)
 
 
+def _sent_marker(report_path: Path) -> Path:
+    """{date}-{mode}.md 的投递凭证 — 只在 send_email_report 成功后写。
+    dedup 门与 watchdog 都以它为准: \"报告文件存在\"证明的是扫描跑过,
+    不证明报告到过收件箱, 两件事必须分开记账 (五轮评审)。"""
+    return report_path.with_suffix(".sent")
+
+
+def resend_pending_reports(d: str, now_et: datetime) -> None:
+    """补发当日已写盘但没发出去的 canonical 报告 (.md 在而 .sent 不在)。
+
+    没有这条, 一次 Resend/SMTP 抖动 = 当天报告静默丢失: 发信失败的 run
+    以 exit 1 收场, DST 双保险的下一次 fire 又被\"报告已存在\"的 dedup
+    拦回 (exit 3), watchdog 只看得到文件存在, 而 FAILED 告警本身走的还是
+    同一条坏通道。补发挂在每次 --email 定时运行的最前面、窗口门之前 —
+    投递不需要市场在开盘, 窗口外的 fire 正好当补发班车。
+
+    只补投递, 绝不重扫: state.json 在上一轮已推进, 重扫会把 fresh_confirm
+    这类一次性转换当场消耗掉 (等价于 R1 那个事故的自制版)。主题取
+    latest-{mode}.json 里的 regime 阶段, 拿不到就裸主题 — 补发标题带
+    resend 字样, 与原始邮件区分且不进同一 Gmail 会话。"""
+    for mode in ("open", "close"):
+        p = REPORTS / f"{d}-{mode}.md"
+        marker = _sent_marker(p)
+        if not p.exists() or marker.exists():
+            continue
+        stage = ""
+        try:
+            latest = json.loads(
+                (REPORTS / f"latest-{mode}.json").read_text(encoding="utf-8"))
+            stage = (latest.get("regime") or {}).get("stage", "")
+        except Exception:
+            pass
+        subject = (f"[watchlist] {d} {mode} {now_et:%H:%M} ET resend"
+                   + (f" — {stage}" if stage else ""))
+        try:
+            send_email_report(p, subject)
+            marker.write_text(now_et.isoformat(), encoding="utf-8")
+            print(f"resent {p.name}")
+            ping_heartbeat()
+        except Exception as e:
+            # 不让补发失败弄死本次运行 — 当前窗口的正式扫描照跑;
+            # 未送达状态由 watchdog 的 .sent 检查兜底
+            print(f"EMAIL RESEND FAILED ({p.name}): {e}", file=sys.stderr)
+
+
+def ping_heartbeat() -> None:
+    """SCAN_HEARTBEAT_URL (healthchecks.io / ntfy 等) — 邮件之外的独立
+    活性信号。邮件商故障时 FAILED/MISSED 告警会跟着一起哑 (同通道),
+    心跳服务按\"没收到 ping\"从它那边报警, 不依赖本机任何出站邮件。
+    只在**投递成功**后 ping — 心跳的语义是\"报告送达\", 不是\"进程活着\"。
+    未配置时是 no-op。"""
+    url = os.environ.get("SCAN_HEARTBEAT_URL")
+    if not url:
+        return
+    try:
+        urllib.request.urlopen(url, timeout=10)
+    except Exception as e:
+        print(f"heartbeat ping failed: {e}", file=sys.stderr)
+
+
 def batch_history(symbols: list[str]) -> dict[str, pd.DataFrame | None]:
     df = yf.download(symbols, period="1y", interval="1d", auto_adjust=True,
                      group_by="ticker", progress=False, threads=True)
@@ -2560,6 +2620,11 @@ def main() -> int:
     args = ap.parse_args()
 
     now_et = datetime.now(ET)
+    # 补发在窗口门**之前**: 投递不需要市场开着, 窗口外的定时 fire (DST
+    # 双保险的另一半、看门狗前的任意一发) 正好当补发班车。只看 canonical
+    # 报告名, manual 报告不补
+    if args.email and not args.force and not args.tickers:
+        resend_pending_reports(now_et.strftime("%Y-%m-%d"), now_et)
     mode = resolve_mode(args.mode, now_et)
     if mode is None:
         if args.force:
@@ -2670,7 +2735,12 @@ def main() -> int:
                    + f" — {regime['stage']}")
         try:
             send_email_report(report_path, subject)
+            # 投递凭证与报告文件分开记账 — dedup 判"跑没跑过"看 .md,
+            # watchdog 判"送没送到"看 .sent, 补发看两者之差
+            _sent_marker(report_path).write_text(now_et.isoformat(),
+                                                 encoding="utf-8")
             print(f"email sent to {os.environ.get('SCAN_EMAIL_TO')}")
+            ping_heartbeat()
         except Exception as e:
             print(f"EMAIL FAILED: {e}", file=sys.stderr)
             return 1

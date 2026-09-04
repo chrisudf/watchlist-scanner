@@ -548,6 +548,87 @@ class TestEmailTransport(unittest.TestCase):
         self.assertNotIn("re_secret_do_not_leak", str(cm.exception))
 
 
+class TestDeliveryLoop(unittest.TestCase):
+    """发信失败的自愈闭环 (五轮评审): 报告先落盘、邮件后发 — 发信失败时
+    dedup 门会把 DST 双保险的下一次 fire 拦回, watchdog 又只查 .md 存在,
+    FAILED 告警走同一条坏通道 → 一次 Resend 抖动 = 当天报告静默丢失。
+    修复 = .sent 投递凭证 + 每次 --email fire 先补发 + 只送达后 ping 心跳。"""
+
+    D = "2026-09-04"
+
+    def _reports(self, stage="NORMAL", with_marker=False):
+        import tempfile
+        from pathlib import Path
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / f"{self.D}-close.md").write_text("# 报告", encoding="utf-8")
+        (tmp / "latest-close.json").write_text(
+            json.dumps({"regime": {"stage": stage}}), encoding="utf-8")
+        if with_marker:
+            (tmp / f"{self.D}-close.sent").write_text("x", encoding="utf-8")
+        return tmp
+
+    def _now(self):
+        return datetime.fromisoformat(f"{self.D}T16:45:00").replace(tzinfo=sc.ET)
+
+    def test_resend_pending_sends_and_writes_marker(self):
+        from unittest.mock import patch
+        tmp = self._reports(stage="STAGE2_WINDOW")
+        sent = {}
+        with patch.object(sc, "REPORTS", tmp), \
+                patch.object(sc, "send_email_report",
+                             lambda p, subj: sent.update(path=p, subj=subj)):
+            sc.resend_pending_reports(self.D, self._now())
+        self.assertEqual(sent["path"].name, f"{self.D}-close.md")
+        # 补发主题带 resend 字样 (不进原 Gmail 会话) 且带 regime 阶段
+        self.assertIn("resend", sent["subj"])
+        self.assertIn("STAGE2_WINDOW", sent["subj"])
+        self.assertTrue((tmp / f"{self.D}-close.sent").exists())
+
+    def test_already_sent_is_noop(self):
+        from unittest.mock import patch
+        tmp = self._reports(with_marker=True)
+        with patch.object(sc, "REPORTS", tmp), \
+                patch.object(sc, "send_email_report",
+                             side_effect=AssertionError("不该重发")):
+            sc.resend_pending_reports(self.D, self._now())
+
+    def test_resend_failure_keeps_marker_absent_and_survives(self):
+        # 补发失败不能弄死本次运行 (当前窗口的正式扫描还要跑), 也不能写
+        # 凭证 — 留给下一个 fire 再试 + watchdog 报"已写盘未送达"
+        from unittest.mock import patch
+        tmp = self._reports()
+        with patch.object(sc, "REPORTS", tmp), \
+                patch.object(sc, "send_email_report",
+                             side_effect=RuntimeError("Resend 500")):
+            sc.resend_pending_reports(self.D, self._now())   # 不抛
+        self.assertFalse((tmp / f"{self.D}-close.sent").exists())
+
+    def test_heartbeat_only_when_configured(self):
+        from unittest.mock import patch
+        hits = []
+        with patch.dict(sc.os.environ, {}, clear=True), \
+                patch.object(sc.urllib.request, "urlopen",
+                             lambda *a, **k: hits.append(a)):
+            sc.ping_heartbeat()
+        self.assertEqual(hits, [])
+        with patch.dict(sc.os.environ,
+                        {"SCAN_HEARTBEAT_URL": "https://hc-ping.com/x"},
+                        clear=True), \
+                patch.object(sc.urllib.request, "urlopen",
+                             lambda url, timeout=None: hits.append(url)):
+            sc.ping_heartbeat()
+        self.assertEqual(hits, ["https://hc-ping.com/x"])
+
+    def test_heartbeat_failure_is_swallowed(self):
+        from unittest.mock import patch
+        with patch.dict(sc.os.environ,
+                        {"SCAN_HEARTBEAT_URL": "https://hc-ping.com/x"},
+                        clear=True), \
+                patch.object(sc.urllib.request, "urlopen",
+                             side_effect=RuntimeError("down")):
+            sc.ping_heartbeat()   # 心跳挂了不影响主流程
+
+
 class TestClock(unittest.TestCase):
     def _et(self, h, m, weekday_date="2026-08-07"):  # a Friday
         return datetime.fromisoformat(f"{weekday_date}T{h:02d}:{m:02d}:00").replace(
