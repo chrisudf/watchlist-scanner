@@ -1034,10 +1034,10 @@ def daily_bar_stale(cc: ChainCache, bar_date: str, s: dict) -> str | None:
     chain_date = max(dates)
     if str(chain_date) <= bar_date:
         return None
-    return (f"股价日线停在 {bar_date}, 而期权链已有 {chain_date} 的成交 — "
-            f"日线陈旧/缺失 (Yahoo 日线与期权链是两个端点, 会不同步)。"
-            "本标的的收盘价、右侧状态判定与所有票据读数都建立在过期价格上, "
-            "停出票直到日线补齐")
+    # 短句: 这条会按标的 (乃至票种) 重复, 长解释只放在"今日动作"的合并行
+    # 里一次 — 和 regime halt 同一个教训 (三轮评审 :1640)
+    return (f"日线陈旧: 停在 {bar_date}, 而期权链已有 {chain_date} 的成交 "
+            "— 停出票直到日线补齐")
 
 
 def blocked_ticket(stale_msg: str | None, regime_msg: str | None) -> dict:
@@ -1502,6 +1502,12 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
         # (⏸), 不是提示。判据见 daily_bar_stale 的 docstring
         stale_msg = daily_bar_stale(cc, tech["as_of"], s) \
             if cfg["options"] else None
+        if stale_msg:
+            # 硬拦只在"本来就要出票"时才看得见 — 而多数标的当天并不出票,
+            # 那时陈旧会完全静默, 而概览表照样印着过期的收盘价和据此判定
+            # 的右侧状态。陈旧本身就是结论, 必须无条件出声
+            r["stale_data"] = True
+            r["notes"].append(f"⛔ {stale_msg}")
 
         # 首次回踩 (收盘口径, 每轮确认只提示一次): 剧本首选入场/加仓点
         # 倒挂期不提示也不烧一次性标记 (纪律: 阶段1不加右侧仓) — 解除后的
@@ -1806,8 +1812,11 @@ def action_block(results: list[dict], ivdf) -> list[str]:
     lines = ["## 今日动作", ""]
     items: list[tuple[str, str]] = []
     halted: list[str] = []
+    stale: list[str] = []
     for r in by_actionability(results):
         sym = r["symbol"]
+        if r.get("stale_data"):
+            stale.append(sym)
         if _has_stop(r):
             items.append((sym, f"- ⚠️ **{sym}** 右侧止损: 收盘跌破20日线 — "
                                "凸性档减半 / 结构破清仓"))
@@ -1850,6 +1859,13 @@ def action_block(results: list[dict], ivdf) -> list[str]:
         elif r.get("retest"):
             items.append((sym, f"- 👀 **{sym}** 首次回踩20日线不破 — 剧本首选"
                                "加仓点 (3-6个月 call spread, 手动构造)"))
+    if stale:
+        # 手机上扫一眼的那一屏必须看得到 — 概览表里这些标的的收盘价与
+        # 右侧状态都建立在过期日线上
+        items.append(("", f"- ⛔ 日线陈旧, 已停出票: {', '.join(stale)} — "
+                          "Yahoo 日线与期权链是两个端点, 会不同步; 这些标的"
+                          "的收盘价、概览表里的右侧状态判定与全部票据读数"
+                          "都建立在过期价格上, 等日线补齐再看"))
     if halted:
         # regime_halt 也可能是 VVIX 的"只拦 CSP"或 VX 开关下的"只拦 LEAP/
         # spread" — 同一标的可以一边被拦一边有别的有效票, 写死"全市场/新票
@@ -1858,7 +1874,7 @@ def action_block(results: list[dict], ivdf) -> list[str]:
                           "— 拦截范围与原因见下方市场状态 ⛔ 行"))
     if items:
         lines += [line for _sym, line in items]
-        mentioned = {sym for sym, _line in items} | set(halted)
+        mentioned = {sym for sym, _line in items} | set(halted) | set(stale)
         others = [r["symbol"] for r in results if r["symbol"] not in mentioned]
         if others:
             lines.append(f"- 其余今日无动作: {', '.join(others)}")

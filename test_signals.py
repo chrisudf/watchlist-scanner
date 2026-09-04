@@ -705,6 +705,18 @@ class TestActionBlockHaltDedup(unittest.TestCase):
         self.assertNotIn("VX 期货全曲线倒挂", text)   # 长文不进今日动作
         self.assertIn("其余今日无动作: CCC", text)
 
+    def test_stale_symbols_surface_even_without_tickets(self):
+        # 硬拦只在"本来就要出票"时才看得见 — 多数标的当天并不出票, 那时
+        # 陈旧会完全静默, 而概览表照样印着过期收盘价 (实测: HOOD 价格陈旧
+        # 16.5%, 报告里零提示)。陈旧必须无条件出现在"今日动作"那一屏
+        ivdf = pd.DataFrame(columns=["date", "symbol", "iv30", "rv30"])
+        rs = [self._r("AAA", stale_data=True), self._r("BBB")]
+        text = "\n".join(sc.action_block(rs, ivdf))
+        self.assertIn("日线陈旧", text)
+        self.assertIn("AAA", text)
+        self.assertNotIn("其余今日无动作: AAA", text)   # 不能被算进"无动作"
+        self.assertIn("BBB", text)
+
     def test_non_regime_skip_still_itemized(self):
         # 普通 skip (年化不足等) 照旧逐票 ⏸, 且 LEAP 行带工具前缀
         ivdf = pd.DataFrame(columns=["date", "symbol", "iv30", "rv30"])
