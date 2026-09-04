@@ -359,6 +359,9 @@ class TestEmailTransport(unittest.TestCase):
         def fake_urlopen(req, timeout=None):
             seen["url"] = req.full_url
             seen["auth"] = req.headers.get("Authorization")
+            # urllib 的默认 UA 会被 Resend 前面的 Cloudflare 拦掉 (403 +
+            # "error code: 1010"), 所以必须显式设置
+            seen["ua"] = req.headers.get("User-agent")
             seen["body"] = json.loads(req.data.decode())
             m = MagicMock()
             m.status = 200
@@ -377,6 +380,7 @@ class TestEmailTransport(unittest.TestCase):
             sc.send_email_report(self._report(), "[watchlist] test")
         self.assertEqual(seen["url"], "https://api.resend.com/emails")
         self.assertEqual(seen["auth"], "Bearer re_test")
+        self.assertTrue(seen["ua"] and "urllib" not in seen["ua"].lower())
         self.assertEqual(seen["body"]["to"], ["me@example.com"])
         self.assertIn("报告正文", seen["body"]["text"])
 
