@@ -2179,18 +2179,62 @@ def render_open(results, regime, now_et, s: dict) -> str:
 # Main
 # --------------------------------------------------------------------------
 
+def send_via_resend(api_key: str, sender: str, to: str, subject: str,
+                    body: str) -> None:
+    """Resend 的 HTTPS API (443)。
+
+    DigitalOcean 默认封锁 droplet 的出站 SMTP —— 25/465/587/2525 一律
+    超时 (不是拒绝, 是静默丢包), 而 443 正常。所以云上唯一能把报告发出去
+    的通道是 HTTPS 邮件 API, Gmail SMTP 在那种机器上永远连不上。
+    sender 必须是 Resend 已验证的域名, 或沙箱地址 onboarding@resend.dev
+    (沙箱只能发给账号自己的邮箱)。"""
+    import json as _json
+    import urllib.error
+
+    payload = _json.dumps({"from": sender, "to": [to],
+                           "subject": subject, "text": body}).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.resend.com/emails", data=payload, method="POST",
+        headers={"Authorization": f"Bearer {api_key}",
+                 "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            if resp.status not in (200, 201):
+                raise RuntimeError(f"Resend HTTP {resp.status}")
+    except urllib.error.HTTPError as e:
+        # 正文带的是 Resend 的错误说明 (未验证发件域/额度等), 不含 api key
+        raise RuntimeError(
+            f"Resend HTTP {e.code}: {e.read()[:300].decode('utf-8', 'replace')}"
+        ) from e
+
+
 def send_email_report(report_path: Path, subject: str) -> None:
-    """SMTP push for headless (droplet) deployments. Config via env vars:
-    SCAN_SMTP_HOST, SCAN_SMTP_PORT (default 587, STARTTLS), SCAN_SMTP_USER,
-    SCAN_SMTP_PASS, SCAN_EMAIL_TO, SCAN_EMAIL_FROM (optional).
-    Raises on any failure — on a droplet, email IS the delivery channel."""
+    """Push the report for headless (droplet) deployments.
+
+    两条通道, 有 SCAN_RESEND_API_KEY 就优先走 HTTPS:
+    - Resend (HTTPS 443): SCAN_RESEND_API_KEY, SCAN_EMAIL_FROM, SCAN_EMAIL_TO
+    - SMTP (STARTTLS):    SCAN_SMTP_HOST, SCAN_SMTP_PORT (默认 587),
+                          SCAN_SMTP_USER, SCAN_SMTP_PASS, SCAN_EMAIL_TO
+    云主机 (DigitalOcean 等) 普遍封锁出站 SMTP 端口, 那里必须用 HTTPS 那条;
+    SMTP 留给本机/自建机器。任何失败都抛异常 —— 在无人值守的机器上, 邮件
+    就是唯一的交付通道, 静默失败等于报告没跑。"""
     import smtplib
     from email.message import EmailMessage
 
-    host = os.environ.get("SCAN_SMTP_HOST")
     to = os.environ.get("SCAN_EMAIL_TO")
-    if not host or not to:
-        raise RuntimeError("SCAN_SMTP_HOST / SCAN_EMAIL_TO not set (see .env.example)")
+    if not to:
+        raise RuntimeError("SCAN_EMAIL_TO not set (see deploy/.env.example)")
+    api_key = os.environ.get("SCAN_RESEND_API_KEY")
+    if api_key:
+        send_via_resend(
+            api_key, os.environ.get("SCAN_EMAIL_FROM", "onboarding@resend.dev"),
+            to, subject, report_path.read_text(encoding="utf-8"))
+        return
+
+    host = os.environ.get("SCAN_SMTP_HOST")
+    if not host:
+        raise RuntimeError("SCAN_RESEND_API_KEY 或 SCAN_SMTP_HOST 至少要设一个 "
+                           "(see deploy/.env.example)")
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = os.environ.get(

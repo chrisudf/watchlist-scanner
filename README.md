@@ -64,8 +64,11 @@ launchd 每天在 8 个固定布里斯班时点触发 (23:45/00:45/01:30 开盘�
 .venv/bin/python scanner.py --mode close --force --no-options   # 只看技术面(快)
 ```
 
-加 `--email` 会在写完报告后通过 SMTP 推送 (环境变量配置, 见 droplet 节;
-邮件失败 exit 1)。
+加 `--email` 会在写完报告后推送 (环境变量配置, 见 droplet 节; 邮件失败
+exit 1)。两条通道: 设了 `SCAN_RESEND_API_KEY` 走 Resend 的 HTTPS API,
+否则走 SMTP。**云主机上必须用 HTTPS 那条** —— DigitalOcean 等默认封锁
+droplet 的出站 SMTP (25/465/587/2525 一律静默超时, 443 正常), Gmail SMTP
+在那种机器上永远连不上。
 
 `--force` 或 `--tickers` 视为手动测试运行: 报告写到 `*-manual.md`,
 **不推进状态机、不写 IV 历史** — 盘中随便试跑, 不会污染当天真正的
@@ -206,7 +209,7 @@ cd /opt/watchlist-scanner
 python3 -m venv .venv && .venv/bin/pip install yfinance pandas numpy
 .venv/bin/python test_signals.py
 
-# 2. 邮件配置: 复制模板并填 SMTP 凭据 (Gmail 用 App Password)
+# 2. 邮件配置: 复制模板并填 Resend api key (云上) 或 SMTP 凭据 (本机)
 cp deploy/.env.example .env && chmod 600 .env && vi .env
 
 # 3. 先手动验证一封
