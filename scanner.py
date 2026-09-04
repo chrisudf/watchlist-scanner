@@ -2247,13 +2247,53 @@ def _html_table(rows: list[list[str]]) -> str:
             f'font-family:{_MONO if _is_numeric_cell(c) else _FONT}">'
             f'{_md_inline(c)}</td>' for c in row)
         trs.append(f'<tr style="background:{bg}">{tds}</tr>')
+    # 宽版默认可见, 窄版默认隐藏 —— 客户端若剥掉 <style>, 看到的就是
+    # 原来的宽表 (desktop 正确, 手机横拖), 绝不会比改之前更差; 支持
+    # 媒体查询时窄屏自动切到卡片。渐进增强, 不赌客户端能力。
     return (
-        '<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;'
-        'margin:12px 0;border:1px solid #e2e8f0;border-radius:6px">'
+        '<div class="wl-wide" style="display:block;overflow-x:auto;'
+        '-webkit-overflow-scrolling:touch;margin:12px 0;'
+        'border:1px solid #e2e8f0;border-radius:6px">'
         '<table cellpadding="0" cellspacing="0" border="0" '
         'style="border-collapse:collapse;width:100%;min-width:560px">'
         f'<thead><tr style="background:#f1f5f9">{th}</tr></thead>'
-        f'<tbody>{"".join(trs)}</tbody></table></div>')
+        f'<tbody>{"".join(trs)}</tbody></table></div>'
+        f'<div class="wl-narrow" style="display:none;margin:12px 0">'
+        f'{_html_cards(rows)}</div>')
+
+
+def _html_cards(rows: list[list[str]]) -> str:
+    """同一份表格的窄屏版: 每行摊成一张卡片, 任何宽度都不用横拖。
+
+    概览表 11 列, 375px 的手机上每列只能分到 ~30px, 表格无论如何压不下。
+    横向滚动在 Gmail 手机版又经常退化成"整封邮件横向滚动"—— 比不滚更糟。
+    所以窄屏直接换布局: 首列 (标的) 当标题, 其余列摊成 `标签 值` 的流式
+    文本, 自然换行。"""
+    head, body = rows[0], rows[1:]
+    cards = []
+    for row in body:
+        title = _md_inline(row[0]) if row else ""
+        state = _md_inline(row[1]) if len(row) > 1 else ""
+        bits = []
+        for label, val in zip(head[2:], row[2:]):
+            v = val.strip()
+            if not v or v in ("—", "-", "未设"):
+                continue
+            bits.append(
+                f'<span style="white-space:nowrap">'
+                f'<span style="color:#94a3b8">{_md_inline(label)}</span> '
+                f'<span style="color:#0f172a;font-family:{_MONO}">'
+                f'{_md_inline(v)}</span></span>')
+        cards.append(
+            f'<div style="margin:8px 0;padding:10px 12px;background:#f8fafc;'
+            f'border:1px solid #e2e8f0;border-radius:6px">'
+            f'<div style="font-size:15px;font-weight:700;color:#0f172a">'
+            f'{title} <span style="font-size:12px;font-weight:500;'
+            f'color:#475569">{state}</span></div>'
+            f'<div style="margin-top:5px;font-size:12px;line-height:1.9">'
+            + ' <span style="color:#cbd5e1">·</span> '.join(bits) +
+            '</div></div>')
+    return "".join(cards)
 
 
 def _split_row(line: str) -> list[str]:
@@ -2369,11 +2409,25 @@ def md_to_email_html(md: str) -> str:
                    f'line-height:1.65">{_md_inline(stripped)}</p>')
         i += 1
 
+    # 唯一的 <style> 块, 只做渐进增强: 被剥掉时全部内联样式仍然成立。
+    # 手机上把宽表换成卡片, 并收紧外边距 (375px 屏上原来 34px 的左右留白
+    # 太浪费), 正文字号略升一档。
+    style = (
+        '<style>@media only screen and (max-width:600px){'
+        '.wl-wide{display:none!important}'
+        '.wl-narrow{display:block!important}'
+        '.wl-outer{padding:6px!important}'
+        '.wl-inner{padding:14px 12px!important;border-radius:6px!important}'
+        '.wl-inner div,.wl-inner p{font-size:14px!important}'
+        '.wl-inner h1{font-size:18px!important}'
+        '}</style>')
     return (
-        f'<div style="margin:0;padding:14px;background:#f1f5f9">'
-        f'<div style="max-width:680px;margin:0 auto;background:#ffffff;'
-        f'padding:18px 20px;border-radius:8px;font-family:{_FONT};'
-        f'-webkit-text-size-adjust:100%">'
+        style +
+        f'<div class="wl-outer" style="margin:0;padding:14px;'
+        f'background:#f1f5f9">'
+        f'<div class="wl-inner" style="max-width:680px;margin:0 auto;'
+        f'background:#ffffff;padding:18px 20px;border-radius:8px;'
+        f'font-family:{_FONT};-webkit-text-size-adjust:100%">'
         + "".join(out) +
         f'<p style="margin:20px 0 0;padding-top:12px;'
         f'border-top:1px solid #e2e8f0;font-size:11px;color:#94a3b8">'
