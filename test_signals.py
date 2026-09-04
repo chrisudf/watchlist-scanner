@@ -7,7 +7,7 @@ No network access needed — everything here is synthetic data.
 
 import math
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -309,6 +309,16 @@ class TestPersistedState(unittest.TestCase):
             e, {"state": "PULLBACK", "leap_pending": True}, "2026-09-04")
         self.assertNotIn("leap_pending", e4)
 
+    def test_temporary_skip_does_not_consume_leap_pending(self):
+        # 三轮评审: leap_ticket 返回 skip_reason (财报缓冲期内 / 无可用合约)
+        # 是**临时**约束 — 清掉补发标记等于约束解除后不再补发, 与"显式消耗"
+        # 的生命周期自相矛盾。analyze 只在真票时置 leap_emitted=True
+        e = sc.next_persisted_state(
+            {}, {"state": "CONFIRMED", "leap_pending": True}, "2026-09-03")
+        kept = sc.next_persisted_state(
+            e, {"state": "TREND", "leap_emitted": False}, "2026-09-04")
+        self.assertTrue(kept["leap_pending"])
+
     def test_retest_pending_lifecycle(self):
         # 三轮评审 (Copilot): 被拦的回踩若不落盘, 价格离开 20 日线后这轮
         # 就再也发不出来 — 承诺的"解除后再提示"落空
@@ -531,6 +541,49 @@ class TestLeapAndRetestGates(unittest.TestCase):
             sc.retest_gate("PULLBACK", True, False, True, "NORMAL"))
 
 
+class TestVXExpiryFilter(unittest.TestCase):
+    def test_expired_front_contract_dropped(self):
+        # 三轮评审 (critical): VX 月度到期日当天上午结算后, 前一交易日的
+        # 文件里那份**当日到期**的合约仍在, sorted 后被当成 M1。它收敛到
+        # 现货 VIX, VIX 一跳就把曲线前端顶起来 — 而它已经不可交易 →
+        # 拿一个死合约误报硬停牌
+        from unittest.mock import patch, MagicMock
+        today = datetime.now(sc.ET).date()
+        later = [(today + timedelta(days=30 * i)).isoformat()
+                 for i in range(1, 6)]
+        # 活曲线前段小幅递减、末月回升 = 局部倒挂 (只该给 warning)。
+        # 当日到期那份被现货 VIX 顶到 34 顶在最前面, 整条链就变成逐对
+        # 非升 = FULL_BACKWARDATION 硬停牌 — 一个已死合约把警告升级成停牌
+        live = [20.0, 19.5, 19.0, 18.5, 21.0]
+        rows = [(today.isoformat(), 34.0)] + list(zip(later, live))
+        self.assertEqual(sc.vx_curve_state([px for _e, px in rows][:5]),
+                         "FULL_BACKWARDATION")        # 不滤 = 误报硬停牌
+        self.assertEqual(sc.vx_curve_state(live),
+                         "PARTIAL_BACKWARDATION")     # 真实形态 = 仅警告
+        fake = MagicMock()
+        fake.read.return_value.decode.return_value = "csv"
+        with patch.object(sc.urllib.request, "urlopen", return_value=fake), \
+             patch.object(sc, "parse_vx_settlement", return_value=rows):
+            out = sc.fetch_vx_curve()
+        self.assertEqual(out["m1_exp"], later[0])   # 死合约不当 M1
+        self.assertEqual(out["n_contracts"], 5)
+        self.assertEqual(out["state"], "PARTIAL_BACKWARDATION")  # 降回警告
+
+
+class TestTicketSkipLine(unittest.TestCase):
+    def test_regime_halt_abbreviated(self):
+        long_reason = "VX 期货全曲线倒挂 " + "详细理由" * 40
+        line = sc.ticket_skip_line("CSP", {"skip_reason": long_reason,
+                                           "regime_halt": True})
+        self.assertIn("见市场状态", line)
+        self.assertNotIn("详细理由" * 40, line)
+
+    def test_ordinary_skip_keeps_full_reason(self):
+        line = sc.ticket_skip_line(
+            "LEAP", {"skip_reason": "财报 2026-09-09 就在 6 天后"})
+        self.assertIn("财报 2026-09-09 就在 6 天后", line)
+
+
 class TestCSPWindow(unittest.TestCase):
     def test_no_zone_never_opens(self):
         # 没有接货价就没有 CSP — 任何 regime 都一样 (ORCL 教训)
@@ -631,37 +684,90 @@ class _FakeCC:
 
 
 class TestRR25Snapshot(unittest.TestCase):
-    SPOT = 100.0
+    """两腿按**同一个 sigma(K)** 定价 -> put-call parity 逐档精确成立,
+    所以 forward_from_parity 必须还原出 F = S*e^((r-q)T)。"""
 
-    def _df(self, strikes, sigma, is_call, live):
-        T = 35 / 365.0
+    T = 35 / 365.0
+    NORMAL_SKEW = staticmethod(lambda m: 0.35 - 0.20 * (m - 1.0))
+    CALL_SKEW = staticmethod(lambda m: 0.35 + 0.20 * (m - 1.0))
+
+    def _chain(self, S, sigma_fn, live=True, oi=100, rel_width=0.04,
+               crossed=False, q=0.0):
+        s_eff = S * math.exp(-q * self.T)
         traded = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=1)
-        rows = []
-        for k in strikes:
-            px = sc.bs_price(self.SPOT, float(k), T, sc.RATE, sigma, is_call)
-            rows.append({"strike": float(k),
-                         "bid": px * 0.98 if live else 0.0,
-                         "ask": px * 1.02 if live else 0.0,
-                         "lastPrice": px, "lastTradeDate": traded})
-        return pd.DataFrame(rows)
+        rows = {True: [], False: []}
+        for i in range(31):
+            k = round(S * (0.70 + 0.02 * i), 2)
+            sig = sigma_fn(k / S)
+            for is_call in (True, False):
+                px = sc.bs_price(s_eff, k, self.T, sc.RATE, sig, is_call)
+                half = px * rel_width / 2
+                bid, ask = px - half, px + half
+                if crossed:
+                    bid, ask = ask, bid
+                rows[is_call].append(
+                    {"strike": k, "lastPrice": px, "lastTradeDate": traded,
+                     "openInterest": oi,
+                     "bid": bid if live else 0.0,
+                     "ask": ask if live else 0.0})
+        return _FakeChain(pd.DataFrame(rows[True]), pd.DataFrame(rows[False]))
+
+    def _snap(self, spot, **kw):
+        S = kw.pop("S", spot)
+        sigma_fn = kw.pop("sigma_fn", self.NORMAL_SKEW)
+        ch = self._chain(S, sigma_fn, **kw)
+        return sc.rr25_snapshot(_FakeCC(ch), spot, sc.SETTINGS_DEFAULTS)
+
+    def test_forward_recovers_stale_spot(self):
+        # 2026-09-04 事故的回归 (见 lesson.md): yfinance 日线最新一根 NaN,
+        # scanner 退回前一日收盘当 spot, 用昨天的股价反解今天的期权报价 —
+        # spot 偏低使 call 抬高/put 压低, 11 个标的亮了 10 个假倒挂旗标。
+        # 现在 IV/delta 都从期权自己的 forward 出发, 陈旧 spot 不再传导。
+        out = self._snap(106.99, S=125.0)          # 链是 125 的, 喂进 106.99
+        self.assertIsNotNone(out)
+        self.assertAlmostEqual(out["fwd_spot"], 125.0, delta=0.5)
+        self.assertGreater(out["spot_gap_pct"], 15.0)
+        self.assertFalse(out["inverted"])          # 正常 skew 不该被判倒挂
+        self.assertGreater(out["rr"], 0)
+
+    def test_genuine_inversion_still_flagged(self):
+        # 过滤收紧后不能变成"永不报告" — 真倒挂仍要亮
+        out = self._snap(100.0, sigma_fn=self.CALL_SKEW)
+        self.assertIsNotNone(out)
+        self.assertTrue(out["inverted"])
+        self.assertLess(out["rr"], -sc.SETTINGS_DEFAULTS["rr_invert_min_pts"])
+
+    def test_dividend_carry_no_longer_biases_iv(self):
+        # 零股息 BS 会压低 call IV/抬高 put IV; forward 口径下两腿都该
+        # 还原回输入的 sigma(K)
+        out = self._snap(100.0, q=0.03)
+        self.assertIsNotNone(out)
+        self.assertAlmostEqual(out["fwd_spot"], 100.0 * math.exp(-0.03 * self.T),
+                               delta=0.05)
+        for leg in ("call", "put"):
+            want = self.NORMAL_SKEW(out[f"{leg}_strike"] / 100.0)
+            self.assertAlmostEqual(out[f"{leg}_iv"], want, delta=0.006)
 
     def test_stale_leg_kills_the_reading(self):
-        # 三轮评审 (Copilot): _mark 会退回到最多 MAX_STALE_TRADE_DAYS 天前的
-        # lastPrice — 一腿陈旧成交价 vs 另一腿实时 mid, 反解出的 IV 差正是
-        # 本补丁要消灭的假倒挂来源
-        s = sc.SETTINGS_DEFAULTS
-        calls = self._df(range(101, 116), 0.30, True, live=True)
-        puts_live = self._df(range(85, 100), 0.32, False, live=True)
-        self.assertIsNotNone(
-            sc.rr25_snapshot(_FakeCC(_FakeChain(calls, puts_live)),
-                             self.SPOT, s))
-        puts_stale = self._df(range(85, 100), 0.32, False, live=False)
-        # 陈旧腿仍是"可用价" (5 日内), 但 RR 不接受 — 整体放弃读数
-        self.assertEqual(
-            sc._mark(puts_stale.iloc[0], sc._stale_cutoff())[1], "last")
+        # 二/三轮评审: _mark 会退回到最多 5 天前的 lastPrice — 一腿陈旧
+        # 成交价 vs 另一腿实时 mid 能造出假倒挂。没有 live 报价 = 无读数
+        ch = self._chain(100.0, self.NORMAL_SKEW, live=False)
+        self.assertEqual(sc._mark(ch.puts.iloc[0], sc._stale_cutoff())[1],
+                         "last")            # 仍是"可用价", 但 RR 不收
         self.assertIsNone(
-            sc.rr25_snapshot(_FakeCC(_FakeChain(calls, puts_stale)),
-                             self.SPOT, s))
+            sc.rr25_snapshot(_FakeCC(ch), 100.0, sc.SETTINGS_DEFAULTS))
+
+    def test_crossed_quotes_rejected(self):
+        # bid > ask 的 mid 无意义 — bid>0 and ask>0 挡不住 (三轮评审)
+        self.assertIsNone(self._snap(100.0, crossed=True))
+
+    def test_wide_quotes_rejected(self):
+        # 任意宽的报价照样满足 bid>0 and ask>0, 其 mid 正是假倒挂来源
+        self.assertIsNone(self._snap(100.0, rel_width=0.60))
+        self.assertIsNotNone(self._snap(100.0, rel_width=0.20))
+
+    def test_illiquid_strikes_rejected(self):
+        self.assertIsNone(self._snap(100.0, oi=1))
 
 
 class TestVVIXStaleness(unittest.TestCase):
@@ -692,6 +798,31 @@ class TestVVIXStaleness(unittest.TestCase):
                           side_effect=RuntimeError("down")):
             out = sc.fetch_vvix()
         self.assertAlmostEqual(out["value"], 91.25)
+
+    def test_delayed_quote_rescues_failed_history(self):
+        # 三轮评审: 历史 CSV **请求失败**但盘中点健康时, 原实现直接落到外层
+        # except 报 error — docstring 写的是"且", 实现做成了"或"。而且失效
+        # 方向是 fail-open: NORMAL 期唯一硬拦 CSP 的门被静默关掉
+        from unittest.mock import patch
+        today = datetime.now(sc.ET)
+        with patch.object(sc, "_cboe_series",
+                          side_effect=RuntimeError("csv 500")), \
+             patch.object(sc, "_cboe_delayed", return_value=(112.0, today)):
+            out = sc.fetch_vvix()
+        self.assertNotIn("error", out)
+        self.assertAlmostEqual(out["value"], 112.0)
+        self.assertIn("盘中", out["as_of"])
+
+    def test_both_paths_down_is_error(self):
+        from unittest.mock import patch
+        with patch.object(sc, "_cboe_series",
+                          side_effect=RuntimeError("csv 500")), \
+             patch.object(sc, "_cboe_delayed",
+                          side_effect=RuntimeError("quote down")):
+            out = sc.fetch_vvix()
+        self.assertIn("error", out)
+        self.assertIn("history", out["error"])
+        self.assertIn("delayed", out["error"])
 
     def test_intraday_graft_rescues_frozen_history(self):
         # 历史 CSV 冻结但今天的盘中点拿得到 → 用盘中点, 不报 error
