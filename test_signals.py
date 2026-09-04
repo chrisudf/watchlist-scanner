@@ -5,6 +5,8 @@ Run:  .venv/bin/python test_signals.py
 No network access needed — everything here is synthetic data.
 """
 
+import io
+import json
 import math
 import unittest
 from datetime import datetime, timedelta
@@ -335,6 +337,71 @@ class TestPersistedState(unittest.TestCase):
         self.assertNotIn("retest_pending", e3)
         e4 = sc.next_persisted_state(e, {"state": "PULLBACK"}, "2026-09-04")
         self.assertNotIn("retest_pending", e4)
+
+
+class TestEmailTransport(unittest.TestCase):
+    """DigitalOcean 封锁 droplet 的出站 SMTP (25/465/587/2525 全部静默超时,
+    443 正常) — 云上必须走 HTTPS 邮件 API, 所以 transport 的选择要可测。"""
+
+    def _report(self):
+        import tempfile
+        from pathlib import Path
+        f = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False,
+                                        encoding="utf-8")
+        f.write("# 报告正文\n")
+        f.close()
+        return Path(f.name)
+
+    def test_resend_key_takes_priority_over_smtp(self):
+        from unittest.mock import patch, MagicMock
+        seen = {}
+
+        def fake_urlopen(req, timeout=None):
+            seen["url"] = req.full_url
+            seen["auth"] = req.headers.get("Authorization")
+            seen["body"] = json.loads(req.data.decode())
+            m = MagicMock()
+            m.status = 200
+            m.__enter__ = lambda s: m
+            m.__exit__ = lambda *a: False
+            return m
+
+        # 同时配了 SMTP 也不该走 SMTP — 云上那条根本连不通
+        env = {"SCAN_EMAIL_TO": "me@example.com",
+               "SCAN_RESEND_API_KEY": "re_test",
+               "SCAN_EMAIL_FROM": "onboarding@resend.dev",
+               "SCAN_SMTP_HOST": "smtp.gmail.com"}
+        with patch.dict(sc.os.environ, env, clear=False), \
+                patch.object(sc.urllib.request, "urlopen", fake_urlopen), \
+                patch("smtplib.SMTP", side_effect=AssertionError("不该走 SMTP")):
+            sc.send_email_report(self._report(), "[watchlist] test")
+        self.assertEqual(seen["url"], "https://api.resend.com/emails")
+        self.assertEqual(seen["auth"], "Bearer re_test")
+        self.assertEqual(seen["body"]["to"], ["me@example.com"])
+        self.assertIn("报告正文", seen["body"]["text"])
+
+    def test_missing_both_transports_raises(self):
+        from unittest.mock import patch
+        with patch.dict(sc.os.environ, {"SCAN_EMAIL_TO": "me@example.com"},
+                        clear=True):
+            with self.assertRaises(RuntimeError):
+                sc.send_email_report(self._report(), "x")
+
+    def test_resend_http_error_surfaces_reason_not_key(self):
+        # 报错要能看出原因 (未验证域名/额度), 但绝不能把 api key 带进日志
+        import urllib.error
+        from unittest.mock import patch
+        err = urllib.error.HTTPError(
+            "https://api.resend.com/emails", 403, "Forbidden", {},
+            io.BytesIO(b'{"message":"domain not verified"}'))
+        env = {"SCAN_EMAIL_TO": "me@example.com",
+               "SCAN_RESEND_API_KEY": "re_secret_do_not_leak"}
+        with patch.dict(sc.os.environ, env, clear=True), \
+                patch.object(sc.urllib.request, "urlopen", side_effect=err):
+            with self.assertRaises(RuntimeError) as cm:
+                sc.send_email_report(self._report(), "x")
+        self.assertIn("domain not verified", str(cm.exception))
+        self.assertNotIn("re_secret_do_not_leak", str(cm.exception))
 
 
 class TestClock(unittest.TestCase):
