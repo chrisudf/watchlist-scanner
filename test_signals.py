@@ -339,6 +339,92 @@ class TestPersistedState(unittest.TestCase):
         self.assertNotIn("retest_pending", e4)
 
 
+class TestEmailHtml(unittest.TestCase):
+    """纯文本邮件里 11 列表格就是一堆竖线, **粗体** 显示成星号 — 手机上
+    没法读。转换只覆盖 render_close 实际产出的 markdown 子集。"""
+
+    def test_table_becomes_real_table(self):
+        md = "\n".join([
+            "| 标的 | 收盘 | Δ% |",
+            "|---|---|---|",
+            "| QQQ | 709.24 | +0.2 |",
+            "| MSFT | 496.82 | -0.8 |",
+        ])
+        h = sc.md_to_email_html(md)
+        self.assertIn("<table", h)
+        self.assertEqual(h.count("<tr"), 3)          # 表头 + 2 行
+        self.assertIn("overflow-x:auto", h)          # 宽表在手机上要能横拖
+        self.assertNotIn("|---|", h)
+
+    def test_numeric_cells_right_aligned_and_monospaced(self):
+        md = "| 标的 | 收盘 |\n|---|---|\n| QQQ | 709.24 |"
+        h = sc.md_to_email_html(md)
+        self.assertIn("text-align:right", h)         # 数字列右对齐才好比
+        self.assertIn("text-align:left", h)          # 文本列仍左对齐
+
+    def test_status_marks_become_colored_cards(self):
+        for mark, bar in (("⛔", "#dc2626"), ("🟢", "#16a34a"),
+                          ("🔵", "#2563eb"), ("⏸", "#94a3b8")):
+            h = sc.md_to_email_html(f"- {mark} 某某标的")
+            self.assertIn(f"border-left:4px solid {bar}", h, mark)
+
+    def test_plain_bullet_is_not_a_card(self):
+        h = sc.md_to_email_html("- 位置: 收盘 63.10")
+        self.assertNotIn("border-left:4px", h)
+        self.assertIn("•", h)
+
+    def test_nested_bullet_is_indented(self):
+        h = sc.md_to_email_html("- 顶层\n  - 缩进项")
+        self.assertIn("margin:2px 0 2px 20px", h)
+
+    def test_inline_bold_and_headings(self):
+        h = sc.md_to_email_html("# 标题\n## 小节\n- VIX **14.32** 收盘")
+        self.assertIn("<h1", h)
+        self.assertIn("<h2", h)
+        self.assertIn("<strong>14.32</strong>", h)
+        self.assertNotIn("**", h)
+
+    def test_source_html_is_escaped(self):
+        # 报告正文来自外部数据 (标的名/错误信息), 不能让它注入标签
+        h = sc.md_to_email_html("- <script>alert(1)</script> & 收盘")
+        self.assertNotIn("<script>", h)
+        self.assertIn("&lt;script&gt;", h)
+        self.assertIn("&amp;", h)
+
+    def test_styles_are_inline_not_a_style_block(self):
+        # Gmail 手机版会剥掉 <style> 块 — 样式必须内联
+        h = sc.md_to_email_html("# 标题\n- 一行")
+        self.assertNotIn("<style", h)
+        self.assertIn("style=", h)
+
+    def test_resend_payload_carries_both_text_and_html(self):
+        from unittest.mock import patch, MagicMock
+        seen = {}
+
+        def fake_urlopen(req, timeout=None):
+            seen.update(json.loads(req.data.decode()))
+            m = MagicMock()
+            m.status = 200
+            m.__enter__ = lambda s: m
+            m.__exit__ = lambda *a: False
+            return m
+
+        import tempfile
+        from pathlib import Path
+        f = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False,
+                                        encoding="utf-8")
+        f.write("# 报告\n\n- 🟢 **AAA** LEAP: BUY\n")
+        f.close()
+        env = {"SCAN_EMAIL_TO": "me@example.com",
+               "SCAN_RESEND_API_KEY": "re_test"}
+        with patch.dict(sc.os.environ, env, clear=True), \
+                patch.object(sc.urllib.request, "urlopen", fake_urlopen):
+            sc.send_email_report(Path(f.name), "[watchlist] test")
+        self.assertIn("**AAA**", seen["text"])       # 纯文本回落保持原样
+        self.assertIn("<strong>AAA</strong>", seen["html"])
+        self.assertIn("border-left:4px solid #16a34a", seen["html"])
+
+
 class TestEmailTransport(unittest.TestCase):
     """DigitalOcean 封锁 droplet 的出站 SMTP (25/465/587/2525 全部静默超时,
     443 正常) — 云上必须走 HTTPS 邮件 API, 所以 transport 的选择要可测。"""
