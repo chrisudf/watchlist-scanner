@@ -128,6 +128,15 @@ SETTINGS_DEFAULTS = {
     "rr_invert_min_pts": 1.0,    # RR < -此值才亮倒挂旗标 (延迟报价噪声地板)
     "rr_max_rel_spread": 0.25,   # (ask-bid)/mid 超此值的报价不用于 RR
     "rr_min_oi": 10,             # RR 两腿的未平仓量地板
+    # parity forward 的聚合: 初判 forward 附近取 N 档各自反解取中位数,
+    # 档间极差/中位 超上限 = 报价面自相矛盾 → 无读数。F 误差以 ~5 vol
+    # pts / 1% 的杠杆对称搬进 RR 两腿 (call 抬/put 压 — 与陈旧 spot 同
+    # 形态), 而 rr_max_rel_spread=0.25 允许单腿 mid 合法偏 ~0.4%: 单档
+    # 反解下一档正常噪声就能越过 rr_invert_min_pts=1.0 的地板。中位数
+    # 灭 <=2 个离群档; 0.8% 极差再兜住"多数档都在漂"的乱报价面 (借券费
+    # 是全曲线一致的平移, 极差不受影响, 难借券标的照常有读数)
+    "rr_forward_pairs": 5,
+    "rr_forward_max_disp": 0.008,
     # forward 反解 spot 与日线收盘的差超此值 = 日线陈旧。35 DTE 的正常持有
     # 成本 |F/S-1| = |e^((r-q)T)-1| 约 0.3%, 1.5% 已是其 5 倍; 难借券的负
     # rebate 可能触发, 但那种标的本来也值得看一眼 (2026-09-04 实测: 陈旧
@@ -774,10 +783,16 @@ def csp_annualized(mid: float, strike: float, dte: int) -> float:
 
 
 def _mark(row, stale_cutoff):
-    """Usable option price: live bid/ask mid, else a recent last trade."""
+    """Usable option price: live bid/ask mid, else a recent last trade.
+
+    crossed 报价 (bid > ask, Yahoo 实测会出) 不算有盘口 — mid 无意义,
+    落到 lastPrice 路径 (src=\"last\" 自动带\"下单前实查\"提示)。此前只有
+    _rr_mark 拒 crossed, CSP/LEAP/spread 的票价照收: 一档 bid 10.60 /
+    ask 10.00 出来的 mid 10.30 标成 \"live\", 派生的 delta/外在/年化全
+    是编的, 且负 spread_pct 反而通过 LEAP 的 <=5% 清洁过滤 (五轮评审)。"""
     bid = float(row.get("bid") or 0)
     ask = float(row.get("ask") or 0)
-    if bid > 0 and ask > 0:
+    if 0 < bid <= ask:
         return (bid + ask) / 2.0, "live"
     last = float(row.get("lastPrice") or 0)
     traded = row.get("lastTradeDate")
@@ -901,8 +916,8 @@ def _rr_mark(row, cutoff, s: dict) -> float | None:
     """RR 专用的报价过滤 — 比 _mark 严得多, 因为 RR 是两腿 IV 的**符号
     敏感差值**, 一腿的坏报价就能凭空造出倒挂旗标:
 
-    - 只认 live bid/ask mid (陈旧 lastPrice 与另一腿的实时 mid 不同源)
-    - 拒绝 crossed 报价 (bid > ask): Yahoo 实测会出, mid 无意义
+    - 只认 live bid/ask mid (陈旧 lastPrice 与另一腿的实时 mid 不同源;
+      crossed 报价已在 _mark 统一拒掉 — 不再有 \"live\" 的 crossed mid)
     - 相对价差上限: bid>0 and ask>0 只证明"有两个正数", 不证明 mid 可用;
       任意宽的报价照样过, 而宽报价的 mid 正是假倒挂的来源 (三轮评审)
     - 未平仓量地板: 无人持有的行权价报价不可信"""
@@ -910,8 +925,6 @@ def _rr_mark(row, cutoff, s: dict) -> float | None:
     if mid is None or src != "live":
         return None
     bid, ask = float(row.get("bid") or 0), float(row.get("ask") or 0)
-    if bid > ask:                                   # crossed
-        return None
     if mid <= 0 or (ask - bid) / mid > s["rr_max_rel_spread"]:
         return None
     if _oi(row) < s["rr_min_oi"]:
@@ -921,8 +934,7 @@ def _rr_mark(row, cutoff, s: dict) -> float | None:
 
 def forward_from_parity(calls, puts, T: float, cutoff, s: dict) -> float | None:
     """由 put-call parity 反解该到期日的 forward: C - P = e^(-rT)(F - K)
-    → F = K + e^(rT)(C - P), 取 |C - P| 最小的行权价 (构造上离 F 最近,
-    也是最活跃的那档)。
+    → F = K + e^(rT)(C - P)。
 
     这样 IV 与 delta 都从**期权市场自己**出发, 一次性消掉两个偏置:
     ① 零股息 BS 用 S 而非 S·e^(-qT), 会压低 call IV/抬高 put IV, 把
@@ -930,7 +942,18 @@ def forward_from_parity(calls, puts, T: float, cutoff, s: dict) -> float | None:
     ② 更要命的是外部 spot 本身可能陈旧 — 实测 yfinance 日线最新一根
        返回 NaN 时会退回前一日收盘, 用昨天的股价去反解今天的期权报价,
        spot 偏低使 call 抬高/put 压低, 恰好是 RR 倒挂的形态 (2026-09-04
-       盘后 11 个标的亮了 10 个假旗标, 见 lesson.md)。"""
+       盘后 11 个标的亮了 10 个假旗标, 见 lesson.md)。
+
+    但**单档**反解 (取 |C-P| 最小的那档) 对该档报价噪声全暴露 — F 误差
+    以 ~5 vol pts / 1% 的杠杆对称搬进两腿 (与陈旧 spot 同一机制, 误差源
+    换成了报价噪声), 而 rr_max_rel_spread 允许的单腿 mid 偏移就足以越过
+    rr_invert_min_pts 的地板; 更阴险的是坏档的 |C-P| 常常恰好因此变小,
+    被"取最小"优先选中 (09-04 修复自身引入的新依赖, 五轮评审)。所以:
+    先用 |C-P| 最小档定初判 F₀, 再取离 F₀ 最近的 rr_forward_pairs 档
+    各自反解, **中位数**当 F (灭 <=2 个离群档); 档间极差超
+    rr_forward_max_disp 或只剩一档 (无从交叉验证) = 报价面自相矛盾,
+    返回 None — 与 25Δ 容差同一取舍: 宁缺毋错。借券费是全曲线一致的
+    平移, 极差不受影响, 难借券标的照常有读数。"""
     if calls is None or puts is None or calls.empty or puts.empty:
         return None
     cmid, pmid = {}, {}
@@ -940,10 +963,18 @@ def forward_from_parity(calls, puts, T: float, cutoff, s: dict) -> float | None:
             if mid is not None:
                 out[float(row["strike"])] = mid
     common = set(cmid) & set(pmid)
-    if not common:
+    if len(common) < 2:
         return None
-    k = min(common, key=lambda x: abs(cmid[x] - pmid[x]))
-    return k + math.exp(RATE * T) * (cmid[k] - pmid[k])
+    carry = math.exp(RATE * T)
+    k0 = min(common, key=lambda x: abs(cmid[x] - pmid[x]))
+    f0 = k0 + carry * (cmid[k0] - pmid[k0])
+    picks = sorted(common, key=lambda x: abs(x - f0))[:s["rr_forward_pairs"]]
+    fwds = sorted(k + carry * (cmid[k] - pmid[k]) for k in picks)
+    n = len(fwds)
+    med = fwds[n // 2] if n % 2 else (fwds[n // 2 - 1] + fwds[n // 2]) / 2
+    if med <= 0 or (fwds[-1] - fwds[0]) / med > s["rr_forward_max_disp"]:
+        return None
+    return med
 
 
 def rr25_snapshot(cc: ChainCache, spot: float, s: dict) -> dict | None:
@@ -1077,7 +1108,9 @@ def _put_candidates(cc: ChainCache, exp: str, dte: int, spot: float):
             "exp": exp, "dte": dte, "strike": strike, "mid": mid, "src": src,
             "iv": iv, "delta": delta,
             "oi": _oi(row),
-            "spread_pct": (ask - bid) / mid * 100 if bid > 0 and ask > 0 else None,
+            # crossed 行经 lastPrice 路径进来时 bid/ask 仍是脏的 — 价差
+            # 只对健康盘口有意义 (负价差曾冒充"干净"通过过滤)
+            "spread_pct": (ask - bid) / mid * 100 if 0 < bid <= ask else None,
         })
     return out
 
@@ -1103,17 +1136,20 @@ def _finish_csp(c: dict, spot: float, s: dict, zone, panic: bool,
     return c
 
 
-def stage2_leap_gate(price_ok: bool, prev_leap_window, ep_end: str,
-                     halted: bool) -> tuple[bool, bool]:
-    """阶段2 LEAP 决策 -> (want_leap, burn_key)。
+def stage2_leap_gate(price_ok: bool, prev_leap_window, ep_end: str) -> bool:
+    """阶段2 LEAP 决策 (纯函数): 价格条件满足且本窗口还没出过真票。
 
-    halted (VX 全曲线倒挂等硬门) 时票仍走 skip_reason 呈现 (⏸ 行可见),
-    但**不烧**每窗口一次的 leap_window dedup key — 硬门是暂态市场条件,
-    且 VX 结算滞后一个交易日, 解除窗第一天常读到恐慌尾巴的旧曲线;
-    烧了 key 会让整个 episode 的 LEAP 补发窗静默丢失。与 retest
-    一次性标记的处理一致 (halt 期间不置位)。"""
-    want = price_ok and prev_leap_window != ep_end
-    return want, want and not halted
+    每窗口一次的 leap_window dedup key 由**调用方在真票发出后**才烧 —
+    任何形式的没出成票都不烧:
+    - halt (VX 全曲线倒挂等硬门) / 日线陈旧: 暂态市场条件, 且 VX 结算
+      滞后一个交易日, 解除窗第一天常读到恐慌尾巴的旧曲线;
+    - 票据级临时 skip (财报缓冲/无可用到期/无报价): 之前在门口就烧 key,
+      leap_ticket 一句\"财报 5 天后\"就让整个 10 天解除窗的补发静默丢失
+      — NORMAL 路径的 leap_pending 补偿明确 gate 在 stage==NORMAL, 从
+      不护这里, 而阶段2恰是全剧本统计最强的入场窗 (五轮评审)。
+    代价是永久性 skip (标的没有 LEAP) 在窗口内每天重复一条 ⏸ 行 —
+    与 NORMAL 路径对非 emitted 票的现状一致, 可见的重复好过静默丢失。"""
+    return price_ok and prev_leap_window != ep_end
 
 
 def normal_leap_gate(fresh_confirm: bool, prev_leap_pending: bool,
@@ -1287,7 +1323,8 @@ def leap_ticket(cc: ChainCache, spot: float, cfg: dict,
             "exp": exp, "dte": dte, "strike": strike, "mid": mid, "src": src,
             "iv": iv, "delta": delta,
             "oi": _oi(row),
-            "spread_pct": (ask - bid) / mid * 100 if bid > 0 and ask > 0 else None,
+            # 同 _put_candidates: 价差只对健康盘口有意义
+            "spread_pct": (ask - bid) / mid * 100 if 0 < bid <= ask else None,
             "extrinsic_pct": extrinsic / mid * 100 if mid > 0 else None,
             "lam": spot * delta / mid if mid > 0 else None,
             "breakeven": strike + mid,
@@ -1414,13 +1451,21 @@ def next_earnings(tk) -> str | None:
     None = lookup FAILED — callers must warn, not treat as no-earnings.
     yfinance swallows HTTP errors and hands back calendar == {}, so an
     empty/non-dict calendar counts as failed (ETFs legitimately 404 — the
-    caller downgrades None to '' for kind etf/index)."""
+    caller downgrades None to '' for kind etf/index).
+
+    "今天"必须是 ET 日历日, 不是本机的 — 布里斯班机器上跑 close 扫描
+    (15:45 ET = 本地次日 05:45/06:45) 时 date.today() 已经是 ET+1,
+    会把**当天 AMC 财报**当过去过滤掉: earnings_iso 变成下季/空,
+    csp_ticket 的"short 不跨财报"剔除失效, 在财报公布前几小时放行
+    跨财报的 CSP 票 (五轮评审; 全文件唯一一处非 ET 时钟)。UTC 主机上
+    扫描窗内两个日历日恰好相等, 所以 droplet 上潜伏未爆。"""
     try:
         cal = tk.calendar
         if not isinstance(cal, dict) or not cal:
             return None
         dates = cal.get("Earnings Date")
-        future = [d for d in dates or [] if d >= date.today()]
+        today_et = datetime.now(ET).date()
+        future = [d for d in dates or [] if d >= today_et]
         return min(future).isoformat() if future else ""
     except Exception:
         return None
@@ -1632,14 +1677,12 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
             ep_end = str(regime["last_episode"]["end"].date())
             price_ok = tech["close"] > tech["sma20"] \
                 or tech["signals"]["no_new_low"]
-            # 陈旧日同样不能烧掉每窗口一次的 dedup key — 否则日线补齐后
-            # 整个 episode 的 LEAP 补发窗静默丢失 (与 halt 同一个理由,
-            # 0005 修过 halt 那条, 陈旧这条是四轮评审补上的)
-            want_leap, burn_key = stage2_leap_gate(
-                price_ok, prev_state.get("leap_window"), ep_end,
-                bool(stale_msg or regime.get("halt_new_longs")))
-            if burn_key:
-                r["leap_window"] = ep_end
+            # dedup key 在下方真票发出后才烧 (见 stage2_leap_gate docstring):
+            # halt/陈旧/票据级临时 skip 都不烧, 否则约束解除后整个 episode
+            # 的 LEAP 补发窗静默丢失
+            want_leap = stage2_leap_gate(
+                price_ok, prev_state.get("leap_window"), ep_end)
+            if want_leap and not (stale_msg or regime.get("halt_new_longs")):
                 r["notes"].append("阶段2解除窗口 — buy the relief: 价格条件"
                                   "(收上20日线/不再新低 二选一)已满足; 工具: "
                                   "deep ITM LEAP / risk reversal (卖put融资买call)")
@@ -1681,6 +1724,10 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
                 # TREND"兜底失效, 不会无限挂着
                 emitted = "skip_reason" not in r["leap"]
                 r["leap_emitted"] = emitted
+                if emitted and stage == "STAGE2_WINDOW":
+                    # 真票已发 — 现在才烧每窗口一次的 dedup key。ep_end
+                    # 只在 STAGE2 分支里绑定, 由 stage 判断护住
+                    r["leap_window"] = ep_end
                 # leap_emitted=False 只保住**已存在**的标记, 不会新建一个 —
                 # 首次 NORMAL 确认当天就撞上财报缓冲/暂无合约时, 一次性的
                 # fresh_confirm 会被 state.json 消耗掉而没有任何补发标记,
@@ -2523,6 +2570,66 @@ def send_email_report(report_path: Path, subject: str) -> None:
         smtp.send_message(msg)
 
 
+def _sent_marker(report_path: Path) -> Path:
+    """{date}-{mode}.md 的投递凭证 — 只在 send_email_report 成功后写。
+    dedup 门与 watchdog 都以它为准: \"报告文件存在\"证明的是扫描跑过,
+    不证明报告到过收件箱, 两件事必须分开记账 (五轮评审)。"""
+    return report_path.with_suffix(".sent")
+
+
+def resend_pending_reports(d: str, now_et: datetime) -> None:
+    """补发当日已写盘但没发出去的 canonical 报告 (.md 在而 .sent 不在)。
+
+    没有这条, 一次 Resend/SMTP 抖动 = 当天报告静默丢失: 发信失败的 run
+    以 exit 1 收场, DST 双保险的下一次 fire 又被\"报告已存在\"的 dedup
+    拦回 (exit 3), watchdog 只看得到文件存在, 而 FAILED 告警本身走的还是
+    同一条坏通道。补发挂在每次 --email 定时运行的最前面、窗口门之前 —
+    投递不需要市场在开盘, 窗口外的 fire 正好当补发班车。
+
+    只补投递, 绝不重扫: state.json 在上一轮已推进, 重扫会把 fresh_confirm
+    这类一次性转换当场消耗掉 (等价于 R1 那个事故的自制版)。主题取
+    latest-{mode}.json 里的 regime 阶段, 拿不到就裸主题 — 补发标题带
+    resend 字样, 与原始邮件区分且不进同一 Gmail 会话。"""
+    for mode in ("open", "close"):
+        p = REPORTS / f"{d}-{mode}.md"
+        marker = _sent_marker(p)
+        if not p.exists() or marker.exists():
+            continue
+        stage = ""
+        try:
+            latest = json.loads(
+                (REPORTS / f"latest-{mode}.json").read_text(encoding="utf-8"))
+            stage = (latest.get("regime") or {}).get("stage", "")
+        except Exception:
+            pass
+        subject = (f"[watchlist] {d} {mode} {now_et:%H:%M} ET resend"
+                   + (f" — {stage}" if stage else ""))
+        try:
+            send_email_report(p, subject)
+            marker.write_text(now_et.isoformat(), encoding="utf-8")
+            print(f"resent {p.name}")
+            ping_heartbeat()
+        except Exception as e:
+            # 不让补发失败弄死本次运行 — 当前窗口的正式扫描照跑;
+            # 未送达状态由 watchdog 的 .sent 检查兜底
+            print(f"EMAIL RESEND FAILED ({p.name}): {e}", file=sys.stderr)
+
+
+def ping_heartbeat() -> None:
+    """SCAN_HEARTBEAT_URL (healthchecks.io / ntfy 等) — 邮件之外的独立
+    活性信号。邮件商故障时 FAILED/MISSED 告警会跟着一起哑 (同通道),
+    心跳服务按\"没收到 ping\"从它那边报警, 不依赖本机任何出站邮件。
+    只在**投递成功**后 ping — 心跳的语义是\"报告送达\", 不是\"进程活着\"。
+    未配置时是 no-op。"""
+    url = os.environ.get("SCAN_HEARTBEAT_URL")
+    if not url:
+        return
+    try:
+        urllib.request.urlopen(url, timeout=10)
+    except Exception as e:
+        print(f"heartbeat ping failed: {e}", file=sys.stderr)
+
+
 def batch_history(symbols: list[str]) -> dict[str, pd.DataFrame | None]:
     df = yf.download(symbols, period="1y", interval="1d", auto_adjust=True,
                      group_by="ticker", progress=False, threads=True)
@@ -2552,6 +2659,11 @@ def main() -> int:
     args = ap.parse_args()
 
     now_et = datetime.now(ET)
+    # 补发在窗口门**之前**: 投递不需要市场开着, 窗口外的定时 fire (DST
+    # 双保险的另一半、看门狗前的任意一发) 正好当补发班车。只看 canonical
+    # 报告名, manual 报告不补
+    if args.email and not args.force and not args.tickers:
+        resend_pending_reports(now_et.strftime("%Y-%m-%d"), now_et)
     mode = resolve_mode(args.mode, now_et)
     if mode is None:
         if args.force:
@@ -2662,7 +2774,12 @@ def main() -> int:
                    + f" — {regime['stage']}")
         try:
             send_email_report(report_path, subject)
+            # 投递凭证与报告文件分开记账 — dedup 判"跑没跑过"看 .md,
+            # watchdog 判"送没送到"看 .sent, 补发看两者之差
+            _sent_marker(report_path).write_text(now_et.isoformat(),
+                                                 encoding="utf-8")
             print(f"email sent to {os.environ.get('SCAN_EMAIL_TO')}")
+            ping_heartbeat()
         except Exception as e:
             print(f"EMAIL FAILED: {e}", file=sys.stderr)
             return 1

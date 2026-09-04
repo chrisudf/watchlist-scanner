@@ -145,6 +145,30 @@ class TestOptionMath(unittest.TestCase):
         iv = sc.implied_vol(price, 100, 90, 1.5, 0.04, is_call=True)
         self.assertAlmostEqual(iv, 0.42, places=3)
 
+    def _quote_row(self, bid, ask, last=0.0, traded_days_ago=1):
+        return pd.Series({
+            "bid": bid, "ask": ask, "lastPrice": last,
+            "lastTradeDate": pd.Timestamp.now(tz="UTC")
+            - pd.Timedelta(days=traded_days_ago)})
+
+    def test_mark_healthy_book(self):
+        mid, src = sc._mark(self._quote_row(1.00, 1.10), sc._stale_cutoff())
+        self.assertAlmostEqual(mid, 1.05)
+        self.assertEqual(src, "live")
+
+    def test_mark_rejects_crossed_book(self):
+        # bid > ask (Yahoo 实测会出): mid 无意义 — 此前只有 _rr_mark 拒,
+        # CSP/LEAP/spread 票价照收且负价差还通过 LEAP <=5% 过滤 (五轮评审)。
+        # crossed 落到 lastPrice 路径 → src="last" 自动带"下单前实查"提示
+        mid, src = sc._mark(self._quote_row(1.10, 1.00, last=1.02),
+                            sc._stale_cutoff())
+        self.assertEqual((mid, src), (1.02, "last"))
+        # crossed 且无近期成交 → 无可用价
+        mid, src = sc._mark(self._quote_row(1.10, 1.00, last=1.02,
+                                            traded_days_ago=10),
+                            sc._stale_cutoff())
+        self.assertIsNone(mid)
+
     def test_stock_ladder(self):
         s = sc.SETTINGS_DEFAULTS
         ladder = sc.stock_ladder([380.0, 440.0], s)
@@ -548,6 +572,87 @@ class TestEmailTransport(unittest.TestCase):
         self.assertNotIn("re_secret_do_not_leak", str(cm.exception))
 
 
+class TestDeliveryLoop(unittest.TestCase):
+    """发信失败的自愈闭环 (五轮评审): 报告先落盘、邮件后发 — 发信失败时
+    dedup 门会把 DST 双保险的下一次 fire 拦回, watchdog 又只查 .md 存在,
+    FAILED 告警走同一条坏通道 → 一次 Resend 抖动 = 当天报告静默丢失。
+    修复 = .sent 投递凭证 + 每次 --email fire 先补发 + 只送达后 ping 心跳。"""
+
+    D = "2026-09-04"
+
+    def _reports(self, stage="NORMAL", with_marker=False):
+        import tempfile
+        from pathlib import Path
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / f"{self.D}-close.md").write_text("# 报告", encoding="utf-8")
+        (tmp / "latest-close.json").write_text(
+            json.dumps({"regime": {"stage": stage}}), encoding="utf-8")
+        if with_marker:
+            (tmp / f"{self.D}-close.sent").write_text("x", encoding="utf-8")
+        return tmp
+
+    def _now(self):
+        return datetime.fromisoformat(f"{self.D}T16:45:00").replace(tzinfo=sc.ET)
+
+    def test_resend_pending_sends_and_writes_marker(self):
+        from unittest.mock import patch
+        tmp = self._reports(stage="STAGE2_WINDOW")
+        sent = {}
+        with patch.object(sc, "REPORTS", tmp), \
+                patch.object(sc, "send_email_report",
+                             lambda p, subj: sent.update(path=p, subj=subj)):
+            sc.resend_pending_reports(self.D, self._now())
+        self.assertEqual(sent["path"].name, f"{self.D}-close.md")
+        # 补发主题带 resend 字样 (不进原 Gmail 会话) 且带 regime 阶段
+        self.assertIn("resend", sent["subj"])
+        self.assertIn("STAGE2_WINDOW", sent["subj"])
+        self.assertTrue((tmp / f"{self.D}-close.sent").exists())
+
+    def test_already_sent_is_noop(self):
+        from unittest.mock import patch
+        tmp = self._reports(with_marker=True)
+        with patch.object(sc, "REPORTS", tmp), \
+                patch.object(sc, "send_email_report",
+                             side_effect=AssertionError("不该重发")):
+            sc.resend_pending_reports(self.D, self._now())
+
+    def test_resend_failure_keeps_marker_absent_and_survives(self):
+        # 补发失败不能弄死本次运行 (当前窗口的正式扫描还要跑), 也不能写
+        # 凭证 — 留给下一个 fire 再试 + watchdog 报"已写盘未送达"
+        from unittest.mock import patch
+        tmp = self._reports()
+        with patch.object(sc, "REPORTS", tmp), \
+                patch.object(sc, "send_email_report",
+                             side_effect=RuntimeError("Resend 500")):
+            sc.resend_pending_reports(self.D, self._now())   # 不抛
+        self.assertFalse((tmp / f"{self.D}-close.sent").exists())
+
+    def test_heartbeat_only_when_configured(self):
+        from unittest.mock import patch
+        hits = []
+        with patch.dict(sc.os.environ, {}, clear=True), \
+                patch.object(sc.urllib.request, "urlopen",
+                             lambda *a, **k: hits.append(a)):
+            sc.ping_heartbeat()
+        self.assertEqual(hits, [])
+        with patch.dict(sc.os.environ,
+                        {"SCAN_HEARTBEAT_URL": "https://hc-ping.com/x"},
+                        clear=True), \
+                patch.object(sc.urllib.request, "urlopen",
+                             lambda url, timeout=None: hits.append(url)):
+            sc.ping_heartbeat()
+        self.assertEqual(hits, ["https://hc-ping.com/x"])
+
+    def test_heartbeat_failure_is_swallowed(self):
+        from unittest.mock import patch
+        with patch.dict(sc.os.environ,
+                        {"SCAN_HEARTBEAT_URL": "https://hc-ping.com/x"},
+                        clear=True), \
+                patch.object(sc.urllib.request, "urlopen",
+                             side_effect=RuntimeError("down")):
+            sc.ping_heartbeat()   # 心跳挂了不影响主流程
+
+
 class TestClock(unittest.TestCase):
     def _et(self, h, m, weekday_date="2026-08-07"):  # a Friday
         return datetime.fromisoformat(f"{weekday_date}T{h:02d}:{m:02d}:00").replace(
@@ -563,6 +668,44 @@ class TestClock(unittest.TestCase):
         self.assertIsNone(sc.resolve_mode("auto", self._et(9, 45, "2026-08-08")))
         # explicit mode bypasses the clock
         self.assertEqual(sc.resolve_mode("close", self._et(3, 0)), "close")
+
+
+class _FakeTk:
+    def __init__(self, calendar):
+        self.calendar = calendar
+
+
+class TestNextEarnings(unittest.TestCase):
+    def test_et_clock_not_host_clock(self):
+        # 布里斯班机上 close 扫描时本机日历日 = ET+1 — date.today() 会把
+        # 当天 AMC 财报当过去滤掉, 在公布前几小时放行跨财报 CSP (五轮评审)。
+        # 把 scanner 的 date.today 钉成 ET+1 模拟那台机器: 修复后不再引用它
+        from unittest.mock import patch
+        et_today = datetime.now(sc.ET).date()
+
+        class _BrisbaneDate(sc.date):
+            @classmethod
+            def today(cls):
+                return et_today + timedelta(days=1)
+
+        with patch.object(sc, "date", _BrisbaneDate):
+            out = sc.next_earnings(_FakeTk({"Earnings Date": [et_today]}))
+        self.assertEqual(out, et_today.isoformat())
+
+    def test_no_upcoming_is_empty_string(self):
+        past = datetime.now(sc.ET).date() - timedelta(days=30)
+        self.assertEqual(sc.next_earnings(_FakeTk({"Earnings Date": [past]})), "")
+
+    def test_failed_lookup_is_none(self):
+        # yfinance 吞 HTTP 错回空 calendar — 契约: None=失败, caller 必须 warn
+        self.assertIsNone(sc.next_earnings(_FakeTk({})))
+        self.assertIsNone(sc.next_earnings(_FakeTk(None)))
+
+    def test_nearest_of_multiple(self):
+        t = datetime.now(sc.ET).date()
+        cal = {"Earnings Date": [t + timedelta(days=95), t + timedelta(days=4)]}
+        self.assertEqual(sc.next_earnings(_FakeTk(cal)),
+                         (t + timedelta(days=4)).isoformat())
 
 
 VX_SETTLE_SAMPLE = """Product,Symbol,Expiration Date,Price
@@ -884,29 +1027,28 @@ class TestCSPWindow(unittest.TestCase):
 
 
 class TestStage2LeapGate(unittest.TestCase):
-    def test_halt_shows_ticket_but_keeps_key(self):
-        # halt 期间: want_leap=True (⏸ skip 行可见) 但不烧 dedup key —
-        # VX 结算滞后一天, 解除窗第一天常读到恐慌尾巴的旧曲线,
-        # 烧了 key 整个 episode 的 LEAP 补发窗静默丢失 (评审 finding #1)
-        want, burn = sc.stage2_leap_gate(True, None, "2026-08-28", halted=True)
-        self.assertTrue(want)
-        self.assertFalse(burn)
-        # halt 解除后同窗口内: 补发 + 烧 key
-        want, burn = sc.stage2_leap_gate(True, None, "2026-08-28", halted=False)
-        self.assertTrue(want)
-        self.assertTrue(burn)
+    """dedup key 的烧毁不再由 gate 决定 — 调用方在**真票发出后**才写
+    r[\"leap_window\"] (五轮评审: 之前在门口就烧, leap_ticket 一句
+    \"财报 5 天后\"的临时 skip 就吞掉整个 10 天解除窗的补发;
+    NORMAL 的 leap_pending 补偿从不护 STAGE2)。gate 只回答一件事:
+    价格条件满足且本窗口还没出过真票。"""
 
-    def test_key_already_burned_dedups(self):
-        want, burn = sc.stage2_leap_gate(True, "2026-08-28", "2026-08-28",
-                                         halted=False)
-        self.assertFalse(want)
-        self.assertFalse(burn)
+    def test_want_while_blocked_key_survives(self):
+        # halt/陈旧/票据级 skip 期间: want=True (⏸ 行可见), key 不烧 —
+        # 次日 prev_leap_window 仍是 None, 同窗口内继续想出票
+        self.assertTrue(sc.stage2_leap_gate(True, None, "2026-08-28"))
+        self.assertTrue(sc.stage2_leap_gate(True, None, "2026-08-28"))
+
+    def test_key_burned_after_real_ticket_dedups(self):
+        # 真票发出当日调用方写入 leap_window=ep_end → 之后同窗口不再出
+        self.assertFalse(sc.stage2_leap_gate(True, "2026-08-28", "2026-08-28"))
+
+    def test_new_episode_new_key(self):
+        # 上一窗口烧过的 key 不影响新 episode (ep_end 不同)
+        self.assertTrue(sc.stage2_leap_gate(True, "2026-08-28", "2026-09-15"))
 
     def test_price_not_ok(self):
-        want, burn = sc.stage2_leap_gate(False, None, "2026-08-28",
-                                         halted=False)
-        self.assertFalse(want)
-        self.assertFalse(burn)
+        self.assertFalse(sc.stage2_leap_gate(False, None, "2026-08-28"))
 
 
 class TestActionBlockHaltDedup(unittest.TestCase):
@@ -1054,6 +1196,46 @@ class TestRR25Snapshot(unittest.TestCase):
     def test_crossed_quotes_rejected(self):
         # bid > ask 的 mid 无意义 — bid>0 and ask>0 挡不住 (三轮评审)
         self.assertIsNone(self._snap(100.0, crossed=True))
+
+    def _bump_call(self, ch, strike, dpx):
+        m = ch.calls["strike"] == strike
+        ch.calls.loc[m, ["bid", "ask", "lastPrice"]] += dpx
+
+    def test_forward_median_survives_one_bad_parity_pair(self):
+        # 单档 |C−P| 反解对该档噪声全暴露 (F 误差 ~5 pts/1% 地搬进 RR),
+        # 且坏档的 |C−P| 常恰好因此变小、被"取最小"优先选中 — 把离 F 最近
+        # 的档 (100, F≈100.38) 的 call mid 压 0.5: 老实现 F 偏 ~-0.5%
+        # (≈-2.5 pts RR, 足以把正常 skew 翻成假倒挂), 中位数聚合下坏档
+        # 被灭, forward 还原精确 (五轮评审)
+        ch = self._chain(100.0, self.NORMAL_SKEW)
+        self._bump_call(ch, 100.0, -0.5)
+        out = sc.rr25_snapshot(_FakeCC(ch), 100.0, sc.SETTINGS_DEFAULTS)
+        self.assertIsNotNone(out)
+        self.assertAlmostEqual(out["fwd_spot"], 100.0, delta=0.15)
+        self.assertFalse(out["inverted"])
+        self.assertGreater(out["rr"], 0)
+
+    def test_forward_chaotic_parity_is_no_reading(self):
+        # 多数档都在漂 = 报价面自相矛盾 — 中位数救不了, 极差门拒掉整个
+        # 读数 (宁缺毋错; 借券费是全曲线一致平移, 极差不受影响不会误伤)
+        ch = self._chain(100.0, self.NORMAL_SKEW)
+        self._bump_call(ch, 98.0, +1.2)
+        self._bump_call(ch, 100.0, -1.2)
+        self._bump_call(ch, 102.0, +0.8)
+        self.assertIsNone(
+            sc.rr25_snapshot(_FakeCC(ch), 100.0, sc.SETTINGS_DEFAULTS))
+
+    def test_forward_single_pair_is_no_reading(self):
+        # 只剩一档可用 = 无从交叉验证 — 之前单档照出读数, 正是噪声全
+        # 暴露的形态
+        traded = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=1)
+        row = lambda px: {"strike": 100.0, "bid": px - 0.05, "ask": px + 0.05,
+                          "lastPrice": px, "lastTradeDate": traded,
+                          "openInterest": 100}
+        fwd = sc.forward_from_parity(
+            pd.DataFrame([row(4.5)]), pd.DataFrame([row(4.1)]),
+            self.T, sc._stale_cutoff(), sc.SETTINGS_DEFAULTS)
+        self.assertIsNone(fwd)
 
     def test_wide_quotes_rejected(self):
         # 任意宽的报价照样满足 bid>0 and ask>0, 其 mid 正是假倒挂来源
