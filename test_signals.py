@@ -489,8 +489,10 @@ class TestEmailHtml(unittest.TestCase):
 
         import tempfile
         from pathlib import Path
+        # delete=False + 不清理 = 每跑一次测试就往仓库目录掉一个 tmpXXXX.md
         f = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False,
                                         encoding="utf-8")
+        self.addCleanup(Path(f.name).unlink, missing_ok=True)
         f.write("# 报告\n\n- 🟢 **AAA** LEAP: BUY\n")
         f.close()
         env = {"SCAN_EMAIL_TO": "me@example.com",
@@ -510,8 +512,10 @@ class TestEmailTransport(unittest.TestCase):
     def _report(self):
         import tempfile
         from pathlib import Path
+        # delete=False + 不清理 = 每跑一次测试就往仓库目录掉一个 tmpXXXX.md
         f = tempfile.NamedTemporaryFile("w", suffix=".md", delete=False,
                                         encoding="utf-8")
+        self.addCleanup(Path(f.name).unlink, missing_ok=True)
         f.write("# 报告正文\n")
         f.close()
         return Path(f.name)
@@ -583,7 +587,9 @@ class TestDeliveryLoop(unittest.TestCase):
     def _reports(self, stage="NORMAL", with_marker=False):
         import tempfile
         from pathlib import Path
+        import shutil
         tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         (tmp / f"{self.D}-close.md").write_text("# 报告", encoding="utf-8")
         (tmp / "latest-close.json").write_text(
             json.dumps({"regime": {"stage": stage}}), encoding="utf-8")
