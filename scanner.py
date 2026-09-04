@@ -1004,6 +1004,53 @@ def rr25_snapshot(cc: ChainCache, spot: float, s: dict) -> dict | None:
 # Tickets
 # --------------------------------------------------------------------------
 
+def daily_bar_stale(cc: ChainCache, bar_date: str, s: dict) -> str | None:
+    """日线是否落后于期权链的最新成交 -> 落后时给出说明, 否则 None。
+
+    判据是**日期比对**, 不是"forward 反解现货 vs 日线收盘"的价差。价差
+    判据分不开两件事: 借券费在定价上等同于股息 (F = S·e^((r-q-b)T)), 难
+    借券的高借券费会让 forward 合法地低于现货好几个百分点, 拿价差硬拦会
+    把那些标的永久静音, 而且给出的理由还是错的。日期不一样 —— 借券费再
+    贵也不会让"日线停在哪天"和"期权链最新成交在哪天"对不上 (三轮评审)。
+
+    单向判断: 只有期权**比日线新**才算陈旧。反过来 (期权好几天没成交)
+    是流动性问题, 不是数据问题, 不报。"""
+    lo, hi = s["rr_dte"]
+    window = [(e, d) for e, d in cc.expiries() if lo <= d <= hi]
+    if not window:
+        return None
+    exp, _dte = min(window, key=lambda x: abs(x[1] - 35))
+    ch = cc.chain(exp)
+    dates = []
+    for df in (ch.calls, ch.puts):
+        if df is None or df.empty or "lastTradeDate" not in df:
+            continue
+        ts = pd.to_datetime(df["lastTradeDate"], errors="coerce",
+                            utc=True).max()
+        if pd.notna(ts):
+            dates.append(ts.tz_convert(ET).date())
+    if not dates:
+        return None
+    chain_date = max(dates)
+    if str(chain_date) <= bar_date:
+        return None
+    return (f"股价日线停在 {bar_date}, 而期权链已有 {chain_date} 的成交 — "
+            f"日线陈旧/缺失 (Yahoo 日线与期权链是两个端点, 会不同步)。"
+            "本标的的收盘价、右侧状态判定与所有票据读数都建立在过期价格上, "
+            "停出票直到日线补齐")
+
+
+def blocked_ticket(stale_msg: str | None, regime_msg: str | None) -> dict:
+    """被拦票的统一构造。
+
+    陈旧数据优先于市场门 — 价格都不可信时, 市场门拦没拦这一票已无意义。
+    且陈旧是**每标的**问题: 不打 regime_halt 标记, 免得被 action_block
+    合并进"全市场"那一行 (那行专给市场级硬停牌去重)。"""
+    if stale_msg:
+        return {"skip_reason": stale_msg, "stale_data": True}
+    return {"skip_reason": regime_msg, "regime_halt": True}
+
+
 def _put_candidates(cc: ChainCache, exp: str, dte: int, spot: float):
     ch = cc.chain(exp)
     puts = ch.puts
@@ -1400,6 +1447,9 @@ def technical_snapshot(hist: pd.DataFrame, s: dict) -> dict | None:
     low_today = float(low.iloc[-1])
     return {
         "bars": len(hist),
+        # 最后一根**有效**日线的日期 (dropna 之后取, NaN 行不会冒充"今天的
+        # 价") — 与期权链的 lastTradeDate 比对即可直接证明日线陈旧
+        "as_of": str(hist.index[-1].date()),
         # 当日下探过20日线但收盘守住 — 回踩提示的原料
         "touched_20dma": low_today <= sma20 <= last,
         "low_today": low_today,
@@ -1447,22 +1497,30 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
         if not fetch_options:
             return r
 
+        cc = ChainCache(sym)
+        # 日线陈旧 = 本标的的价格/状态/票据全部建立在过期价格上 → 硬拦
+        # (⏸), 不是提示。判据见 daily_bar_stale 的 docstring
+        stale_msg = daily_bar_stale(cc, tech["as_of"], s) \
+            if cfg["options"] else None
+
         # 首次回踩 (收盘口径, 每轮确认只提示一次): 剧本首选入场/加仓点
         # 倒挂期不提示也不烧一次性标记 (纪律: 阶段1不加右侧仓) — 解除后的
         # 首次回踩才算这轮的"首次"
         retest_seen = retest_gate(
             state, tech["touched_20dma"], bool(prev_state.get("retested")),
             bool(prev_state.get("retest_pending")), regime["stage"])
-        if retest_seen and regime.get("halt_new_longs"):
+        if retest_seen and (stale_msg or regime.get("halt_new_longs")):
             r["retest_pending"] = True
             # 呈现被拦的回踩 (⏸ skip_reason) 但不烧一次性 retested 标记 —
-            # halt 解除后同一轮回踩仍可提示, 不是静默消失
+            # 恢复后同一轮回踩仍可提示, 不是静默消失
             if cfg["options"]:
-                r["spread"] = {"skip_reason": regime["halt_new_longs"],
-                               "regime_halt": True}
+                r["spread"] = blocked_ticket(stale_msg,
+                                             regime.get("halt_new_longs"))
             else:
-                r["notes"].append("首次回踩20日线不破, 但硬停牌中 "
-                                  "(见市场状态 ⛔) — 解除后再按股价操作")
+                r["notes"].append(
+                    "首次回踩20日线不破, 但"
+                    + ("日线数据陈旧" if stale_msg else "硬停牌中 (见市场状态 ⛔)")
+                    + " — 恢复后再按股价操作")
         elif retest_seen:
             r["retest"] = True
             how = "票见下" if cfg["options"] else "无期权链 — 按股价操作"
@@ -1497,7 +1555,6 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
         if in_or_near_zone:
             r["ladder"] = stock_ladder(zone, s)
 
-        cc = ChainCache(sym)
         r["earnings"] = next_earnings(cc.tk)
         if r["earnings"] is None and cfg["kind"] in ("etf", "index"):
             r["earnings"] = ""  # ETF/指数无财报 — 404 是常态不是失败
@@ -1515,12 +1572,17 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
             pass
         rr = r["rr25"]
         gap = (rr or {}).get("spot_gap_pct")
-        if gap is not None and abs(gap) >= s["rr_spot_gap_warn"] * 100:
+        # 日线**不**陈旧 (日期对得上) 却仍有大幅 forward/现货背离 = 持有成本
+        # 异常, 最常见的原因是难借券的高借券费 (F = S·e^((r-q-b)T))。这不是
+        # 数据问题而是信息: 借券贵 = 做空拥挤, 且卖 put 的净收益会被这块成本
+        # 侵蚀。陈旧那条路已经在上面硬拦掉了, 到这里的都是真背离
+        if stale_msg is None and gap is not None \
+                and abs(gap) >= s["rr_spot_gap_warn"] * 100:
             r["notes"].append(
-                f"⚠️ 股价日线与期权市场不一致: 期权 forward 反解现货 "
-                f"~{rr['fwd_spot']:.2f}, 日线收盘 {tech['close']:.2f} "
-                f"(差 {gap:+.1f}%) — 日线陈旧/缺失的可能性大, 本标的的价格、"
-                "状态判定与票据读数都不可信 (RR 已改用 forward, 不受影响)")
+                f"期权 forward 反解现货 ~{rr['fwd_spot']:.2f} vs 日线收盘 "
+                f"{tech['close']:.2f} ({gap:+.1f}%), 而日线并不陈旧 — 持有成本"
+                "异常, 常见于难借券的高借券费: 做空拥挤的信号, 且卖 put 的净"
+                "收益会被借券成本侵蚀, 下单前核对券商的借券费率")
         if rr and rr["inverted"]:
             r["notes"].append(
                 f"⚠️ 25Δ risk reversal 倒挂 ({rr['exp']}: "
@@ -1586,16 +1648,15 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
         # 不是静默消失 (被拦的票在报告里显示 ⏸ + 原因)。regime_halt 标记
         # 让 action_block 把全市场硬停牌合并成一行, 免得每票重复长文
         if want_csp:
-            if regime.get("halt_csp"):
-                r["csp"] = {"skip_reason": regime["halt_csp"],
-                            "regime_halt": True}
+            if stale_msg or regime.get("halt_csp"):
+                r["csp"] = blocked_ticket(stale_msg, regime.get("halt_csp"))
             else:
                 r["csp"] = csp_ticket(cc, tech["close"], r["iv30"],
                                       r["earnings"], stage, zone, s)
         if want_leap:
-            if regime.get("halt_new_longs"):
-                r["leap"] = {"skip_reason": regime["halt_new_longs"],
-                             "regime_halt": True}
+            if stale_msg or regime.get("halt_new_longs"):
+                r["leap"] = blocked_ticket(stale_msg,
+                                           regime.get("halt_new_longs"))
                 if stage == "NORMAL":
                     r["leap_pending"] = True
             else:

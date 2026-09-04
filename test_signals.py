@@ -584,6 +584,55 @@ class TestTicketSkipLine(unittest.TestCase):
         self.assertIn("财报 2026-09-09 就在 6 天后", line)
 
 
+class TestDailyBarStale(unittest.TestCase):
+    """三轮评审: 陈旧日线改成**日期比对 + 硬拦**。
+
+    价差判据 (forward 反解现货 vs 日线收盘) 分不开"日线陈旧"和"难借券的
+    高借券费" —— 后者让 forward 合法地低于现货好几个百分点, 拿它硬拦会把
+    那些标的永久静音。日期不会骗人。"""
+
+    def _cc(self, chain_day):
+        ts = pd.Timestamp(f"{chain_day} 19:58", tz="UTC")   # = 当日 15:58 ET
+        df = pd.DataFrame([{"strike": 100.0, "lastTradeDate": ts}])
+        return _FakeCC(_FakeChain(df, df))
+
+    def test_chain_newer_than_bar_is_stale(self):
+        # 2026-09-04 事故的形态: 日线停在 9/2, 期权链已有 9/3 的成交
+        msg = sc.daily_bar_stale(self._cc("2026-09-03"), "2026-09-02",
+                                 sc.SETTINGS_DEFAULTS)
+        self.assertIsNotNone(msg)
+        self.assertIn("2026-09-02", msg)
+        self.assertIn("2026-09-03", msg)
+
+    def test_same_day_is_fresh(self):
+        self.assertIsNone(sc.daily_bar_stale(
+            self._cc("2026-09-03"), "2026-09-03", sc.SETTINGS_DEFAULTS))
+
+    def test_illiquid_chain_is_not_stale(self):
+        # 单向判据: 期权好几天没成交是流动性问题, 不是数据问题 — 不能反过来报
+        self.assertIsNone(sc.daily_bar_stale(
+            self._cc("2026-08-28"), "2026-09-03", sc.SETTINGS_DEFAULTS))
+
+    def test_no_trade_dates_is_not_stale(self):
+        df = pd.DataFrame([{"strike": 100.0}])
+        self.assertIsNone(sc.daily_bar_stale(
+            _FakeCC(_FakeChain(df, df)), "2026-09-03", sc.SETTINGS_DEFAULTS))
+
+
+class TestBlockedTicket(unittest.TestCase):
+    def test_stale_beats_regime_and_stays_per_ticker(self):
+        # 价格都不可信时, 市场门拦没拦这一票已无意义 → 陈旧优先。
+        # 且陈旧是每标的问题, 不能被 action_block 合并进"全市场"那一行
+        t = sc.blocked_ticket("日线停在 2026-09-02", "全市场硬停牌")
+        self.assertIn("2026-09-02", t["skip_reason"])
+        self.assertTrue(t["stale_data"])
+        self.assertFalse(sc._regime_halted(t))
+
+    def test_regime_path_keeps_merge_flag(self):
+        t = sc.blocked_ticket(None, "VX 全曲线倒挂")
+        self.assertTrue(sc._regime_halted(t))
+
+
 class TestCSPWindow(unittest.TestCase):
     def test_no_zone_never_opens(self):
         # 没有接货价就没有 CSP — 任何 regime 都一样 (ORCL 教训)
