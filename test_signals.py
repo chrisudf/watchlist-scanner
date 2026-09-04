@@ -391,11 +391,35 @@ class TestEmailHtml(unittest.TestCase):
         self.assertIn("&lt;script&gt;", h)
         self.assertIn("&amp;", h)
 
-    def test_styles_are_inline_not_a_style_block(self):
-        # Gmail 手机版会剥掉 <style> 块 — 样式必须内联
+    def test_style_block_is_only_progressive_enhancement(self):
+        # Gmail 手机版可能剥掉 <style> — 所以 <style> 里只放媒体查询,
+        # 剥掉之后剩下的内联样式必须仍然是一份完整可读的桌面版
         h = sc.md_to_email_html("# 标题\n- 一行")
-        self.assertNotIn("<style", h)
-        self.assertIn("style=", h)
+        self.assertIn("@media", h)
+        head, _, rest = h.partition("</style>")
+        self.assertNotIn("@media", rest)          # 媒体查询只此一处
+        self.assertIn("style=", rest)             # 正文仍是内联样式
+
+    def test_table_ships_wide_and_narrow_versions(self):
+        md = "| 标的 | 状态 | 收盘 |\n|---|---|---|\n| QQQ | 回调中 | 709.24 |"
+        h = sc.md_to_email_html(md)
+        # 宽版默认可见, 窄版默认隐藏 —— 剥掉 <style> 时退回原来的宽表,
+        # 绝不会比改之前更差
+        self.assertIn('class="wl-wide" style="display:block', h)
+        self.assertIn('class="wl-narrow" style="display:none', h)
+        self.assertIn(".wl-wide{display:none!important}", h)
+        self.assertIn(".wl-narrow{display:block!important}", h)
+        self.assertEqual(h.count("QQQ"), 2)       # 两版各一次
+
+    def test_narrow_cards_label_each_value(self):
+        md = ("| 标的 | 状态 | 收盘 | 量比 | 价值区 |\n|---|---|---|---|---|\n"
+              "| QQQ | 回调中 | 709.24 | 1.0x | 未设 |")
+        h = sc.md_to_email_html(md)
+        cards = h.split('class="wl-narrow"')[1]
+        self.assertIn("收盘", cards)               # 卡片里带列名当标签
+        self.assertIn("709.24", cards)
+        self.assertIn("量比", cards)
+        self.assertNotIn("价值区", cards)          # 空值列不占位
 
     def test_resend_payload_carries_both_text_and_html(self):
         from unittest.mock import patch, MagicMock
