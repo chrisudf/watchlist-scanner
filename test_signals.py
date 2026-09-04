@@ -591,32 +591,53 @@ class TestDailyBarStale(unittest.TestCase):
     高借券费" —— 后者让 forward 合法地低于现货好几个百分点, 拿它硬拦会把
     那些标的永久静音。日期不会骗人。"""
 
-    def _cc(self, chain_day):
+    def _cc(self, chain_day, expiries=None):
         ts = pd.Timestamp(f"{chain_day} 19:58", tz="UTC")   # = 当日 15:58 ET
         df = pd.DataFrame([{"strike": 100.0, "lastTradeDate": ts}])
-        return _FakeCC(_FakeChain(df, df))
+        return _FakeCC(_FakeChain(df, df), expiries=expiries)
+
+    def test_works_outside_the_rr_dte_window(self):
+        # 四轮评审: 判据原本借用 rr_dte 的 20-60 DTE 窗口选到期日 — 没有
+        # 到期日落在窗口内的标的会让整道门**静默失效**, 而它照样出 CSP/
+        # LEAP 票, 那些票就建立在过期价格上
+        cc = self._cc("2026-09-03", expiries=[("2026-09-11", 7)])
+        self.assertIsNotNone(sc.daily_bar_stale(cc, "2026-09-02"))
+
+    def test_falls_through_to_next_expiry_without_trades(self):
+        # 最近一档没有成交记录时往后再试
+        ts = pd.Timestamp("2026-09-03 19:58", tz="UTC")
+        empty = _FakeChain(pd.DataFrame([{"strike": 100.0}]),
+                           pd.DataFrame([{"strike": 100.0}]))
+        traded = _FakeChain(
+            pd.DataFrame([{"strike": 100.0, "lastTradeDate": ts}]),
+            pd.DataFrame([{"strike": 100.0, "lastTradeDate": ts}]))
+
+        class _CC:
+            def expiries(self):
+                return [("2026-09-11", 7), ("2026-09-18", 14)]
+
+            def chain(self, exp):
+                return empty if exp == "2026-09-11" else traded
+
+        self.assertIsNotNone(sc.daily_bar_stale(_CC(), "2026-09-02"))
 
     def test_chain_newer_than_bar_is_stale(self):
         # 2026-09-04 事故的形态: 日线停在 9/2, 期权链已有 9/3 的成交
-        msg = sc.daily_bar_stale(self._cc("2026-09-03"), "2026-09-02",
-                                 sc.SETTINGS_DEFAULTS)
+        msg = sc.daily_bar_stale(self._cc("2026-09-03"), "2026-09-02")
         self.assertIsNotNone(msg)
         self.assertIn("2026-09-02", msg)
         self.assertIn("2026-09-03", msg)
 
     def test_same_day_is_fresh(self):
-        self.assertIsNone(sc.daily_bar_stale(
-            self._cc("2026-09-03"), "2026-09-03", sc.SETTINGS_DEFAULTS))
+        self.assertIsNone(sc.daily_bar_stale(self._cc("2026-09-03"), "2026-09-03"))
 
     def test_illiquid_chain_is_not_stale(self):
         # 单向判据: 期权好几天没成交是流动性问题, 不是数据问题 — 不能反过来报
-        self.assertIsNone(sc.daily_bar_stale(
-            self._cc("2026-08-28"), "2026-09-03", sc.SETTINGS_DEFAULTS))
+        self.assertIsNone(sc.daily_bar_stale(self._cc("2026-08-28"), "2026-09-03"))
 
     def test_no_trade_dates_is_not_stale(self):
         df = pd.DataFrame([{"strike": 100.0}])
-        self.assertIsNone(sc.daily_bar_stale(
-            _FakeCC(_FakeChain(df, df)), "2026-09-03", sc.SETTINGS_DEFAULTS))
+        self.assertIsNone(sc.daily_bar_stale(_FakeCC(_FakeChain(df, df)), "2026-09-03"))
 
 
 class TestBlockedTicket(unittest.TestCase):
@@ -734,11 +755,12 @@ class _FakeChain:
 
 
 class _FakeCC:
-    def __init__(self, chain):
+    def __init__(self, chain, expiries=None):
         self._chain = chain
+        self._expiries = expiries or [("2026-10-16", 35)]
 
     def expiries(self):
-        return [("2026-10-16", 35)]
+        return self._expiries
 
     def chain(self, exp):
         return self._chain

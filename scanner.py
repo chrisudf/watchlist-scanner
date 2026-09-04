@@ -1004,7 +1004,7 @@ def rr25_snapshot(cc: ChainCache, spot: float, s: dict) -> dict | None:
 # Tickets
 # --------------------------------------------------------------------------
 
-def daily_bar_stale(cc: ChainCache, bar_date: str, s: dict) -> str | None:
+def daily_bar_stale(cc: ChainCache, bar_date: str) -> str | None:
     """日线是否落后于期权链的最新成交 -> 落后时给出说明, 否则 None。
 
     判据是**日期比对**, 不是"forward 反解现货 vs 日线收盘"的价差。价差
@@ -1014,24 +1014,28 @@ def daily_bar_stale(cc: ChainCache, bar_date: str, s: dict) -> str | None:
     贵也不会让"日线停在哪天"和"期权链最新成交在哪天"对不上 (三轮评审)。
 
     单向判断: 只有期权**比日线新**才算陈旧。反过来 (期权好几天没成交)
-    是流动性问题, 不是数据问题, 不报。"""
-    lo, hi = s["rr_dte"]
-    window = [(e, d) for e, d in cc.expiries() if lo <= d <= hi]
-    if not window:
+    是流动性问题, 不是数据问题, 不报。
+
+    到期日取**最近的**, 不借用 rr_dte 的 20-60 DTE 窗口: 借用的话, 没有
+    到期日落在窗口内的标的会让整道门静默失效, 而它照样能出 CSP/LEAP 票 —
+    那些票就建立在过期价格上 (四轮评审)。最近的一档没有成交记录时往后
+    再试两档就停, 免得为一道校验多拉一堆链。"""
+    chain_date = None
+    for exp, _dte in cc.expiries()[:3]:
+        dates = []
+        ch = cc.chain(exp)
+        for df in (ch.calls, ch.puts):
+            if df is None or df.empty or "lastTradeDate" not in df:
+                continue
+            ts = pd.to_datetime(df["lastTradeDate"], errors="coerce",
+                                utc=True).max()
+            if pd.notna(ts):
+                dates.append(ts.tz_convert(ET).date())
+        if dates:
+            chain_date = max(dates)
+            break
+    if chain_date is None:
         return None
-    exp, _dte = min(window, key=lambda x: abs(x[1] - 35))
-    ch = cc.chain(exp)
-    dates = []
-    for df in (ch.calls, ch.puts):
-        if df is None or df.empty or "lastTradeDate" not in df:
-            continue
-        ts = pd.to_datetime(df["lastTradeDate"], errors="coerce",
-                            utc=True).max()
-        if pd.notna(ts):
-            dates.append(ts.tz_convert(ET).date())
-    if not dates:
-        return None
-    chain_date = max(dates)
     if str(chain_date) <= bar_date:
         return None
     # 短句: 这条会按标的 (乃至票种) 重复, 长解释只放在"今日动作"的合并行
@@ -1500,7 +1504,7 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
         cc = ChainCache(sym)
         # 日线陈旧 = 本标的的价格/状态/票据全部建立在过期价格上 → 硬拦
         # (⏸), 不是提示。判据见 daily_bar_stale 的 docstring
-        stale_msg = daily_bar_stale(cc, tech["as_of"], s) \
+        stale_msg = daily_bar_stale(cc, tech["as_of"]) \
             if cfg["options"] else None
         if stale_msg:
             # 硬拦只在"本来就要出票"时才看得见 — 而多数标的当天并不出票,
@@ -1628,9 +1632,12 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
             ep_end = str(regime["last_episode"]["end"].date())
             price_ok = tech["close"] > tech["sma20"] \
                 or tech["signals"]["no_new_low"]
+            # 陈旧日同样不能烧掉每窗口一次的 dedup key — 否则日线补齐后
+            # 整个 episode 的 LEAP 补发窗静默丢失 (与 halt 同一个理由,
+            # 0005 修过 halt 那条, 陈旧这条是四轮评审补上的)
             want_leap, burn_key = stage2_leap_gate(
                 price_ok, prev_state.get("leap_window"), ep_end,
-                bool(regime.get("halt_new_longs")))
+                bool(stale_msg or regime.get("halt_new_longs")))
             if burn_key:
                 r["leap_window"] = ep_end
                 r["notes"].append("阶段2解除窗口 — buy the relief: 价格条件"
@@ -1672,7 +1679,14 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
                 # 是临时约束, 清掉标记就等于约束解除后不再补发, 与"显式消耗"
                 # 的生命周期自相矛盾 (三轮评审)。仍由"状态离开 CONFIRMED/
                 # TREND"兜底失效, 不会无限挂着
-                r["leap_emitted"] = "skip_reason" not in r["leap"]
+                emitted = "skip_reason" not in r["leap"]
+                r["leap_emitted"] = emitted
+                # leap_emitted=False 只保住**已存在**的标记, 不会新建一个 —
+                # 首次 NORMAL 确认当天就撞上财报缓冲/暂无合约时, 一次性的
+                # fresh_confirm 会被 state.json 消耗掉而没有任何补发标记,
+                # 约束解除后再也发不出来 (四轮评审)
+                if not emitted and stage == "NORMAL":
+                    r["leap_pending"] = True
         if r.get("retest"):  # STAGE1 已在回踩检测处拦掉
             r["spread"] = call_spread_ticket(cc, tech["close"], s)
             if "skip_reason" not in r["spread"]:
@@ -1707,7 +1721,9 @@ def append_iv_history(results: list[dict], scan_date: str) -> pd.DataFrame:
     df = load_iv_history()
     rows = []
     for r in results:
-        if r["iv30"] is None:
+        # iv30 的 ATM 档位是按 tech["close"] 选的 — 陈旧价选出的档位和据此
+        # 算的 IV 一样不可信, 不能进自建 IVP 的历史样本 (四轮评审)
+        if r["iv30"] is None or r.get("stale_data"):
             continue
         dup = ((df["date"] == scan_date) & (df["symbol"] == r["symbol"])).any()
         if not dup:
@@ -2291,6 +2307,13 @@ def main() -> int:
             # persist state transitions (close-basis only, per the playbook)
             for r in results:
                 if r["error"] or r["tech"] is None:
+                    continue
+                if r.get("stale_data"):
+                    # r["state"] 是拿过期价格算出来的 — 落盘会覆盖
+                    # state/since 并消耗一次性转换, 等于用昨天的价把今天的
+                    # 信号用掉。报告已声明这些读数不可信, 持久化更不能收
+                    # (四轮评审)
+                    r["state_since"] = state.get(r["symbol"], {}).get("since")
                     continue
                 prev = state.get(r["symbol"], {})
                 state[r["symbol"]] = next_persisted_state(prev, r, d)
