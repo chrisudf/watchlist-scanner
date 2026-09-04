@@ -128,6 +128,15 @@ SETTINGS_DEFAULTS = {
     "rr_invert_min_pts": 1.0,    # RR < -此值才亮倒挂旗标 (延迟报价噪声地板)
     "rr_max_rel_spread": 0.25,   # (ask-bid)/mid 超此值的报价不用于 RR
     "rr_min_oi": 10,             # RR 两腿的未平仓量地板
+    # parity forward 的聚合: 初判 forward 附近取 N 档各自反解取中位数,
+    # 档间极差/中位 超上限 = 报价面自相矛盾 → 无读数。F 误差以 ~5 vol
+    # pts / 1% 的杠杆对称搬进 RR 两腿 (call 抬/put 压 — 与陈旧 spot 同
+    # 形态), 而 rr_max_rel_spread=0.25 允许单腿 mid 合法偏 ~0.4%: 单档
+    # 反解下一档正常噪声就能越过 rr_invert_min_pts=1.0 的地板。中位数
+    # 灭 <=2 个离群档; 0.8% 极差再兜住"多数档都在漂"的乱报价面 (借券费
+    # 是全曲线一致的平移, 极差不受影响, 难借券标的照常有读数)
+    "rr_forward_pairs": 5,
+    "rr_forward_max_disp": 0.008,
     # forward 反解 spot 与日线收盘的差超此值 = 日线陈旧。35 DTE 的正常持有
     # 成本 |F/S-1| = |e^((r-q)T)-1| 约 0.3%, 1.5% 已是其 5 倍; 难借券的负
     # rebate 可能触发, 但那种标的本来也值得看一眼 (2026-09-04 实测: 陈旧
@@ -925,8 +934,7 @@ def _rr_mark(row, cutoff, s: dict) -> float | None:
 
 def forward_from_parity(calls, puts, T: float, cutoff, s: dict) -> float | None:
     """由 put-call parity 反解该到期日的 forward: C - P = e^(-rT)(F - K)
-    → F = K + e^(rT)(C - P), 取 |C - P| 最小的行权价 (构造上离 F 最近,
-    也是最活跃的那档)。
+    → F = K + e^(rT)(C - P)。
 
     这样 IV 与 delta 都从**期权市场自己**出发, 一次性消掉两个偏置:
     ① 零股息 BS 用 S 而非 S·e^(-qT), 会压低 call IV/抬高 put IV, 把
@@ -934,7 +942,18 @@ def forward_from_parity(calls, puts, T: float, cutoff, s: dict) -> float | None:
     ② 更要命的是外部 spot 本身可能陈旧 — 实测 yfinance 日线最新一根
        返回 NaN 时会退回前一日收盘, 用昨天的股价去反解今天的期权报价,
        spot 偏低使 call 抬高/put 压低, 恰好是 RR 倒挂的形态 (2026-09-04
-       盘后 11 个标的亮了 10 个假旗标, 见 lesson.md)。"""
+       盘后 11 个标的亮了 10 个假旗标, 见 lesson.md)。
+
+    但**单档**反解 (取 |C-P| 最小的那档) 对该档报价噪声全暴露 — F 误差
+    以 ~5 vol pts / 1% 的杠杆对称搬进两腿 (与陈旧 spot 同一机制, 误差源
+    换成了报价噪声), 而 rr_max_rel_spread 允许的单腿 mid 偏移就足以越过
+    rr_invert_min_pts 的地板; 更阴险的是坏档的 |C-P| 常常恰好因此变小,
+    被"取最小"优先选中 (09-04 修复自身引入的新依赖, 五轮评审)。所以:
+    先用 |C-P| 最小档定初判 F₀, 再取离 F₀ 最近的 rr_forward_pairs 档
+    各自反解, **中位数**当 F (灭 <=2 个离群档); 档间极差超
+    rr_forward_max_disp 或只剩一档 (无从交叉验证) = 报价面自相矛盾,
+    返回 None — 与 25Δ 容差同一取舍: 宁缺毋错。借券费是全曲线一致的
+    平移, 极差不受影响, 难借券标的照常有读数。"""
     if calls is None or puts is None or calls.empty or puts.empty:
         return None
     cmid, pmid = {}, {}
@@ -944,10 +963,18 @@ def forward_from_parity(calls, puts, T: float, cutoff, s: dict) -> float | None:
             if mid is not None:
                 out[float(row["strike"])] = mid
     common = set(cmid) & set(pmid)
-    if not common:
+    if len(common) < 2:
         return None
-    k = min(common, key=lambda x: abs(cmid[x] - pmid[x]))
-    return k + math.exp(RATE * T) * (cmid[k] - pmid[k])
+    carry = math.exp(RATE * T)
+    k0 = min(common, key=lambda x: abs(cmid[x] - pmid[x]))
+    f0 = k0 + carry * (cmid[k0] - pmid[k0])
+    picks = sorted(common, key=lambda x: abs(x - f0))[:s["rr_forward_pairs"]]
+    fwds = sorted(k + carry * (cmid[k] - pmid[k]) for k in picks)
+    n = len(fwds)
+    med = fwds[n // 2] if n % 2 else (fwds[n // 2 - 1] + fwds[n // 2]) / 2
+    if med <= 0 or (fwds[-1] - fwds[0]) / med > s["rr_forward_max_disp"]:
+        return None
+    return med
 
 
 def rr25_snapshot(cc: ChainCache, spot: float, s: dict) -> dict | None:

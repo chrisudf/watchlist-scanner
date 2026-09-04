@@ -1197,6 +1197,46 @@ class TestRR25Snapshot(unittest.TestCase):
         # bid > ask 的 mid 无意义 — bid>0 and ask>0 挡不住 (三轮评审)
         self.assertIsNone(self._snap(100.0, crossed=True))
 
+    def _bump_call(self, ch, strike, dpx):
+        m = ch.calls["strike"] == strike
+        ch.calls.loc[m, ["bid", "ask", "lastPrice"]] += dpx
+
+    def test_forward_median_survives_one_bad_parity_pair(self):
+        # 单档 |C−P| 反解对该档噪声全暴露 (F 误差 ~5 pts/1% 地搬进 RR),
+        # 且坏档的 |C−P| 常恰好因此变小、被"取最小"优先选中 — 把离 F 最近
+        # 的档 (100, F≈100.38) 的 call mid 压 0.5: 老实现 F 偏 ~-0.5%
+        # (≈-2.5 pts RR, 足以把正常 skew 翻成假倒挂), 中位数聚合下坏档
+        # 被灭, forward 还原精确 (五轮评审)
+        ch = self._chain(100.0, self.NORMAL_SKEW)
+        self._bump_call(ch, 100.0, -0.5)
+        out = sc.rr25_snapshot(_FakeCC(ch), 100.0, sc.SETTINGS_DEFAULTS)
+        self.assertIsNotNone(out)
+        self.assertAlmostEqual(out["fwd_spot"], 100.0, delta=0.15)
+        self.assertFalse(out["inverted"])
+        self.assertGreater(out["rr"], 0)
+
+    def test_forward_chaotic_parity_is_no_reading(self):
+        # 多数档都在漂 = 报价面自相矛盾 — 中位数救不了, 极差门拒掉整个
+        # 读数 (宁缺毋错; 借券费是全曲线一致平移, 极差不受影响不会误伤)
+        ch = self._chain(100.0, self.NORMAL_SKEW)
+        self._bump_call(ch, 98.0, +1.2)
+        self._bump_call(ch, 100.0, -1.2)
+        self._bump_call(ch, 102.0, +0.8)
+        self.assertIsNone(
+            sc.rr25_snapshot(_FakeCC(ch), 100.0, sc.SETTINGS_DEFAULTS))
+
+    def test_forward_single_pair_is_no_reading(self):
+        # 只剩一档可用 = 无从交叉验证 — 之前单档照出读数, 正是噪声全
+        # 暴露的形态
+        traded = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=1)
+        row = lambda px: {"strike": 100.0, "bid": px - 0.05, "ask": px + 0.05,
+                          "lastPrice": px, "lastTradeDate": traded,
+                          "openInterest": 100}
+        fwd = sc.forward_from_parity(
+            pd.DataFrame([row(4.5)]), pd.DataFrame([row(4.1)]),
+            self.T, sc._stale_cutoff(), sc.SETTINGS_DEFAULTS)
+        self.assertIsNone(fwd)
+
     def test_wide_quotes_rejected(self):
         # 任意宽的报价照样满足 bid>0 and ask>0, 其 mid 正是假倒挂来源
         self.assertIsNone(self._snap(100.0, rel_width=0.60))
