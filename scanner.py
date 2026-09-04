@@ -1103,17 +1103,20 @@ def _finish_csp(c: dict, spot: float, s: dict, zone, panic: bool,
     return c
 
 
-def stage2_leap_gate(price_ok: bool, prev_leap_window, ep_end: str,
-                     halted: bool) -> tuple[bool, bool]:
-    """阶段2 LEAP 决策 -> (want_leap, burn_key)。
+def stage2_leap_gate(price_ok: bool, prev_leap_window, ep_end: str) -> bool:
+    """阶段2 LEAP 决策 (纯函数): 价格条件满足且本窗口还没出过真票。
 
-    halted (VX 全曲线倒挂等硬门) 时票仍走 skip_reason 呈现 (⏸ 行可见),
-    但**不烧**每窗口一次的 leap_window dedup key — 硬门是暂态市场条件,
-    且 VX 结算滞后一个交易日, 解除窗第一天常读到恐慌尾巴的旧曲线;
-    烧了 key 会让整个 episode 的 LEAP 补发窗静默丢失。与 retest
-    一次性标记的处理一致 (halt 期间不置位)。"""
-    want = price_ok and prev_leap_window != ep_end
-    return want, want and not halted
+    每窗口一次的 leap_window dedup key 由**调用方在真票发出后**才烧 —
+    任何形式的没出成票都不烧:
+    - halt (VX 全曲线倒挂等硬门) / 日线陈旧: 暂态市场条件, 且 VX 结算
+      滞后一个交易日, 解除窗第一天常读到恐慌尾巴的旧曲线;
+    - 票据级临时 skip (财报缓冲/无可用到期/无报价): 之前在门口就烧 key,
+      leap_ticket 一句\"财报 5 天后\"就让整个 10 天解除窗的补发静默丢失
+      — NORMAL 路径的 leap_pending 补偿明确 gate 在 stage==NORMAL, 从
+      不护这里, 而阶段2恰是全剧本统计最强的入场窗 (五轮评审)。
+    代价是永久性 skip (标的没有 LEAP) 在窗口内每天重复一条 ⏸ 行 —
+    与 NORMAL 路径对非 emitted 票的现状一致, 可见的重复好过静默丢失。"""
+    return price_ok and prev_leap_window != ep_end
 
 
 def normal_leap_gate(fresh_confirm: bool, prev_leap_pending: bool,
@@ -1640,14 +1643,12 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
             ep_end = str(regime["last_episode"]["end"].date())
             price_ok = tech["close"] > tech["sma20"] \
                 or tech["signals"]["no_new_low"]
-            # 陈旧日同样不能烧掉每窗口一次的 dedup key — 否则日线补齐后
-            # 整个 episode 的 LEAP 补发窗静默丢失 (与 halt 同一个理由,
-            # 0005 修过 halt 那条, 陈旧这条是四轮评审补上的)
-            want_leap, burn_key = stage2_leap_gate(
-                price_ok, prev_state.get("leap_window"), ep_end,
-                bool(stale_msg or regime.get("halt_new_longs")))
-            if burn_key:
-                r["leap_window"] = ep_end
+            # dedup key 在下方真票发出后才烧 (见 stage2_leap_gate docstring):
+            # halt/陈旧/票据级临时 skip 都不烧, 否则约束解除后整个 episode
+            # 的 LEAP 补发窗静默丢失
+            want_leap = stage2_leap_gate(
+                price_ok, prev_state.get("leap_window"), ep_end)
+            if want_leap and not (stale_msg or regime.get("halt_new_longs")):
                 r["notes"].append("阶段2解除窗口 — buy the relief: 价格条件"
                                   "(收上20日线/不再新低 二选一)已满足; 工具: "
                                   "deep ITM LEAP / risk reversal (卖put融资买call)")
@@ -1689,6 +1690,10 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
                 # TREND"兜底失效, 不会无限挂着
                 emitted = "skip_reason" not in r["leap"]
                 r["leap_emitted"] = emitted
+                if emitted and stage == "STAGE2_WINDOW":
+                    # 真票已发 — 现在才烧每窗口一次的 dedup key。ep_end
+                    # 只在 STAGE2 分支里绑定, 由 stage 判断护住
+                    r["leap_window"] = ep_end
                 # leap_emitted=False 只保住**已存在**的标记, 不会新建一个 —
                 # 首次 NORMAL 确认当天就撞上财报缓冲/暂无合约时, 一次性的
                 # fresh_confirm 会被 state.json 消耗掉而没有任何补发标记,

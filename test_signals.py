@@ -1003,29 +1003,28 @@ class TestCSPWindow(unittest.TestCase):
 
 
 class TestStage2LeapGate(unittest.TestCase):
-    def test_halt_shows_ticket_but_keeps_key(self):
-        # halt 期间: want_leap=True (⏸ skip 行可见) 但不烧 dedup key —
-        # VX 结算滞后一天, 解除窗第一天常读到恐慌尾巴的旧曲线,
-        # 烧了 key 整个 episode 的 LEAP 补发窗静默丢失 (评审 finding #1)
-        want, burn = sc.stage2_leap_gate(True, None, "2026-08-28", halted=True)
-        self.assertTrue(want)
-        self.assertFalse(burn)
-        # halt 解除后同窗口内: 补发 + 烧 key
-        want, burn = sc.stage2_leap_gate(True, None, "2026-08-28", halted=False)
-        self.assertTrue(want)
-        self.assertTrue(burn)
+    """dedup key 的烧毁不再由 gate 决定 — 调用方在**真票发出后**才写
+    r[\"leap_window\"] (五轮评审: 之前在门口就烧, leap_ticket 一句
+    \"财报 5 天后\"的临时 skip 就吞掉整个 10 天解除窗的补发;
+    NORMAL 的 leap_pending 补偿从不护 STAGE2)。gate 只回答一件事:
+    价格条件满足且本窗口还没出过真票。"""
 
-    def test_key_already_burned_dedups(self):
-        want, burn = sc.stage2_leap_gate(True, "2026-08-28", "2026-08-28",
-                                         halted=False)
-        self.assertFalse(want)
-        self.assertFalse(burn)
+    def test_want_while_blocked_key_survives(self):
+        # halt/陈旧/票据级 skip 期间: want=True (⏸ 行可见), key 不烧 —
+        # 次日 prev_leap_window 仍是 None, 同窗口内继续想出票
+        self.assertTrue(sc.stage2_leap_gate(True, None, "2026-08-28"))
+        self.assertTrue(sc.stage2_leap_gate(True, None, "2026-08-28"))
+
+    def test_key_burned_after_real_ticket_dedups(self):
+        # 真票发出当日调用方写入 leap_window=ep_end → 之后同窗口不再出
+        self.assertFalse(sc.stage2_leap_gate(True, "2026-08-28", "2026-08-28"))
+
+    def test_new_episode_new_key(self):
+        # 上一窗口烧过的 key 不影响新 episode (ep_end 不同)
+        self.assertTrue(sc.stage2_leap_gate(True, "2026-08-28", "2026-09-15"))
 
     def test_price_not_ok(self):
-        want, burn = sc.stage2_leap_gate(False, None, "2026-08-28",
-                                         halted=False)
-        self.assertFalse(want)
-        self.assertFalse(burn)
+        self.assertFalse(sc.stage2_leap_gate(False, None, "2026-08-28"))
 
 
 class TestActionBlockHaltDedup(unittest.TestCase):
