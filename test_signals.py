@@ -1221,6 +1221,52 @@ class TestRR25Snapshot(unittest.TestCase):
         self.assertFalse(out["inverted"])
         self.assertGreater(out["rr"], 0)
 
+    @staticmethod
+    def _leg(rr, inverted):
+        return {"rr": rr, "inverted": inverted, "call_iv": 0.30,
+                "put_iv": 0.30 + rr / 100, "call_strike": 108.0,
+                "put_strike": 92.0, "call_delta": 0.25, "put_delta": -0.25}
+
+    def test_split_verdict_across_forwards_is_no_reading(self):
+        # 2026-09-05 实测 GOOG 的形态: 五个候选 forward 各自反解出
+        # -1.96/-1.14/-0.95/-0.73/-0.29 — 两个越过 1.0 地板, 三个没越过。
+        # "算不算倒挂"取决于挑了哪个 forward, 那不是市场事实。当天报告里
+        # 它以 -1.1 亮了旗标 (五轮评审后的六轮观测)
+        from unittest.mock import patch
+        ch = self._chain(100.0, self.NORMAL_SKEW)
+        seq = [self._leg(v, v < -1.0)
+               for v in (-1.96, -1.14, -0.95, -0.73, -0.29)]
+        with patch.object(sc, "_rr_at_forward",
+                          side_effect=lambda *a, **k: seq.pop(0)):
+            out = sc.rr25_snapshot(_FakeCC(ch), 100.0, sc.SETTINGS_DEFAULTS)
+        self.assertIsNone(out)
+
+    def test_unanimous_verdict_survives_and_reports_dispersion(self):
+        # 同日 GLD 的形态: 五个候选全在 -1.85 附近 — 判定一致, 是真读数。
+        # 散布随读数带出来, 让人能自己判置信度
+        from unittest.mock import patch
+        ch = self._chain(100.0, self.NORMAL_SKEW)
+        vals = (-1.88, -1.85, -1.85, -1.84, -1.83)
+        seq = [self._leg(v, True) for v in vals]
+        with patch.object(sc, "_rr_at_forward",
+                          side_effect=lambda *a, **k: seq.pop(0)):
+            out = sc.rr25_snapshot(_FakeCC(ch), 100.0, sc.SETTINGS_DEFAULTS)
+        self.assertIsNotNone(out)
+        self.assertTrue(out["inverted"])
+        self.assertAlmostEqual(out["rr"], -1.85, places=2)   # 取中位那份
+        self.assertAlmostEqual(out["rr_dispersion"], 0.05, places=2)
+
+    def test_unanimous_not_inverted_also_survives(self):
+        # 一致判"不倒挂"同样是有效读数 — 门管的是判定分裂, 不是方向
+        from unittest.mock import patch
+        ch = self._chain(100.0, self.NORMAL_SKEW)
+        seq = [self._leg(v, False) for v in (0.14, 0.23, 0.48, 0.55, 0.56)]
+        with patch.object(sc, "_rr_at_forward",
+                          side_effect=lambda *a, **k: seq.pop(0)):
+            out = sc.rr25_snapshot(_FakeCC(ch), 100.0, sc.SETTINGS_DEFAULTS)
+        self.assertIsNotNone(out)
+        self.assertFalse(out["inverted"])
+
     def test_forward_chaotic_parity_is_no_reading(self):
         # 多数档都在漂 = 报价面自相矛盾 — 中位数救不了, 极差门拒掉整个
         # 读数 (宁缺毋错; 借券费是全曲线一致平移, 极差不受影响不会误伤)
