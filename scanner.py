@@ -136,7 +136,9 @@ SETTINGS_DEFAULTS = {
     # 灭 <=2 个离群档; 0.8% 极差再兜住"多数档都在漂"的乱报价面 (借券费
     # 是全曲线一致的平移, 极差不受影响, 难借券标的照常有读数)
     "rr_forward_pairs": 5,
-    "rr_forward_max_disp": 0.008,
+    "rr_forward_max_disp": 0.008,     # 粗筛: 报价面整体自相矛盾时直接放弃
+    # 旗标的可信度门不设成数值阈值 —— 见 rr25_snapshot: 候选 forward 之间
+    # 必须对"是否倒挂"给出**一致判定**, 不一致就没有读数。
     # forward 反解 spot 与日线收盘的差超此值 = 日线陈旧。35 DTE 的正常持有
     # 成本 |F/S-1| = |e^((r-q)T)-1| 约 0.3%, 1.5% 已是其 5 倍; 难借券的负
     # rebate 可能触发, 但那种标的本来也值得看一眼 (2026-09-04 实测: 陈旧
@@ -569,6 +571,7 @@ def fetch_regime(s: dict) -> dict:
     # a provisional intraday point on top — a day-one inversion must gate
     # TODAY's tickets, not tomorrow's.
     intraday = False
+    intraday_date = None
     try:
         v_now, v_ts = _cboe_delayed("VIX")
         v3_now, v3_ts = _cboe_delayed("VIX3M")
@@ -580,6 +583,7 @@ def fetch_regime(s: dict) -> dict:
             vix3m = pd.concat(
                 [vix3m[vix3m.index < stamp], pd.Series([v3_now], index=[stamp])])
             intraday = True
+            intraday_date = str(today_et)
     except Exception:
         pass  # settled series still stands; staleness warning covers the gap
 
@@ -603,6 +607,7 @@ def fetch_regime(s: dict) -> dict:
         "last_episode": episodes[-1] if episodes else None,
         "as_of": as_of,
         "source": source, "stale_days": age_days, "intraday": intraday,
+        "intraday_date": intraday_date,
         "vx": vx,
         "halt_csp": gates["halt_csp"],
         "halt_new_longs": gates["halt_new_longs"],
@@ -932,6 +937,30 @@ def _rr_mark(row, cutoff, s: dict) -> float | None:
     return mid
 
 
+def parity_forwards(calls, puts, T: float, cutoff, s: dict) -> list[float]:
+    """初判 F₀ 附近的 rr_forward_pairs 个候选 forward, 已排序。
+
+    调用方对每个候选各算一次 RR, 用**读数本身的散布**判可信度 —— 见
+    rr_max_dispersion_pts 的注释: 以 forward 百分比表述的门放行了远超
+    RR 地板的噪声。可用档 <2 (无从交叉验证) 时返回空表。"""
+    if calls is None or puts is None or calls.empty or puts.empty:
+        return []
+    cmid, pmid = {}, {}
+    for df, out in ((calls, cmid), (puts, pmid)):
+        for _, row in df.iterrows():
+            mid = _rr_mark(row, cutoff, s)
+            if mid is not None:
+                out[float(row["strike"])] = mid
+    common = set(cmid) & set(pmid)
+    if len(common) < 2:
+        return []
+    carry = math.exp(RATE * T)
+    k0 = min(common, key=lambda x: abs(cmid[x] - pmid[x]))
+    f0 = k0 + carry * (cmid[k0] - pmid[k0])
+    picks = sorted(common, key=lambda x: abs(x - f0))[:s["rr_forward_pairs"]]
+    return sorted(k + carry * (cmid[k] - pmid[k]) for k in picks)
+
+
 def forward_from_parity(calls, puts, T: float, cutoff, s: dict) -> float | None:
     """由 put-call parity 反解该到期日的 forward: C - P = e^(-rT)(F - K)
     → F = K + e^(rT)(C - P)。
@@ -954,22 +983,9 @@ def forward_from_parity(calls, puts, T: float, cutoff, s: dict) -> float | None:
     rr_forward_max_disp 或只剩一档 (无从交叉验证) = 报价面自相矛盾,
     返回 None — 与 25Δ 容差同一取舍: 宁缺毋错。借券费是全曲线一致的
     平移, 极差不受影响, 难借券标的照常有读数。"""
-    if calls is None or puts is None or calls.empty or puts.empty:
+    fwds = parity_forwards(calls, puts, T, cutoff, s)
+    if not fwds:
         return None
-    cmid, pmid = {}, {}
-    for df, out in ((calls, cmid), (puts, pmid)):
-        for _, row in df.iterrows():
-            mid = _rr_mark(row, cutoff, s)
-            if mid is not None:
-                out[float(row["strike"])] = mid
-    common = set(cmid) & set(pmid)
-    if len(common) < 2:
-        return None
-    carry = math.exp(RATE * T)
-    k0 = min(common, key=lambda x: abs(cmid[x] - pmid[x]))
-    f0 = k0 + carry * (cmid[k0] - pmid[k0])
-    picks = sorted(common, key=lambda x: abs(x - f0))[:s["rr_forward_pairs"]]
-    fwds = sorted(k + carry * (cmid[k] - pmid[k]) for k in picks)
     n = len(fwds)
     med = fwds[n // 2] if n % 2 else (fwds[n // 2 - 1] + fwds[n // 2]) / 2
     if med <= 0 or (fwds[-1] - fwds[0]) / med > s["rr_forward_max_disp"]:
@@ -989,12 +1005,38 @@ def rr25_snapshot(cc: ChainCache, spot: float, s: dict) -> dict | None:
     ch = cc.chain(exp)
     cutoff = _stale_cutoff()
     T = dte / 365.0
-    # forward 拿不到就没有读数 — 绝不退回可能陈旧的外部 spot
-    fwd = forward_from_parity(ch.calls, ch.puts, T, cutoff, s)
-    if fwd is None:
+    # 逐个候选 forward 各算一份读数, 用**读数散布**判可信度 (见
+    # rr_max_dispersion_pts): 以 forward 百分比表述的门量纲错了, 放行的
+    # 噪声可达地板的四倍。拿不到候选就没有读数 — 绝不退回可能陈旧的外部 spot
+    fwds = parity_forwards(ch.calls, ch.puts, T, cutoff, s)
+    if not fwds:
         return None
-    # 零股息 BS 里代入 S_eff = F·e^(-rT) 就等价于带股息/持有成本的定价
-    # (S·e^(-qT) = F·e^(-rT)), 不必改 bs_price/bs_delta 的签名
+    if forward_from_parity(ch.calls, ch.puts, T, cutoff, s) is None:
+        return None                      # 粗筛: 报价面整体自相矛盾
+    readings = [(f, _rr_at_forward(ch, f, T, cutoff, s)) for f in fwds]
+    readings = [(f, o) for f, o in readings if o is not None]
+    if not readings:
+        return None
+    rr_vals = [o["rr"] for _f, o in readings]
+    disp = max(rr_vals) - min(rr_vals)
+    if len({o["inverted"] for _f, o in readings}) > 1:
+        # 候选之间对"是否倒挂"意见不一 —— 结论取决于挑了哪个 forward,
+        # 那不是市场事实。**散布多大本身无所谓, 跨过判定边界才致命**:
+        # 2026-09-05 实测 GOOG 五个候选 -1.96/-1.14/-0.95/-0.73/-0.29,
+        # 两个越过 1.0 地板三个没越过 (当天报告里它以 -1.1 亮了旗标);
+        # 同日 GLD 五个全在 -1.85 附近、SOFI 全在 -1.2 以下 —— 那才是
+        # 稳的读数。用散布数值当门会两头不讨好: 极差 (max-min) 对单个
+        # 离群档过敏, 等于把中位数的鲁棒性又扔掉; 截尾极差则所有标的
+        # 都 <=0.41, 门形同虚设
+        return None
+    fwd, out = readings[len(readings) // 2]      # 取中位 forward 的那份
+    s_eff = fwd * math.exp(-RATE * T)
+    out["rr_dispersion"] = disp
+    return _finish_rr(out, exp, dte, fwd, s_eff, spot)
+
+
+def _rr_at_forward(ch, fwd: float, T: float, cutoff, s: dict) -> dict | None:
+    """给定一个 forward, 算一份 25Δ RR 读数 (纯计算, 不再取数)。"""
     s_eff = fwd * math.exp(-RATE * T)
     sides = []
     for df, is_call in ((ch.calls, True), (ch.puts, False)):
@@ -1019,15 +1061,17 @@ def rr25_snapshot(cc: ChainCache, spot: float, s: dict) -> dict | None:
                              "delta": bs_delta(s_eff, strike, T, RATE, iv,
                                                is_call)})
         sides.append(rows)
-    out = rr25(sides[0], sides[1], s["rr_delta_tol"],
-               s["rr_invert_min_pts"])
-    if out is not None:
-        # forward 反解出的现货 vs 传进来的日线收盘 — 正常只差个股息/借券,
-        # 差得多就是那根日线陈旧/缺失, 意味着**整份报告**的价格与状态都不
-        # 可信 (RR 本身已改用 forward, 不受影响)
-        gap = (s_eff / spot - 1) * 100 if spot else None
-        out.update({"exp": exp, "dte": dte, "forward": fwd,
-                    "fwd_spot": s_eff, "spot_gap_pct": gap})
+    return rr25(sides[0], sides[1], s["rr_delta_tol"], s["rr_invert_min_pts"])
+
+
+def _finish_rr(out: dict, exp: str, dte: int, fwd: float, s_eff: float,
+               spot: float) -> dict:
+    # forward 反解出的现货 vs 传进来的日线收盘 — 正常只差个股息/借券,
+    # 差得多就是那根日线陈旧/缺失, 意味着**整份报告**的价格与状态都不
+    # 可信 (RR 本身已改用 forward, 不受影响)
+    gap = (s_eff / spot - 1) * 100 if spot else None
+    out.update({"exp": exp, "dte": dte, "forward": fwd,
+                "fwd_spot": s_eff, "spot_gap_pct": gap})
     return out
 
 
@@ -1643,7 +1687,8 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
                 f"⚠️ 25Δ risk reversal 倒挂 ({rr['exp']}: "
                 f"{rr['call_strike']:g}C IV {rr['call_iv'] * 100:.1f}% > "
                 f"{rr['put_strike']:g}P IV {rr['put_iv'] * 100:.1f}%, "
-                f"RR {rr['rr']:+.1f} pts) — 上涨追逐挤压 (2021 meme 形态): "
+                f"RR {rr['rr']:+.1f} pts, 跨 forward 散布 "
+                f"{rr.get('rr_dispersion', 0):.1f}) — 上涨追逐挤压 (2021 meme 形态): "
                 "CSP 对下行风险结构性少收钱 (行权价放更远或跳过); "
                 "OTM/ATM LEAP 在付倒挂税, 只用 deep ITM/正股; "
                 "covered call/PMCC 短腿溢价异常肥 — 只 covered 不裸卖")
@@ -1960,8 +2005,13 @@ def regime_block(regime: dict) -> list[str]:
         f"- VIX **{regime['vix']:.2f}** | VIX3M {regime['vix3m']:.2f} | "
         f"ratio **{regime['ratio']:.3f}**"
         + (f" | VXN {regime['vxn']:.2f}" if regime["vxn"] else "")
-        + f"  (as of {regime['as_of']}, {regime['source']}"
-        + (", 含盘中临时点·延迟15min" if regime.get("intraday") else "") + ")",
+        # 与 VVIX/MOVE 同口径: 嫁接了盘中点就报盘中日期, 结算日放括号里。
+        # 此前这行固定显示结算日 (前一交易日), 而相邻的 VVIX 行显示当日
+        # "盘中" —— 同一段里两套写法, 驱动整个 regime 判定的那行看起来最旧
+        + (f"  (as of {regime['intraday_date']} 盘中·延迟15min "
+           f"[结算 {regime['as_of']}], {regime['source']})"
+           if regime.get("intraday")
+           else f"  (as of {regime['as_of']}, {regime['source']})"),
         f"- 阶段: **{regime['stage']}** — {REGIME_NOTES[regime['stage']]}",
     ]
     vx = regime.get("vx") or {}
