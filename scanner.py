@@ -699,14 +699,18 @@ def next_state(prev: str, *, close: float, sma20: float, confirmed: bool,
     elif close < sma20:
         if in_zone:
             state = "LEFT_ZONE"
-            if close < zone[0]:
-                notes.append("已跌破价值区下沿 — 剧本: 检查论点是否失效, 而不是继续摊")
         elif near_zone:
             state = "NEAR_ZONE"
         else:
             state = "PULLBACK"
     else:
         state = "UPTREND"
+    # 破下沿 = 论点检查, 纯价格判定, 与状态标签解耦 — 原来绑在 LEFT_ZONE
+    # 分支里, 破下沿后反弹站上塌陷的 20 日线 (UPTREND/TREND) 或止损转
+    # PULLBACK 当日就一声不响, 而 CSP/分批档位照常可执行 (zone 评审):
+    # 警告必须跟着价格走, 不跟状态标签走
+    if zone is not None and close < zone[0]:
+        notes.append("已跌破价值区下沿 — 剧本: 检查论点是否失效, 而不是继续摊")
     return state, notes
 
 
@@ -1176,6 +1180,12 @@ def _finish_csp(c: dict, spot: float, s: dict, zone, panic: bool,
         notes.append("盘口不可用, 按最近成交价估算 — 下单前实查")
     if zone is not None and c["strike"] > zone[1]:
         notes.append(f"行权价高于价值区上沿 {zone[1]:g} — 被行权成本不在接货区, 可下移到 <= {zone[1]:g}")
+    if zone is not None and spot < zone[0]:
+        # 破下沿的票必须自带论点检查前置 — strike<=上沿的硬 cap 只保证接货
+        # 价不高, 保证不了论点还活着 (zone 评审: RKLB [45,57.5] 跌到 40 时
+        # 照常铸 32-34P 置顶, 全报告可以零警告)
+        notes.insert(0, "⚠️ 现价已破价值区下沿 — 剧本: 先过论点检查再卖; "
+                        "论点失效则跳过, 仍成立则重锚 zone 后再挂")
     c["notes"] = notes
     return c
 
@@ -1586,6 +1596,9 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
                 "右侧确认需 61 根日线, 当前只看价格/20日线/价值区")
         if zone is not None:
             r["zone_dist_pct"] = (tech["close"] / zone[1] - 1) * 100
+        # 与 next_state/_finish_csp 的下沿判定同一口径 — note 给人读,
+        # 这个旗标给 action_block 等渲染路由用
+        r["below_floor"] = zone is not None and tech["close"] < zone[0]
 
         if not fetch_options:
             return r
@@ -1928,6 +1941,12 @@ def action_block(results: list[dict], ivdf) -> list[str]:
         if _has_stop(r):
             items.append((sym, f"- ⚠️ **{sym}** 右侧止损: 收盘跌破20日线 — "
                                "凸性档减半 / 结构破清仓"))
+        # 破下沿的可执行票在第一屏就要带着论点检查, 不能只藏在详情区
+        # note 里; CSP/LEAP/spread 同权 — 破自己接货带下沿时开新多头的
+        # 论点检查分量不低于卖 put (CONFIRMED+破下沿实测可达: 深跌后
+        # 不再新低+突破前20日高即三选二)
+        floor_tag = ("⚠️破下沿·先过论点检查 — " if r.get("below_floor") else "")
+        floor_tagged = False
         leap, csp = r["leap"], r["csp"]
         if leap and "skip_reason" not in leap:
             ivp = self_ivp(ivdf, sym, r["iv30"]) if r["iv30"] else None
@@ -1935,19 +1954,21 @@ def action_block(results: list[dict], ivdf) -> list[str]:
                 items.append((sym, f"- 🟡 **{sym}** 右侧确认但自建IVP "
                                    f"{ivp:.0f}>60 — 改 spread/PMCC (见下)"))
             else:
-                items.append((sym, f"- 🟢 **{sym}** LEAP: BUY {leap['exp']} "
+                items.append((sym, f"- 🟢 **{sym}** LEAP: {floor_tag}BUY {leap['exp']} "
                                    f"{leap['strike']:g}C @ ~{leap['mid']:.2f} "
                                    f"(delta {leap['delta']:.2f}, 详见下)"))
+                floor_tagged = floor_tagged or bool(floor_tag)
         elif _regime_halted(leap):
             if sym not in halted:
                 halted.append(sym)
         elif leap:
             items.append((sym, f"- ⏸ **{sym}** LEAP: {leap['skip_reason']}"))
         if csp and "skip_reason" not in csp:
-            items.append((sym, f"- 🔵 **{sym}** CSP: SELL {csp['exp']} "
+            items.append((sym, f"- 🔵 **{sym}** CSP: {floor_tag}SELL {csp['exp']} "
                                f"{csp['strike']:g}P @ ~{csp['mid']:.2f} "
                                f"(delta {csp['delta']:.2f}, 年化 "
                                f"~{csp['annualized_pct']:.0f}%, 详见下)"))
+            floor_tagged = floor_tagged or bool(floor_tag)
         elif _regime_halted(csp):
             if sym not in halted:
                 halted.append(sym)
@@ -1955,10 +1976,11 @@ def action_block(results: list[dict], ivdf) -> list[str]:
             items.append((sym, f"- ⏸ **{sym}** CSP: {csp['skip_reason']}"))
         spread = r.get("spread")
         if spread and "skip_reason" not in spread:
-            items.append((sym, f"- 🟣 **{sym}** 回踩 spread: BUY {spread['exp']} "
+            items.append((sym, f"- 🟣 **{sym}** 回踩 spread: {floor_tag}BUY {spread['exp']} "
                                f"{spread['long_strike']:g}C / SELL "
                                f"{spread['short_strike']:g}C 净支出 "
                                f"~{spread['debit']:.2f} (详见下)"))
+            floor_tagged = floor_tagged or bool(floor_tag)
         elif _regime_halted(spread):
             if sym not in halted:
                 halted.append(sym)
@@ -1967,6 +1989,12 @@ def action_block(results: list[dict], ivdf) -> list[str]:
         elif r.get("retest"):
             items.append((sym, f"- 👀 **{sym}** 首次回踩20日线不破 — 剧本首选"
                                "加仓点 (3-6个月 call spread, 手动构造)"))
+        if r.get("below_floor") and not floor_tagged:
+            # 没有任何带前置的真票 (ladder-only 的 options=false 标的、
+            # CSP 被 skip/halt) — 破下沿恰是剧本要求做论点检查的日子,
+            # 不能让它落进"其余今日无动作"
+            items.append((sym, f"- ⚠️ **{sym}** 已破价值区下沿 — 剧本: 先过"
+                               "论点检查; 分批档/被拦票见下, 别按旧接货档继续摊"))
     if stale:
         # 手机上扫一眼的那一屏必须看得到 — 概览表里这些标的的收盘价与
         # 右侧状态都建立在过期日线上
@@ -2161,7 +2189,13 @@ def render_close(results, regime, ivdf, now_et) -> str:
                 for n in csp["notes"]:
                     lines.append(f"  - {n}")
                 zone = r["cfg"]["value_zone"]
-                if zone is not None and csp["strike"] <= zone[1]:
+                if zone is not None and csp["strike"] < zone[0]:
+                    # GOOG [315,340] 在区内时 delta 带常选到 310-312.5P —
+                    # 低于下沿, 说"在价值区内"字面为假
+                    lines.append(f"  - 愿意接货档 (行权价已低于价值区下沿 "
+                                 f"{zone[0]:g}): 拿到到期, 跌破行权价 = 接货"
+                                 "流程; 赚 50-60% 权利金可提前收")
+                elif zone is not None and csp["strike"] <= zone[1]:
                     lines.append("  - 愿意接货档 (行权价在价值区内): 拿到到期, "
                                  "跌破行权价 = 接货流程; 赚 50-60% 权利金可提前收")
                 else:
@@ -2173,9 +2207,14 @@ def render_close(results, regime, ivdf, now_et) -> str:
             widening = (ladder[1] - ladder[2]) > (ladder[0] - ladder[1])
             spacing_note = ("间距递增" if widening else
                             "区间较宽, 末档间距未递增 — 剧本要求间距递增, 自行加深恐慌档")
+            # 档位是 GTC 限价买单位 — 已在现价上方的档挂上去会立即成交,
+            # 必须点名 (区内标的的 ① 档天然高于现价; 破下沿时 ①② 都是)
+            above = sum(1 for x in ladder if x > t["close"])
+            pos_note = (f"前 {above} 档已在现价上方, 挂 GTC 会立即成交 — "
+                        "按现价决策, 别机械挂单; " if above else "")
             lines.append(
                 f"- 正股分批档位: ① {ladder[0]:g} ② {ladder[1]:g} "
-                f"③ {ladder[2]:g} (恐慌档) — {spacing_note}; 总仓位按\"还能再跌"
+                f"③ {ladder[2]:g} (恐慌档) — {pos_note}{spacing_note}; 总仓位按\"还能再跌"
                 f"30-50%\"定, 打完末档仍扛得住再跌; 止损靠论点失效不靠价格")
         leap = r["leap"]
         if leap:
@@ -2254,7 +2293,13 @@ def render_open(results, regime, now_et, s: dict) -> str:
             alerts.append(f"- **{sym}** 盘初波动 {t['change_pct']:+.1f}% "
                           f"(现价 {t['close']:.2f})")
         zone = r["cfg"]["value_zone"]
-        if zone and t["close"] <= zone[1]:
+        if zone and t["close"] < zone[0]:
+            # 破下沿 ≠ 在价值区内 — 剧本这时要的是论点检查, 不是接货动作;
+            # 原来两种情形同一句"核对 CSP 挂单/接货档位"会催人继续摊
+            alerts.append(f"- **{sym}** 已跌破价值区下沿 ({zone[0]:g}-{zone[1]:g}, "
+                          f"现价 {t['close']:.2f}) — 剧本: 检查论点是否失效, "
+                          f"而不是按旧接货档继续摊")
+        elif zone and t["close"] <= zone[1]:
             alerts.append(f"- **{sym}** 在价值区内 ({zone[0]:g}-{zone[1]:g}, "
                           f"现价 {t['close']:.2f}) — 核对 CSP 挂单/接货档位")
         if r.get("prev_state") in ("CONFIRMED", "TREND") and t["close"] < t["sma20"]:
