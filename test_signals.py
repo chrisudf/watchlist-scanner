@@ -8,8 +8,10 @@ No network access needed — everything here is synthetic data.
 import io
 import json
 import math
+import tempfile
 import unittest
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -1137,6 +1139,87 @@ class TestActionBlockHaltDedup(unittest.TestCase):
         self.assertIn("⏸ **AAA** CSP: 年化仅", text)
         self.assertIn("⏸ **AAA** LEAP: 财报", text)
         self.assertNotIn("全市场硬停牌", text)
+
+
+class TestLoadConfig(unittest.TestCase):
+    """配置错误要在装载时炸 (zone 评审): 字符串 zone 此前能穿过校验,
+    运行期变成被宽 except 吞掉的 TypeError; 拼错的键静默落回默认值;
+    [tickers.spcx]+[tickers.SPCX] 合法共存, upper() 后 last-wins 丢条目。"""
+
+    def _load(self, text):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "watchlist.toml"
+            p.write_text(text, encoding="utf-8")
+            return sc.load_config(p)
+
+    def test_valid_config_loads_and_normalizes_zone(self):
+        s, t = self._load(
+            "[settings]\nnear_zone_pct = 4.0\n"
+            "[tickers.rklb]\nhigh_beta = true\nvalue_zone = [45, 57.5]\n")
+        self.assertEqual(s["near_zone_pct"], 4.0)
+        self.assertEqual(t["RKLB"]["value_zone"], [45.0, 57.5])
+        self.assertIsInstance(t["RKLB"]["value_zone"][0], float)
+
+    def test_repo_watchlist_still_loads(self):
+        # 白名单/类型门不得误伤真实配置文件
+        s, t = sc.load_config()
+        self.assertTrue(t)
+
+    def test_unknown_settings_key_raises(self):
+        # 已知 D1: vvix_halt 拼成 vivx_halt → 默认值顶着你以为改过的名字生效
+        with self.assertRaises(ValueError):
+            self._load("[settings]\nvivx_halt = 105\n[tickers.QQQ]\n")
+
+    def test_settings_value_type_gated(self):
+        # TOML 引号手滑: 键名合法、值是字符串 — 会在 render_open 的
+        # abs(gap) >= s[...] 处裸崩 (宽 except 之外), 无报告无邮件
+        with self.assertRaises(ValueError):
+            self._load('[settings]\ngap_alert_pct = "1.5"\n[tickers.QQQ]\n')
+        with self.assertRaises(ValueError):
+            self._load("[settings]\nvvix_halt = true\n[tickers.QQQ]\n")
+        with self.assertRaises(ValueError):
+            self._load("[settings]\ncsp_dte_normal = [12]\n[tickers.QQQ]\n")
+        # int 给 float 键是合法宽容 (TOML 里 5 与 5.0 都常见)
+        s, _ = self._load("[settings]\nnear_zone_pct = 5\n[tickers.QQQ]\n")
+        self.assertEqual(s["near_zone_pct"], 5)
+
+    def test_unknown_ticker_key_raises(self):
+        with self.assertRaises(ValueError):
+            self._load("[tickers.QQQ]\nvalue_zon = [600, 700]\n")
+
+    def test_string_zone_raises(self):
+        with self.assertRaises(ValueError):
+            self._load('[tickers.GOOG]\nvalue_zone = ["315", "340"]\n')
+
+    def test_scalar_zone_raises_valueerror_not_typeerror(self):
+        # 旧代码在 len(int) 处裸崩 TypeError, 整个 load 无提示炸掉
+        with self.assertRaises(ValueError):
+            self._load("[tickers.GOOG]\nvalue_zone = 315\n")
+
+    def test_bool_zone_raises(self):
+        with self.assertRaises(ValueError):
+            self._load("[tickers.GOOG]\nvalue_zone = [true, 340]\n")
+
+    def test_nonfinite_zone_raises(self):
+        with self.assertRaises(ValueError):
+            self._load("[tickers.GOOG]\nvalue_zone = [315, inf]\n")
+        with self.assertRaises(ValueError):
+            self._load("[tickers.GOOG]\nvalue_zone = [nan, 340]\n")
+
+    def test_reversed_or_nonpositive_zone_raises(self):
+        with self.assertRaises(ValueError):
+            self._load("[tickers.GOOG]\nvalue_zone = [340, 315]\n")
+        with self.assertRaises(ValueError):
+            self._load("[tickers.GOOG]\nvalue_zone = [0, 340]\n")
+
+    def test_case_collision_raises(self):
+        with self.assertRaises(ValueError):
+            self._load("[tickers.spcx]\noptions = false\n"
+                       "[tickers.SPCX]\nkind = \"stock\"\n")
+
+    def test_empty_tickers_raises(self):
+        with self.assertRaises(ValueError):
+            self._load("[settings]\nnear_zone_pct = 5.0\n")
 
 
 class TestActionBlockFloorTag(unittest.TestCase):

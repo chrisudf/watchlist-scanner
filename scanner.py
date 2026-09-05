@@ -147,18 +147,66 @@ SETTINGS_DEFAULTS = {
 }
 
 
+def _valid_zone(zone) -> bool:
+    """[低, 高] 两个有限正数, 低 < 高。bool 是 int 的子类, 显式排除。"""
+    return (isinstance(zone, (list, tuple)) and len(zone) == 2
+            and all(isinstance(x, (int, float)) and not isinstance(x, bool)
+                    and math.isfinite(x) for x in zone)
+            and 0 < zone[0] < zone[1])
+
+
 def load_config(path: Path = CONFIG_FILE) -> tuple[dict, dict]:
-    """-> (settings, {symbol: ticker_cfg}). Ticker order follows the file."""
+    """-> (settings, {symbol: ticker_cfg}). Ticker order follows the file.
+
+    配置错误在装载时就炸, 不留到运行期 (zone 评审): 手编 15 行 zone 的
+    那天, 一个字符串 zone / 拼错的键 / 大小写重复条目在这里报错是一条
+    带原因的 ValueError; 漏到运行期就是每天扫描里被宽 except 吞掉的
+    TypeError, 或者阈值默认值顶着你以为改过的名字继续生效。"""
     with open(path, "rb") as f:
         raw = tomllib.load(f)
-    settings = {**SETTINGS_DEFAULTS, **raw.get("settings", {})}
+    settings_raw = raw.get("settings", {})
+    unknown = set(settings_raw) - set(SETTINGS_DEFAULTS)
+    if unknown:
+        raise ValueError(f"[settings] 未知键 (typo?): {', '.join(sorted(unknown))}")
+    for k, v in settings_raw.items():
+        # 值类型跟着默认值走 — TOML 引号手滑 (gap_alert_pct = "1.5")
+        # 会穿过键白名单, 在 render_open 的比较处裸崩且没有报告
+        default = SETTINGS_DEFAULTS[k]
+        if isinstance(default, bool):
+            ok = isinstance(v, bool)
+        elif isinstance(default, (int, float)):
+            ok = isinstance(v, (int, float)) and not isinstance(v, bool)
+        elif isinstance(default, list):
+            ok = (isinstance(v, (list, tuple)) and len(v) == len(default)
+                  and all(isinstance(x, (int, float))
+                          and not isinstance(x, bool) for x in v))
+        else:
+            ok = isinstance(v, type(default))
+        if not ok:
+            raise ValueError(f"[settings] {k} 类型错误: 期望与默认值 "
+                             f"{default!r} 同类, 得到 {v!r}")
+    settings = {**SETTINGS_DEFAULTS, **settings_raw}
     tickers = {}
     for sym, tcfg in raw.get("tickers", {}).items():
+        unknown = set(tcfg) - set(TICKER_DEFAULTS)
+        if unknown:
+            raise ValueError(
+                f"[tickers.{sym}] 未知键 (typo?): {', '.join(sorted(unknown))}")
         cfg = {**TICKER_DEFAULTS, **tcfg}
         zone = cfg["value_zone"]
-        if zone is not None and (len(zone) != 2 or zone[0] >= zone[1]):
-            raise ValueError(f"{sym}: value_zone must be [low, high]")
-        tickers[sym.upper()] = cfg
+        if zone is not None:
+            if not _valid_zone(zone):
+                raise ValueError(
+                    f"{sym}: value_zone 必须是 [低, 高] 两个正数 "
+                    f"(低 < 高), 得到 {zone!r}")
+            # 统一成 float — TOML 里 [45, 57.5] 混用 int/float 是合法的
+            cfg["value_zone"] = [float(zone[0]), float(zone[1])]
+        key = sym.upper()
+        if key in tickers:
+            # [tickers.spcx] 与 [tickers.SPCX] 是合法的两张 TOML 表 —
+            # upper() 归一后 last-wins 会静默丢前者
+            raise ValueError(f"[tickers] 重复条目 (含大小写差异): {key}")
+        tickers[key] = cfg
     if not tickers:
         raise ValueError("watchlist.toml has no [tickers.*] entries")
     return settings, tickers
