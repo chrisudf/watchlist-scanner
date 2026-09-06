@@ -494,10 +494,10 @@ class TestEmailHtml(unittest.TestCase):
         # Gmail 超过 ~102KB 会截断成 "[Message clipped]" — 报告被静默切掉
         # 一半比不发还糟。20 只标的的概览表 + 每只两行 note 是个偏悲观的
         # 规模, 留足余量。
-        head = "| 标的 | 状态 | 操作 | 收盘 | Δ% | vs20日 | 量比 | 三选二 | 价值区 | iv/rv | IVP |"
+        head = "| 标的 | 价值区 | 状态 | 操作 | 收盘 | Δ% | vs20日 | 量比 | 三选二 | iv/rv | IVP |"
         sep = "|" + "---|" * 11
-        rows = ["| SYM%02d | 回调中(20日线下) | 设区间 | 709.24 | +1.2 | -0.0%% "
-                "| 1.0x | 低✓ 收· 破· | 380-440 (上方+16%%) | 25/47%% | 62 |" % i
+        rows = ["| SYM%02d | 380-440 (上方+16%%) | 回调中(20日线下) | 设区间 "
+                "| 709.24 | +1.2 | -0.0%% | 1.0x | 低✓ 收· 破· | 25/47%% | 62 |" % i
                 for i in range(20)]
         notes = []
         for i in range(20):
@@ -528,6 +528,17 @@ class TestEmailHtml(unittest.TestCase):
         self.assertIn("709.24", cards)
         self.assertIn("量比", cards)
         self.assertNotIn("价值区", cards)          # 空值列不占位
+
+    def test_narrow_card_subtitle_follows_state_column(self):
+        # 概览表把价值区提到第二列后, 卡片标题旁的副标题必须还是状态 —
+        # 按列序写死会变成 "QQQ 未设" (无 zone 的标的) 或 "SYM —"
+        md = ("| 标的 | 价值区 | 状态 | 收盘 |\n|---|---|---|---|\n"
+              "| QQQ | 未设 | 回调中 | 709.24 |")
+        cards = sc.md_to_email_html(md).split('class="wl-narrow"')[1]
+        title = cards[cards.index("QQQ"):cards.index("</div>")]
+        self.assertIn("回调中", title)             # 副标题 = 状态
+        self.assertNotIn("未设", title)            # 不是价值区, 更不是空值
+        self.assertIn("收盘", cards)               # 其余列照常带标签摊开
 
     def test_resend_payload_carries_both_text_and_html(self):
         from unittest.mock import patch, MagicMock
@@ -1425,6 +1436,10 @@ class TestRenderOpenZoneAlert(unittest.TestCase):
         self.assertIn("核对 CSP 挂单", text)
 
 
+def _split(row: str) -> list[str]:
+    return [c.strip() for c in row.strip().strip("|").split("|")]
+
+
 def _ohlcv_downtrend(last_close: float, n: int = 70) -> pd.DataFrame:
     """单调下行、收在 last_close 的合成 OHLCV — 喂 technical_snapshot 够用。"""
     idx = pd.bdate_range("2026-05-01", periods=n)
@@ -1506,6 +1521,16 @@ class TestRenderCloseZoneLines(unittest.TestCase):
         text = self._render(self._result(335.31, (315.0, 340.0), 310.0,
                                          ladder=[340.0, 315.0, 258.3]))
         self.assertIn("前 1 档已在现价上方", text)
+
+    def test_overview_puts_zone_next_to_symbol(self):
+        # 手机上"这票的接货带在哪"要和标的挨着 — 原来隔了 7 列 (状态/操作/
+        # 收盘/Δ%/vs20日/量比/三选二), 横向扫过去才对得上
+        text = self._render(self._result(335.31, (315.0, 340.0), 310.0))
+        self.assertIn("| 标的 | 价值区 | 状态 | 操作 |", text)
+        row = next(l for l in text.splitlines() if l.startswith("| XX |"))
+        self.assertEqual(_split(row)[1], "315-340 (区内)")
+        self.assertEqual(_split(row)[2], "价值区内(左侧)")
+        self.assertEqual(len(_split(row)), 11)     # 列数不变, 只换位
 
     def test_ladder_all_rungs_below_close_no_note(self):
         text = self._render(self._result(400.0, (315.0, 340.0), 310.0,

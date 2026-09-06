@@ -2155,14 +2155,14 @@ def render_close(results, regime, ivdf, now_et) -> str:
 
     ordered = by_actionability(results)
     lines += ["## 概览 (按可操作性排序)", "",
-              "| 标的 | 状态 | 操作 | 收盘 | Δ% | vs20日 | 量比 | 三选二 "
-              "| 价值区 | iv/rv | IVP |",
+              "| 标的 | 价值区 | 状态 | 操作 | 收盘 | Δ% | vs20日 "
+              "| 量比 | 三选二 | iv/rv | IVP |",
               "|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in ordered:
         t = r["tech"]
         if t is None:
-            lines.append(f"| {r['symbol']} | {STATE_LABEL['NO_DATA']} | — | — "
-                         f"| — | — | — | — | — | — | — |")
+            lines.append(f"| {r['symbol']} | — | {STATE_LABEL['NO_DATA']} "
+                         f"| — | — | — | — | — | — | — | — |")
             continue
         zone = r["cfg"]["value_zone"]
         if zone:
@@ -2180,11 +2180,11 @@ def render_close(results, regime, ivdf, now_et) -> str:
                 if r["iv30"] and t["rv30"]
                 else fmt(r["iv30"] and r["iv30"] * 100, ".0f", "%"))
         lines.append(
-            f"| {r['symbol']} | {STATE_LABEL[r['state']]} "
+            f"| {r['symbol']} | {zone_s} | {STATE_LABEL[r['state']]} "
             f"| {action_label(r, ivp)} | {t['close']:.2f} "
             f"| {t['change_pct']:+.1f} | {t['vs_sma20_pct']:+.1f}% "
             f"| {t['vol_ratio']:.1f}x | {sig_marks(t['signals'])} "
-            f"| {zone_s} | {ivrv} | {fmt(ivp, '.0f')} |")
+            f"| {ivrv} | {fmt(ivp, '.0f')} |")
     lines += [
         "",
         "> 三选二: **低**=不再新低(近5日低点 > 前15日低点) · **收**=放量收复"
@@ -2464,12 +2464,18 @@ def _html_cards(rows: list[list[str]]) -> str:
     所以窄屏直接换布局: 首列 (标的) 当标题, 其余列摊成 `标签 值` 的流式
     文本, 自然换行。"""
     head, body = rows[0], rows[1:]
+    # 副标题认"状态"这一列, 不认列序 — 概览表把价值区提到了第二列
+    # (2026-09-06: 手机上标的与接货带要挨着看), 位置写死会把卡片标题
+    # 变成 "NVDA 未设", NO_DATA 行更是变成 "SYM —"
+    sub_i = head.index("状态") if "状态" in head else 1
     cards = []
     for row in body:
         title = _md_inline(row[0]) if row else ""
-        state = _md_inline(row[1]) if len(row) > 1 else ""
+        state = _md_inline(row[sub_i]) if len(row) > sub_i else ""
         bits = []
-        for label, val in zip(head[2:], row[2:]):
+        for i, (label, val) in enumerate(zip(head, row)):
+            if i in (0, sub_i):
+                continue
             v = val.strip()
             if not v or v in ("—", "-", "未设"):
                 continue
