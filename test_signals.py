@@ -1774,13 +1774,22 @@ def _split(row: str) -> list[str]:
     return [c.strip() for c in row.strip().strip("|").split("|")]
 
 
-def _ohlcv_downtrend(last_close: float, n: int = 70) -> pd.DataFrame:
-    """单调下行、收在 last_close 的合成 OHLCV — 喂 technical_snapshot 够用。"""
+def _ohlcv_downtrend(last_close: float, n: int = 70,
+                     split=None) -> pd.DataFrame:
+    """单调下行、收在 last_close 的合成 OHLCV — 喂 technical_snapshot 够用。
+    split=(距最后一根的交易日数, 比率) 时附带 Stock Splits 列 (模拟
+    batch_history 的 actions=True)。"""
     idx = pd.bdate_range("2026-05-01", periods=n)
     c = pd.Series([last_close + (n - 1 - i) * 0.5 for i in range(n)],
                   index=idx, dtype=float)
-    return pd.DataFrame({"Open": c, "High": c * 1.01, "Low": c * 0.99,
-                         "Close": c, "Volume": 1_000_000.0}, index=idx)
+    df = pd.DataFrame({"Open": c, "High": c * 1.01, "Low": c * 0.99,
+                       "Close": c, "Volume": 1_000_000.0}, index=idx)
+    if split is not None:
+        days_ago, ratio = split
+        col = pd.Series(0.0, index=idx)
+        col.iloc[-1 - days_ago] = ratio
+        df["Stock Splits"] = col
+    return df
 
 
 class TestAnalyzeTickerBelowFloor(unittest.TestCase):
@@ -1807,6 +1816,153 @@ class TestAnalyzeTickerBelowFloor(unittest.TestCase):
     def test_flag_false_without_zone(self):
         r = self._run(40.0, None)
         self.assertFalse(r["below_floor"])
+
+
+class TestSplitAfter(unittest.TestCase):
+    """拆股检测: auto_adjust 让价格自洽而手工 zone 死掉 — zone 评审认定的
+    唯一"一夜致死"路径。"""
+
+    def test_no_split_column_none(self):
+        self.assertIsNone(sc.split_after(_ohlcv_downtrend(50.0), "2026-01-01"))
+        self.assertIsNone(sc.split_after(None, "2026-01-01"))
+
+    def test_split_after_asof_detected(self):
+        out = sc.split_after(_ohlcv_downtrend(50.0, split=(5, 10.0)),
+                             "2026-01-01")
+        self.assertIsNotNone(out)
+        self.assertEqual(out[1], 10.0)
+
+    def test_split_before_asof_ignored(self):
+        hist = _ohlcv_downtrend(50.0, split=(60, 10.0))
+        asof = hist.index[-30].date().isoformat()   # 重锚发生在拆股之后
+        self.assertIsNone(sc.split_after(hist, asof))
+
+    def test_no_asof_uses_fallback_window(self):
+        self.assertIsNotNone(
+            sc.split_after(_ohlcv_downtrend(50.0, split=(5, 4.0)), None))
+        self.assertIsNone(     # ~2 个月前的拆股不在 30 日保守窗内
+            sc.split_after(_ohlcv_downtrend(50.0, split=(45, 4.0)), None))
+
+    def test_tz_aware_index(self):
+        # 生产 hist 的 index 可能是交易所本地时区的 tz-aware Timestamp
+        hist = _ohlcv_downtrend(50.0, split=(5, 10.0))
+        hist.index = hist.index.tz_localize("America/New_York")
+        self.assertIsNotNone(sc.split_after(hist, "2026-01-01"))
+
+    def test_multi_split_returns_latest(self):
+        hist = _ohlcv_downtrend(50.0, split=(20, 2.0))
+        hist.loc[hist.index[-6], "Stock Splits"] = 10.0
+        out = sc.split_after(hist, "2026-01-01")
+        self.assertEqual(out[1], 10.0)
+
+
+class TestZoneInvalidOnSplit(unittest.TestCase):
+    def _run(self, split):
+        cfg = {**sc.TICKER_DEFAULTS, "value_zone": [45.0, 57.5],
+               "zone_asof": "2026-05-10"}
+        return sc.analyze_ticker(
+            "XX", cfg, _ohlcv_downtrend(50.0, split=split), {},
+            {"stage": "NORMAL"}, sc.SETTINGS_DEFAULTS, "close",
+            fetch_options=False)
+
+    def test_split_invalidates_zone(self):
+        r = self._run((5, 10.0))
+        self.assertIn("拆股", r["zone_invalid"])
+        self.assertTrue(any("作废" in n for n in r["notes"]))
+        # 分析已按无 zone 跑: 不打左侧标签、无下沿旗标、watch 清空;
+        # 粘性标记已铸造 (随 next_persisted_state 入 state.json)
+        self.assertEqual(r["state"], "PULLBACK")
+        self.assertFalse(r["below_floor"])
+        self.assertIsNone(r["zone_watch"])
+        self.assertEqual(r["zone_split"]["sig"],
+                         sc.zone_sig([45.0, 57.5], "2026-05-10"))
+
+    def test_no_split_zone_intact(self):
+        r = self._run(None)
+        self.assertIsNone(r.get("zone_invalid"))
+        self.assertEqual(r["state"], "LEFT_ZONE")
+
+    def test_invalidation_sticky_after_window(self):
+        # 事件已滑出检测窗 (hist 里无 split 行) 但 state 里有粘性标记 →
+        # 仍作废: 无 zone_asof 的标的不会在 30 日 fallback 窗过后静默复活
+        cfg = {**sc.TICKER_DEFAULTS, "value_zone": [45.0, 57.5]}
+        prev = {"zone_split": {"sig": sc.zone_sig([45.0, 57.5], None),
+                               "info": "拆股 10:1 @ 2026-06-15"}}
+        r = sc.analyze_ticker("XX", cfg, _ohlcv_downtrend(5.0), prev,
+                              {"stage": "NORMAL"}, sc.SETTINGS_DEFAULTS,
+                              "close", fetch_options=False)
+        self.assertIn("拆股", r["zone_invalid"])
+        self.assertEqual(r["zone_split"], prev["zone_split"])
+        self.assertNotEqual(r["state"], "LEFT_ZONE")
+
+    def test_reanchor_clears_sticky_invalidation(self):
+        # 重锚 (区间数值变 → sig 变) → 标记不认: zone 恢复生效, r 不再
+        # 携带 zone_split (next_persisted_state 里键自然掉落)
+        cfg = {**sc.TICKER_DEFAULTS, "value_zone": [4.5, 5.75],
+               "zone_asof": "2026-09-06"}
+        prev = {"zone_split": {"sig": "45-57.5@未标",
+                               "info": "拆股 10:1 @ 2026-06-15"}}
+        r = sc.analyze_ticker("XX", cfg, _ohlcv_downtrend(5.0), prev,
+                              {"stage": "NORMAL"}, sc.SETTINGS_DEFAULTS,
+                              "close", fetch_options=False)
+        self.assertIsNone(r.get("zone_invalid"))
+        self.assertIsNone(r.get("zone_split"))
+        self.assertEqual(r["state"], "LEFT_ZONE")   # 5.0 ∈ [4.5, 5.75]
+
+    def test_persisted_state_carries_split_marker(self):
+        zs = {"sig": "45-57.5@未标", "info": "拆股 10:1 @ 2026-06-15"}
+        entry = sc.next_persisted_state(
+            {}, {"state": "PULLBACK", "zone_split": zs}, "2026-09-07")
+        self.assertEqual(entry["zone_split"], zs)
+        entry2 = sc.next_persisted_state(
+            {"zone_split": zs}, {"state": "PULLBACK"}, "2026-09-08")
+        self.assertNotIn("zone_split", entry2)
+
+    def test_reverse_split_wording(self):
+        cfg = {**sc.TICKER_DEFAULTS, "value_zone": [45.0, 57.5],
+               "zone_asof": "2026-05-10"}
+        r = sc.analyze_ticker("XX", cfg,
+                              _ohlcv_downtrend(200.0, split=(5, 0.25)), {},
+                              {"stage": "NORMAL"}, sc.SETTINGS_DEFAULTS,
+                              "close", fetch_options=False)
+        self.assertIn("合股 1:4", r["zone_invalid"])
+        self.assertNotIn("拆股 0.25", r["zone_invalid"])
+
+    def test_action_label_and_overview_column(self):
+        r = self._run((5, 10.0))
+        self.assertEqual(sc.action_label(r, None), "拆股·重锚区间")
+        ivdf = pd.DataFrame(columns=["date", "symbol", "iv30", "rv30"])
+        now = datetime(2026, 9, 4, 15, 45, tzinfo=sc.ET)
+        text = sc.render_close([r], dict(TestRenderOpenZoneAlert.REGIME),
+                               ivdf, now)
+        self.assertIn("作废", text)
+        self.assertNotIn("45-57.5 (", text)   # 概览不照印已作废的旧区间
+
+    def test_open_pass_alert_says_invalid_not_in_zone(self):
+        # 开盘警报读的是 cfg 里的旧区间 — zone 作废后不能照常催接货
+        r = self._run((5, 10.0))
+        r["prev_state"] = "UPTREND"
+        now = datetime(2026, 9, 4, 9, 45, tzinfo=sc.ET)
+        text = sc.render_open([r], dict(TestRenderOpenZoneAlert.REGIME),
+                              now, sc.SETTINGS_DEFAULTS)
+        self.assertIn("作废", text)
+        self.assertNotIn("在价值区内", text)
+        self.assertNotIn("已跌破价值区下沿", text)
+
+
+class TestIdentityMismatch(unittest.TestCase):
+    """kind=etf/index 却有真实财报日 = 身份体检 (SPCX 案 ~85 天无人发现)。"""
+
+    def test_etf_with_real_earnings_flags(self):
+        note = sc.identity_mismatch_note("etf", "2026-10-20")
+        self.assertIsNotNone(note)
+        self.assertIn("身份", note)
+
+    def test_quiet_cases(self):
+        self.assertIsNone(sc.identity_mismatch_note("etf", ""))
+        self.assertIsNone(sc.identity_mismatch_note("etf", None))
+        self.assertIsNone(sc.identity_mismatch_note("index", ""))
+        self.assertIsNone(sc.identity_mismatch_note("stock", "2026-10-20"))
 
 
 class TestZonePosition(unittest.TestCase):

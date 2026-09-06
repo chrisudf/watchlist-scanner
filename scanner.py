@@ -318,6 +318,10 @@ def next_persisted_state(prev: dict, r: dict, today: str) -> dict:
     # 负责沿用/归零), zone 被删时 r["zone_watch"] 为 None → 键自然消失
     if r.get("zone_watch"):
         entry["zone_watch"] = r["zone_watch"]
+    # 拆股作废的粘性标记: analyze_ticker 只在 sig 仍匹配时携带 —
+    # 重锚 (sig 变) 当日 r 不带, 键在这里自然掉落
+    if r.get("zone_split"):
+        entry["zone_split"] = r["zone_split"]
     # NORMAL 期 LEAP 被硬停牌拦下的补发标记: 确认转换是一次性的且会被
     # state.json 无条件消耗, halt 不该吞掉它 — 标记随右侧状态存活,
     # 止损出局 (转 PULLBACK) 即失效; 真票发出当日不再置位, 自然清除
@@ -845,6 +849,41 @@ STATE_LABEL = {
     "CONFIRMED": "右侧确认", "TREND": "右侧持仓(跟踪20日线)",
     "NO_DATA": "数据不足",
 }
+
+
+def split_after(hist, asof_iso: str | None, fallback_days: int = 30):
+    """zone_asof 之后 (缺失时: 最近 fallback_days 日历日内) 的拆股事件
+    -> (date_iso, ratio) | None。
+
+    auto_adjust=True 让历史价格自洽, 但手工 zone 是按旧股本写的 — 拆股
+    后 in_zone 恒真/恒假、strike<=上沿的硬 cap 失去束缚力, 会铸出标着
+    "愿意接货档"的近价 put (zone 评审: 唯一让 zone 一夜作废的路径)。
+    需要 batch_history 的 actions=True 才有 Stock Splits 列; 列缺失时
+    静默返回 None (VIX 侧等其他抓取路径不带该列)。"""
+    if hist is None or "Stock Splits" not in getattr(hist, "columns", ()):
+        return None
+    sp = hist["Stock Splits"]
+    sp = sp[sp.notna() & (sp != 0)]
+    if sp.empty:
+        return None
+    cutoff = (date.fromisoformat(asof_iso) if asof_iso
+              else hist.index[-1].date() - timedelta(days=fallback_days))
+    ev = sp[[ts.date() > cutoff for ts in sp.index]]
+    if ev.empty:
+        return None
+    return ev.index[-1].date().isoformat(), float(ev.iloc[-1])
+
+
+def identity_mismatch_note(kind: str, earnings) -> str | None:
+    """kind=etf/index 却查到真实财报日 = 标的身份可能已变 — ETF/指数没有
+    财报日历 (代码在两处都依赖"ETF 日历 404 是常态"这一事实), 反过来就是
+    零成本的身份体检。SPCX 案: 私募 ETF ticker 被 SpaceX 普通股顶替,
+    ~85 天无人发现。"""
+    if earnings and kind in ("etf", "index"):
+        return (f"⚠️ kind={kind} 但查到真实财报日 {earnings} — 标的身份"
+                "可能已变 (退市换牌/ETF 清盘后 ticker 被新股顶替), 复核 "
+                "watchlist.toml 的 kind/value_zone/notes")
+    return None
 
 
 def zone_sig(zone, zone_asof) -> str | None:
@@ -1816,6 +1855,36 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
             return r
         r["tech"] = tech
         zone = cfg["value_zone"]
+        # 拆股 = zone 一夜作废: auto_adjust 后价格自洽而手工 zone 还是
+        # 旧股本口径, strike<=上沿失去束缚力 — 置 zone_invalid 并按无
+        # zone 分析 (状态机/CSP/ladder/watch 全部停用)。作废是**粘性**的:
+        # 首次检出写进 state (zone_split, 键上 sig), 事件滑出 split_after
+        # 的检测窗也不复活 — 只有重锚 (区间数值或 zone_asof 变 → sig 变)
+        # 才解除; 否则无 zone_asof 的标的在 30 日 fallback 窗过后旧 zone
+        # 会带着失束的硬 cap 静默复活
+        cur_sig = zone_sig(zone, cfg.get("zone_asof"))
+        prev_split = prev_state.get("zone_split")
+        if zone is not None and prev_split \
+                and prev_split.get("sig") == cur_sig:
+            r["zone_invalid"] = prev_split["info"]
+            r["zone_split"] = prev_split
+            r["notes"].append(f"⛔ {prev_split['info']} — value_zone 仍处"
+                              "作废状态, 重锚 zone (并更新 zone_asof) 后恢复")
+            zone = None
+        else:
+            split = split_after(hist, cfg.get("zone_asof")) \
+                if zone is not None else None
+            if split:
+                sd, ratio = split
+                info = (f"拆股 {ratio:g}:1 @ {sd}" if ratio >= 1
+                        else f"合股 1:{1 / ratio:g} @ {sd}")
+                r["zone_invalid"] = info
+                r["zone_split"] = {"sig": cur_sig, "info": info}
+                r["notes"].append(
+                    f"⛔ {info} — value_zone 按旧股本写的, 已作废: "
+                    "行权价<=上沿的硬门失去束缚力, CSP/分批档/左侧状态"
+                    "全部停用, 重锚 zone (并更新 zone_asof) 后恢复")
+                zone = None
         prev = prev_state.get("state", "UPTREND")
         state, notes = next_state(
             prev, close=tech["close"], sma20=tech["sma20"],
@@ -1914,6 +1983,9 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
         r["earnings"] = next_earnings(cc.tk)
         if r["earnings"] is None and cfg["kind"] in ("etf", "index"):
             r["earnings"] = ""  # ETF/指数无财报 — 404 是常态不是失败
+        id_note = identity_mismatch_note(cfg["kind"], r["earnings"])
+        if id_note:
+            r["notes"].append(id_note)
         if not cfg["options"]:
             return r
         try:
@@ -1955,7 +2027,11 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
         # (剧本 ORCL 教训: 不想接货的 put 本来就不该卖)。与状态标签解耦:
         # 价格在/近价值区就出, 趋势上方也一样 — 接货限价单与趋势方向无关。
         want_csp = csp_window_open(zone, in_or_near_zone, stage)
-        if zone is None and stage.startswith("STAGE1"):
+        # zone_invalid (拆股作废) 时 zone 局部变量也是 None — 但"设好
+        # value_zone"的提示对已设区间的标的字面为假, 且与 ⛔ 重锚指令
+        # 矛盾, 两条"未设价值区"提示都要让位给 ⛔ 行
+        if zone is None and stage.startswith("STAGE1") \
+                and not r.get("zone_invalid"):
             r["notes"].append("倒挂期但未设价值区 — 剧本: 不想接货的 put 不该卖; "
                               "在 watchlist.toml 设好 value_zone 才出 CSP 票")
         if stage == "STAGE2_WINDOW":
@@ -1965,7 +2041,7 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
                     "+3.04%/88%, 21日 +4.38%/91% — options.cafe 2009-2025 "
                     "43 次事件): 价格虽在接货带上方仍试出 CSP 常规档, "
                     "行权价仍卡接货带上沿, 年化不过线自然拦")
-            elif zone is None:
+            elif zone is None and not r.get("zone_invalid"):
                 r["notes"].append(
                     "阶段2解除窗口 (统计最强卖权窗: 解除日起 5日 +3.04%/88%) "
                     "但未设价值区 — 设好 value_zone 才出 CSP 票")
@@ -2147,6 +2223,8 @@ def action_label(r: dict, ivp) -> str:
         return "确认·看下文"
     if r.get("ladder") and not csp:
         return "分批档👇"  # 无期权链但在接货带内 — 正股分批是唯一工具
+    if r.get("zone_invalid"):
+        return "拆股·重锚区间"  # zone 已作废, 左侧工具停用直到重锚
     zone = r["cfg"]["value_zone"]
     if zone is not None and r["tech"]["close"] > zone[1]:
         return "等回落入区"  # 设了接货带, 现价还在上方 — 等价格回来
@@ -2377,7 +2455,10 @@ def render_close(results, regime, ivdf, now_et) -> str:
                          f"| — | — | — | — | — | — | — |")
             continue
         zone = r["cfg"]["value_zone"]
-        if zone:
+        if r.get("zone_invalid"):
+            # cfg 里的数字还在, 但分析已按无 zone 跑 — 概览不能照印旧区间
+            zone_s = f"⛔作废({r['zone_invalid']})"
+        elif zone:
             zone_s = (f"{zone[0]:g}-{zone[1]:g} "
                       f"({zone_position(t['close'], zone)})")
         else:
@@ -2548,7 +2629,11 @@ def render_open(results, regime, now_et, s: dict) -> str:
             alerts.append(f"- **{sym}** 盘初波动 {t['change_pct']:+.1f}% "
                           f"(现价 {t['close']:.2f})")
         zone = r["cfg"]["value_zone"]
-        if zone and t["close"] < zone[0]:
+        if r.get("zone_invalid"):
+            # cfg 里的旧区间已作废 — 开盘警报不能照常催接货
+            alerts.append(f"- **{sym}** ⛔ {r['zone_invalid']} — value_zone "
+                          "已作废, 重锚 (并更新 zone_asof) 后恢复")
+        elif zone and t["close"] < zone[0]:
             # 破下沿 ≠ 在价值区内 — 剧本这时要的是论点检查, 不是接货动作;
             # 原来两种情形同一句"核对 CSP 挂单/接货档位"会催人继续摊
             alerts.append(f"- **{sym}** 已跌破价值区下沿 ({zone[0]:g}-{zone[1]:g}, "
@@ -2987,8 +3072,11 @@ def ping_heartbeat() -> None:
 
 
 def batch_history(symbols: list[str]) -> dict[str, pd.DataFrame | None]:
+    # actions=True: 附带 Dividends/Stock Splits 两列, 零额外请求 —
+    # split_after 靠 Stock Splits 检测拆股 (zone 作废的唯一"一夜致死"路径)
     df = yf.download(symbols, period="1y", interval="1d", auto_adjust=True,
-                     group_by="ticker", progress=False, threads=True)
+                     actions=True, group_by="ticker", progress=False,
+                     threads=True)
     out = {}
     for sym in symbols:
         try:
