@@ -83,7 +83,8 @@ MAX_STALE_TRADE_DAYS = 5         # option lastPrice older than this = unusable
 # --------------------------------------------------------------------------
 
 TICKER_DEFAULTS = {"kind": "stock", "options": True, "high_beta": False,
-                   "value_zone": None, "two_x": None, "notes": ""}
+                   "value_zone": None, "zone_asof": None, "two_x": None,
+                   "notes": ""}
 
 SETTINGS_DEFAULTS = {
     "gap_alert_pct": 1.5,        # open pass: flag |gap| above this
@@ -144,6 +145,20 @@ SETTINGS_DEFAULTS = {
     # rebate 可能触发, 但那种标的本来也值得看一眼 (2026-09-04 实测: 陈旧
     # 一天的日线造成 2.0%~16.5% 的差, 3% 会漏掉 MSFT 这档)
     "rr_spot_gap_warn": 0.015,
+    # zone 生命周期腐烂检测 (2026-09-05 zone 评审: 手工 zone 会烂 —
+    # 4/15 旧锚在三周~一个月内作废而扫描器全程无感)
+    "zone_asof_stale_days": 60,      # zone_asof 距今超此天数 = 超龄复核提醒
+    "zone_flag_repeat_days": 7,      # 同一 zone 提示的重复间隔 (首发+每 N 天)
+    # 漂移检测: 裸阈值不行 — 校准日就 +16~18% 的深接货带 (HOOD/AAPL 新带)
+    # 会当天误报, 按带宽缩放又让 50% 宽的旧带永远不报 → 自校准: 阈值 =
+    # max(基线, 校准日距离 ref + 余量), 连续 N 收盘才算 (回代: AAPL 旧带
+    # 击穿后第 10 个交易日即报, 早于人工发现 ~3 周; 15 个新 zone 校准日
+    # 全部静默)
+    "zone_drift_run": 10,            # 漂移判定的连续收盘数
+    "zone_drift_base_pct": 15.0,     # 上沿漂移阈值下限 (%)
+    "zone_drift_margin_pts": 8.0,    # 自校准余量: 校准日距离 + N pts
+    "zone_floor_instant_pct": 10.0,  # 下沿瞬时升格线: 收盘 < 下沿×(1-N%)
+                                     # (取下沿与恐慌档 -18% 的中点)
 }
 
 
@@ -212,8 +227,9 @@ def load_config(path: Path = CONFIG_FILE) -> tuple[dict, dict]:
         for k, v in tcfg.items():
             # 键名对了不代表值对: options = "false" 是合法 TOML 字符串,
             # 而非空字符串为真 — 想关期权票, 结果照常抓链出票 (PR #10 评审)
-            if k == "value_zone":
-                continue                      # 下面单独校验 (可为 None)
+            if k in ("value_zone", "zone_asof"):
+                continue                      # 下面单独校验 (都可为 None,
+                                              # zone_asof 还收裸 date)
             default = TICKER_DEFAULTS[k]
             if isinstance(default, bool):     # options / high_beta
                 ok = isinstance(v, bool)
@@ -239,6 +255,25 @@ def load_config(path: Path = CONFIG_FILE) -> tuple[dict, dict]:
                     f"(低 < 高), 得到 {zone!r}")
             # 统一成 float — TOML 里 [45, 57.5] 混用 int/float 是合法的
             cfg["value_zone"] = [float(zone[0]), float(zone[1])]
+        asof = cfg["zone_asof"]
+        if asof is not None:
+            if zone is None:
+                raise ValueError(f"{sym}: zone_asof 只在设了 value_zone 时有意义")
+            # TOML 裸日期解析成 date, 带引号是 str — 都归一成 ISO 字符串
+            if isinstance(asof, datetime):
+                asof = asof.date()
+            if not isinstance(asof, date):
+                try:
+                    asof = date.fromisoformat(str(asof))
+                except (ValueError, TypeError):
+                    raise ValueError(f"{sym}: zone_asof 必须是日期 "
+                                     f"(YYYY-MM-DD), 得到 {asof!r}") from None
+            if asof > datetime.now(ET).date():
+                # 年份 typo 会同时静默废掉超龄提醒 (age 恒负) 与拆股检测
+                # (cutoff 在未来) — 装载时就拒, 别留两个机制无声关闭
+                raise ValueError(f"{sym}: zone_asof {asof} 在未来 — 校准"
+                                 "日期只能是今天或过去")
+            cfg["zone_asof"] = asof.isoformat()
         key = sym.upper()
         if key in tickers:
             # [tickers.spcx] 与 [tickers.SPCX] 是合法的两张 TOML 表 —
@@ -279,6 +314,14 @@ def next_persisted_state(prev: dict, r: dict, today: str) -> dict:
     lw = r.get("leap_window") or prev.get("leap_window")
     if lw:
         entry["leap_window"] = lw
+    # zone 生命周期监控状态: 本次结果直接覆盖 (zone_watch_update 自己
+    # 负责沿用/归零), zone 被删时 r["zone_watch"] 为 None → 键自然消失
+    if r.get("zone_watch"):
+        entry["zone_watch"] = r["zone_watch"]
+    # 拆股作废的粘性标记: analyze_ticker 只在 sig 仍匹配时携带 —
+    # 重锚 (sig 变) 当日 r 不带, 键在这里自然掉落
+    if r.get("zone_split"):
+        entry["zone_split"] = r["zone_split"]
     # NORMAL 期 LEAP 被硬停牌拦下的补发标记: 确认转换是一次性的且会被
     # state.json 无条件消耗, halt 不该吞掉它 — 标记随右侧状态存活,
     # 止损出局 (转 PULLBACK) 即失效; 真票发出当日不再置位, 自然清除
@@ -806,6 +849,162 @@ STATE_LABEL = {
     "CONFIRMED": "右侧确认", "TREND": "右侧持仓(跟踪20日线)",
     "NO_DATA": "数据不足",
 }
+
+
+def split_after(hist, asof_iso: str | None, fallback_days: int = 30):
+    """zone_asof 之后 (缺失时: 最近 fallback_days 日历日内) 的拆股事件
+    -> (date_iso, ratio) | None。
+
+    auto_adjust=True 让历史价格自洽, 但手工 zone 是按旧股本写的 — 拆股
+    后 in_zone 恒真/恒假、strike<=上沿的硬 cap 失去束缚力, 会铸出标着
+    "愿意接货档"的近价 put (zone 评审: 唯一让 zone 一夜作废的路径)。
+    需要 batch_history 的 actions=True 才有 Stock Splits 列; 列缺失时
+    静默返回 None (VIX 侧等其他抓取路径不带该列)。"""
+    if hist is None or "Stock Splits" not in getattr(hist, "columns", ()):
+        return None
+    sp = hist["Stock Splits"]
+    sp = sp[sp.notna() & (sp != 0)]
+    if sp.empty:
+        return None
+    cutoff = (date.fromisoformat(asof_iso) if asof_iso
+              else hist.index[-1].date() - timedelta(days=fallback_days))
+    ev = sp[[ts.date() > cutoff for ts in sp.index]]
+    if ev.empty:
+        return None
+    return ev.index[-1].date().isoformat(), float(ev.iloc[-1])
+
+
+def split_history_covers(hist, asof_iso: str | None) -> bool:
+    """日线窗是否覆盖到 zone_asof — batch_history 只取 1 年, 校准日更早时
+    split_after 的 None 是"查不到"而非"没有", 旧股本 zone 会带着失束的
+    CSP 硬 cap 继续生效 (PR #11 评审)。缺 asof 时按 30 日 fallback 窗算,
+    正常 hist 必然覆盖。"""
+    if not asof_iso or hist is None or getattr(hist, "empty", True):
+        return True
+    return hist.index[0].date() <= date.fromisoformat(asof_iso)
+
+
+def identity_mismatch_note(kind: str, earnings) -> str | None:
+    """kind=etf/index 却查到真实财报日 = 标的身份可能已变 — ETF/指数没有
+    财报日历 (代码在两处都依赖"ETF 日历 404 是常态"这一事实), 反过来就是
+    零成本的身份体检。SPCX 案: 私募 ETF ticker 被 SpaceX 普通股顶替,
+    ~85 天无人发现。"""
+    if earnings and kind in ("etf", "index"):
+        return (f"⚠️ kind={kind} 但查到真实财报日 {earnings} — 标的身份"
+                "可能已变 (退市换牌/ETF 清盘后 ticker 被新股顶替), 复核 "
+                "watchlist.toml 的 kind/value_zone/notes")
+    return None
+
+
+def zone_sig(zone, zone_asof) -> str | None:
+    """zone 配置身份 — 数值或 zone_asof 变了 = 人已重校: 漂移计数与
+    提示频控全部归零, 新身份从零开始观察。"""
+    if zone is None:
+        return None
+    # repr 而非 :g — :g 只给 6 位有效数字, [1000000,1100000] 与
+    # [1000001,1100000] 会共用身份 "1e+06-1.1e+06": 改了区间却不归零漂移
+    # 计数, 还可能让上一版的粘性拆股作废挂在新区间上 (PR #11 评审)
+    return f"{zone[0]!r}-{zone[1]!r}@{zone_asof or '未标'}"
+
+
+def _zone_flag_due(flags: dict, name: str, today_iso: str,
+                   repeat_days: int) -> bool:
+    """同一提示首发 + 每 repeat_days 天一次 — 命中即更新 flags[name]。"""
+    last = flags.get(name)
+    if last is not None and (date.fromisoformat(today_iso)
+                             - date.fromisoformat(last)).days < repeat_days:
+        return False
+    flags[name] = today_iso
+    return True
+
+
+def zone_ref_from_hist(hist, zone, zone_asof):
+    """确定性的漂移基准: zone_asof 当日 (或其前最后一根) 的收盘距上沿的
+    距离 — state.json 删除/换机器重建 watch 时 ref 可复现, 一个已经漂移
+    很远的 zone 不会被"重新校准"成永久静默 (auto_adjust 的分红微调可
+    忽略; 拆股情形 zone 反正已作废)。asof 缺失或早于 hist 起点 → None
+    (退回首见收盘口径, 由 60d 超龄提醒兜底)。"""
+    if zone is None or not zone_asof or hist is None or hist.empty:
+        return None
+    cut = date.fromisoformat(zone_asof)
+    sel = hist["Close"][[ts.date() <= cut for ts in hist.index]]
+    if sel.empty:
+        return None
+    return max(0.0, (float(sel.iloc[-1]) / zone[1] - 1) * 100)
+
+
+def zone_watch_update(prev_watch, *, close: float, zone, zone_asof,
+                      today_iso: str, s: dict,
+                      ref_hint=None) -> tuple[dict | None, list[str]]:
+    """zone 生命周期监控 (纯函数, close 口径) -> (新 watch 状态, notes)。
+
+    手工维护的 zone 会腐烂而扫描器此前完全无感 (2026-09-05 zone 评审
+    实证: AAPL 旧带被实价击穿 +21% 一个月, 过时警告只写在 config notes
+    这个 write-only 字段里从未上报)。watch 存 state.json 随
+    next_persisted_state 跨日携带 (manual/stale 日不落盘 — 计数只按
+    正式收盘推进); ref_pct 记本 zone 身份首个收盘距上沿的距离, 给漂移
+    阈值做自校准基准 (故意设深的接货带不该在校准日就报警)。"""
+    if zone is None:
+        return None, []
+    sig = zone_sig(zone, zone_asof)
+    # ref 优先用 zone_ref_from_hist 的确定性口径 (zone_asof 当日收盘),
+    # 拿不到才退回首见收盘 — 后者在 state.json 重建时会把已漂移的 zone
+    # "重新校准"成静默, 只能当兜底
+    ref0 = ref_hint if ref_hint is not None \
+        else max(0.0, (close / zone[1] - 1) * 100)
+    w = dict(prev_watch) if prev_watch and prev_watch.get("sig") == sig \
+        else {"sig": sig, "ref_pct": ref0}
+    # 手编/损坏的 state.json 可能丢 ref_pct — 缺失按同口径重锚, 单日
+    # 自愈, 别让 KeyError 经宽 except 把整个标的吞成 r[error]
+    w.setdefault("ref_pct", ref0)
+    w["flags"] = dict(w.get("flags") or {})
+    notes = []
+    if zone_asof is None:
+        if "no_asof" not in w["flags"]:      # 每个 zone 身份只提示一次
+            w["flags"]["no_asof"] = today_iso
+            notes.append("zone 未标 zone_asof — 在 watchlist.toml 补上校准"
+                         "日期 (YYYY-MM-DD) 才能启用超龄复核提醒")
+    else:
+        age = (date.fromisoformat(today_iso)
+               - date.fromisoformat(zone_asof)).days
+        if age > s["zone_asof_stale_days"] and _zone_flag_due(
+                w["flags"], "age", today_iso, s["zone_flag_repeat_days"]):
+            notes.append(f"zone 校准已 {age} 天 (zone_asof {zone_asof}) — "
+                         "剧本: 对照最新估值带/支撑复核区间, 复核后更新 "
+                         "zone_asof")
+    # 上沿漂移: 价格涨着涨着把 zone 抛在身后 = zone 过时(偏低)。阈值
+    # 自校准 (max(基线, ref+余量)): 故意设深的接货带在校准日静默, 只有
+    # "此后又拉开了余量以上的距离"且持续 run 个收盘才报
+    dist = (close / zone[1] - 1) * 100
+    threshold = max(s["zone_drift_base_pct"],
+                    w["ref_pct"] + s["zone_drift_margin_pts"])
+    w["above_run"] = (w.get("above_run", 0) + 1) if dist > threshold else 0
+    if w["above_run"] == 0:
+        w["flags"].pop("upper", None)   # 条件解除 → 下一轮漂移重新首发
+    elif w["above_run"] >= s["zone_drift_run"] and _zone_flag_due(
+            w["flags"], "upper", today_iso, s["zone_flag_repeat_days"]):
+        notes.append(
+            f"现价高于接货带上沿 {dist:+.1f}%, 连续 {w['above_run']} 个收盘"
+            f"超过漂移阈值 {threshold:.1f}% — zone 可能过时(偏低): "
+            "重校区间, 或明确接受长期不接货")
+    # 下沿漂移: L703 的"检查论点"是单日提示 — 持续 run 个收盘破下沿,
+    # 或单日深破 (下沿再 -instant%), 升格为"zone 重锚"级别
+    below = close < zone[0]
+    w["below_run"] = (w.get("below_run", 0) + 1) if below else 0
+    instant = close < zone[0] * (1 - s["zone_floor_instant_pct"] / 100)
+    if w["below_run"] == 0:
+        w["flags"].pop("lower", None)
+    elif (w["below_run"] >= s["zone_drift_run"] or instant) \
+            and _zone_flag_due(w["flags"], "lower", today_iso,
+                               s["zone_flag_repeat_days"]):
+        how = (f"收盘已深破下沿 {s['zone_floor_instant_pct']:g}%+"
+               if instant and w["below_run"] < s["zone_drift_run"]
+               else f"连续 {w['below_run']} 个收盘破下沿")
+        notes.append(
+            f"{how} — 论点检查升格为 zone 重锚: 论点失效则离场, "
+            "仍成立则按新支撑/估值重画区间; 重锚前下方档位只当参考价, "
+            "先过论点检查再执行")
+    return w, notes
 
 
 def yang_zhang(price_data, window=30, trading_periods=252):
@@ -1669,6 +1868,44 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
             return r
         r["tech"] = tech
         zone = cfg["value_zone"]
+        # 拆股 = zone 一夜作废: auto_adjust 后价格自洽而手工 zone 还是
+        # 旧股本口径, strike<=上沿失去束缚力 — 置 zone_invalid 并按无
+        # zone 分析 (状态机/CSP/ladder/watch 全部停用)。作废是**粘性**的:
+        # 首次检出写进 state (zone_split, 键上 sig), 事件滑出 split_after
+        # 的检测窗也不复活 — 只有重锚 (区间数值或 zone_asof 变 → sig 变)
+        # 才解除; 否则无 zone_asof 的标的在 30 日 fallback 窗过后旧 zone
+        # 会带着失束的硬 cap 静默复活
+        cur_sig = zone_sig(zone, cfg.get("zone_asof"))
+        prev_split = prev_state.get("zone_split")
+        if zone is not None and prev_split \
+                and prev_split.get("sig") == cur_sig:
+            r["zone_invalid"] = prev_split["info"]
+            r["zone_split"] = prev_split
+            r["notes"].append(f"⛔ {prev_split['info']} — value_zone 仍处"
+                              "作废状态, 重锚 zone (并更新 zone_asof) 后恢复")
+            zone = None
+        else:
+            if (zone is not None and mode == "close"
+                    and not split_history_covers(
+                        hist, cfg.get("zone_asof"))):
+                # 不作废 (旧 zone 未必错), 但别让"没报拆股"读成"确认没拆股"
+                r["notes"].append(
+                    f"拆股检测只覆盖到 {hist.index[0].date()} (日线窗 1 年), "
+                    f"zone_asof {cfg['zone_asof']} 更早 — 这段空窗里的拆股"
+                    "查不到, 复核 zone 时一并确认")
+            split = split_after(hist, cfg.get("zone_asof")) \
+                if zone is not None else None
+            if split:
+                sd, ratio = split
+                info = (f"拆股 {ratio:g}:1 @ {sd}" if ratio >= 1
+                        else f"合股 1:{1 / ratio:g} @ {sd}")
+                r["zone_invalid"] = info
+                r["zone_split"] = {"sig": cur_sig, "info": info}
+                r["notes"].append(
+                    f"⛔ {info} — value_zone 按旧股本写的, 已作废: "
+                    "行权价<=上沿的硬门失去束缚力, CSP/分批档/左侧状态"
+                    "全部停用, 重锚 zone (并更新 zone_asof) 后恢复")
+                zone = None
         prev = prev_state.get("state", "UPTREND")
         state, notes = next_state(
             prev, close=tech["close"], sma20=tech["sma20"],
@@ -1685,6 +1922,17 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
         # 与 next_state/_finish_csp 的下沿判定同一口径 — note 给人读,
         # 这个旗标给 action_block 等渲染路由用
         r["below_floor"] = zone is not None and tech["close"] < zone[0]
+        # zone 生命周期监控 — 放在 fetch_options 返回之前: --no-options
+        # 的非 manual 收盘跑也要携带 watch, 否则持久化循环会把它抹掉
+        # (与 leap_pending 同一个坑, 见 next_persisted_state docstring)。
+        # notes 只在 close 出 (open 报告不渲染 notes, 且计数以收盘为准)
+        r["zone_watch"], zw_notes = zone_watch_update(
+            prev_state.get("zone_watch"), close=tech["close"], zone=zone,
+            zone_asof=cfg.get("zone_asof"),
+            today_iso=datetime.now(ET).date().isoformat(), s=s,
+            ref_hint=zone_ref_from_hist(hist, zone, cfg.get("zone_asof")))
+        if mode == "close":
+            r["notes"].extend(zw_notes)
 
         if not fetch_options:
             return r
@@ -1756,6 +2004,9 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
         r["earnings"] = next_earnings(cc.tk)
         if r["earnings"] is None and cfg["kind"] in ("etf", "index"):
             r["earnings"] = ""  # ETF/指数无财报 — 404 是常态不是失败
+        id_note = identity_mismatch_note(cfg["kind"], r["earnings"])
+        if id_note:
+            r["notes"].append(id_note)
         if not cfg["options"]:
             return r
         try:
@@ -1797,7 +2048,11 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
         # (剧本 ORCL 教训: 不想接货的 put 本来就不该卖)。与状态标签解耦:
         # 价格在/近价值区就出, 趋势上方也一样 — 接货限价单与趋势方向无关。
         want_csp = csp_window_open(zone, in_or_near_zone, stage)
-        if zone is None and stage.startswith("STAGE1"):
+        # zone_invalid (拆股作废) 时 zone 局部变量也是 None — 但"设好
+        # value_zone"的提示对已设区间的标的字面为假, 且与 ⛔ 重锚指令
+        # 矛盾, 两条"未设价值区"提示都要让位给 ⛔ 行
+        if zone is None and stage.startswith("STAGE1") \
+                and not r.get("zone_invalid"):
             r["notes"].append("倒挂期但未设价值区 — 剧本: 不想接货的 put 不该卖; "
                               "在 watchlist.toml 设好 value_zone 才出 CSP 票")
         if stage == "STAGE2_WINDOW":
@@ -1807,7 +2062,7 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
                     "+3.04%/88%, 21日 +4.38%/91% — options.cafe 2009-2025 "
                     "43 次事件): 价格虽在接货带上方仍试出 CSP 常规档, "
                     "行权价仍卡接货带上沿, 年化不过线自然拦")
-            elif zone is None:
+            elif zone is None and not r.get("zone_invalid"):
                 r["notes"].append(
                     "阶段2解除窗口 (统计最强卖权窗: 解除日起 5日 +3.04%/88%) "
                     "但未设价值区 — 设好 value_zone 才出 CSP 票")
@@ -1982,6 +2237,11 @@ def action_label(r: dict, ivp) -> str:
         return "spread票👇"
     if r.get("retest"):
         return "回踩中👀"
+    if r.get("zone_invalid"):
+        # 必须排在纯状态标签之前: 拆股不清右侧状态, 右侧持仓 (TREND) 撞上
+        # 拆股时原来会显示"持有·跟20日线", 操作列一个字不提区间已作废
+        # (PR #11 评审)。止损/真票等更高优先级的标签仍在其上
+        return "拆股·重锚区间"  # zone 已作废, 左侧工具停用直到重锚
     state = r["state"]
     if state == "TREND":
         return "持有·跟20日线"
@@ -2219,7 +2479,10 @@ def render_close(results, regime, ivdf, now_et) -> str:
                          f"| — | — | — | — | — | — | — |")
             continue
         zone = r["cfg"]["value_zone"]
-        if zone:
+        if r.get("zone_invalid"):
+            # cfg 里的数字还在, 但分析已按无 zone 跑 — 概览不能照印旧区间
+            zone_s = f"⛔作废({r['zone_invalid']})"
+        elif zone:
             zone_s = (f"{zone[0]:g}-{zone[1]:g} "
                       f"({zone_position(t['close'], zone)})")
         else:
@@ -2390,7 +2653,11 @@ def render_open(results, regime, now_et, s: dict) -> str:
             alerts.append(f"- **{sym}** 盘初波动 {t['change_pct']:+.1f}% "
                           f"(现价 {t['close']:.2f})")
         zone = r["cfg"]["value_zone"]
-        if zone and t["close"] < zone[0]:
+        if r.get("zone_invalid"):
+            # cfg 里的旧区间已作废 — 开盘警报不能照常催接货
+            alerts.append(f"- **{sym}** ⛔ {r['zone_invalid']} — value_zone "
+                          "已作废, 重锚 (并更新 zone_asof) 后恢复")
+        elif zone and t["close"] < zone[0]:
             # 破下沿 ≠ 在价值区内 — 剧本这时要的是论点检查, 不是接货动作;
             # 原来两种情形同一句"核对 CSP 挂单/接货档位"会催人继续摊
             alerts.append(f"- **{sym}** 已跌破价值区下沿 ({zone[0]:g}-{zone[1]:g}, "
@@ -2829,8 +3096,11 @@ def ping_heartbeat() -> None:
 
 
 def batch_history(symbols: list[str]) -> dict[str, pd.DataFrame | None]:
+    # actions=True: 附带 Dividends/Stock Splits 两列, 零额外请求 —
+    # split_after 靠 Stock Splits 检测拆股 (zone 作废的唯一"一夜致死"路径)
     df = yf.download(symbols, period="1y", interval="1d", auto_adjust=True,
-                     group_by="ticker", progress=False, threads=True)
+                     actions=True, group_by="ticker", progress=False,
+                     threads=True)
     out = {}
     for sym in symbols:
         try:

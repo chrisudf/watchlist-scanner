@@ -10,7 +10,7 @@ import json
 import math
 import tempfile
 import unittest
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -1354,6 +1354,304 @@ class TestLoadConfig(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._load("[settings]\nnear_zone_pct = 5.0\n")
 
+    def test_zone_asof_accepted_and_normalized(self):
+        _, t = self._load('[tickers.NVDA]\nvalue_zone = [185, 205]\n'
+                          'zone_asof = "2026-09-05"\n')
+        self.assertEqual(t["NVDA"]["zone_asof"], "2026-09-05")
+        # TOML 裸日期 (无引号) 解析成 date 对象 — 同样归一成 ISO 字符串
+        _, t = self._load("[tickers.NVDA]\nvalue_zone = [185, 205]\n"
+                          "zone_asof = 2026-09-05\n")
+        self.assertEqual(t["NVDA"]["zone_asof"], "2026-09-05")
+        # TOML 裸 datetime (带时间) 是 datetime 对象 — isinstance 分支
+        # 顺序 (datetime 先于 date) 的 pin
+        _, t = self._load("[tickers.NVDA]\nvalue_zone = [185, 205]\n"
+                          "zone_asof = 2026-09-05T10:00:00\n")
+        self.assertEqual(t["NVDA"]["zone_asof"], "2026-09-05")
+
+    def test_zone_asof_without_zone_raises(self):
+        with self.assertRaisesRegex(ValueError, "只在设了 value_zone"):
+            self._load('[tickers.NVDA]\nzone_asof = "2026-09-05"\n')
+
+    def test_zone_asof_bad_format_raises(self):
+        with self.assertRaisesRegex(ValueError, "必须是日期"):
+            self._load('[tickers.NVDA]\nvalue_zone = [185, 205]\n'
+                       'zone_asof = "09/05/2026"\n')
+
+    def test_zone_asof_future_raises(self):
+        # 年份 typo (2026→2062) 会同时静默废掉超龄提醒与拆股检测
+        with self.assertRaisesRegex(ValueError, "在未来"):
+            self._load('[tickers.NVDA]\nvalue_zone = [185, 205]\n'
+                       'zone_asof = "2062-09-05"\n')
+
+
+class TestZoneWatchScaffold(unittest.TestCase):
+    """zone 生命周期监控脚手架: sig 身份 / ref 自校准基准 / 提示频控 /
+    超龄提醒 / state.json 携带 (zone 评审: AAPL 旧带带着自己写在 notes
+    里的过时警告烂了 26 天, 因为 notes 是 write-only 字段)。"""
+
+    S = sc.SETTINGS_DEFAULTS
+
+    def test_no_zone_no_watch(self):
+        w, notes = sc.zone_watch_update(None, close=100.0, zone=None,
+                                        zone_asof=None,
+                                        today_iso="2026-09-07", s=self.S)
+        self.assertIsNone(w)
+        self.assertEqual(notes, [])
+
+    def test_init_captures_sig_and_ref(self):
+        w, _ = sc.zone_watch_update(None, close=230.36, zone=[185.0, 205.0],
+                                    zone_asof="2026-09-05",
+                                    today_iso="2026-09-07", s=self.S)
+        self.assertEqual(w["sig"], sc.zone_sig([185.0, 205.0], "2026-09-05"))
+        self.assertAlmostEqual(w["ref_pct"], (230.36 / 205 - 1) * 100,
+                               places=6)
+
+    def test_ref_floored_at_zero_inside_zone(self):
+        w, _ = sc.zone_watch_update(None, close=335.31, zone=[315.0, 340.0],
+                                    zone_asof="2026-09-05",
+                                    today_iso="2026-09-07", s=self.S)
+        self.assertEqual(w["ref_pct"], 0.0)
+
+    def test_sig_change_resets_flags(self):
+        prev = {"sig": "185-205@2026-09-05", "ref_pct": 12.4,
+                "flags": {"age": "2026-11-10"}}
+        w, _ = sc.zone_watch_update(prev, close=230.0, zone=[185.0, 210.0],
+                                    zone_asof="2026-11-15",
+                                    today_iso="2026-11-16", s=self.S)
+        self.assertEqual(w["sig"], sc.zone_sig([185.0, 210.0], "2026-11-15"))
+        self.assertEqual(w["flags"], {})
+
+    def test_age_reminder_fires_and_repeats_weekly(self):
+        zone = [185.0, 205.0]
+        w, notes = sc.zone_watch_update(None, close=230.0, zone=zone,
+                                        zone_asof="2026-09-05",
+                                        today_iso="2026-11-05", s=self.S)
+        self.assertTrue(any("复核" in n for n in notes))     # 61 天 > 60
+        w, notes2 = sc.zone_watch_update(w, close=230.0, zone=zone,
+                                         zone_asof="2026-09-05",
+                                         today_iso="2026-11-06", s=self.S)
+        self.assertEqual(notes2, [])                          # 频控: 次日静默
+        _, notes3 = sc.zone_watch_update(w, close=230.0, zone=zone,
+                                         zone_asof="2026-09-05",
+                                         today_iso="2026-11-12", s=self.S)
+        self.assertTrue(any("复核" in n for n in notes3))     # 7 天后重复
+
+    def test_fresh_zone_is_silent(self):
+        _, notes = sc.zone_watch_update(None, close=230.0,
+                                        zone=[185.0, 205.0],
+                                        zone_asof="2026-09-05",
+                                        today_iso="2026-09-07", s=self.S)
+        self.assertEqual(notes, [])
+
+    def test_no_asof_hint_once_per_sig(self):
+        zone = [45.0, 57.5]
+        w, notes = sc.zone_watch_update(None, close=64.0, zone=zone,
+                                        zone_asof=None,
+                                        today_iso="2026-09-07", s=self.S)
+        self.assertTrue(any("zone_asof" in n for n in notes))
+        _, notes2 = sc.zone_watch_update(w, close=64.0, zone=zone,
+                                         zone_asof=None,
+                                         today_iso="2026-10-07", s=self.S)
+        self.assertEqual(notes2, [])          # 只提示一次, 一个月后也不再提
+
+    def test_persisted_state_carries_watch(self):
+        watch = {"sig": sc.zone_sig([45.0, 57.5], "2026-09-05"),
+                 "ref_pct": 11.8, "flags": {}}
+        entry = sc.next_persisted_state(
+            {}, {"state": "PULLBACK", "zone_watch": watch}, "2026-09-07")
+        self.assertEqual(entry["zone_watch"], watch)
+        entry2 = sc.next_persisted_state(
+            {"zone_watch": watch},
+            {"state": "PULLBACK", "zone_watch": None}, "2026-09-08")
+        self.assertNotIn("zone_watch", entry2)   # zone 删掉 → watch 消失
+
+    def test_analyze_ticker_wires_watch(self):
+        cfg = {**sc.TICKER_DEFAULTS, "value_zone": [45.0, 57.5],
+               "zone_asof": "2026-09-05"}
+        r = sc.analyze_ticker("XX", cfg, _ohlcv_downtrend(50.0), {},
+                              {"stage": "NORMAL"}, sc.SETTINGS_DEFAULTS,
+                              "close", fetch_options=False)
+        self.assertEqual(r["zone_watch"]["sig"],
+                         sc.zone_sig([45.0, 57.5], "2026-09-05"))
+
+    def test_legacy_watch_missing_ref_self_heals(self):
+        # 手编/损坏的 state.json 丢了 ref_pct — 按当日距离重锚, 不 KeyError
+        w, _ = sc.zone_watch_update(
+            {"sig": sc.zone_sig([45.0, 57.5], "2026-09-05")},
+                                    close=64.0, zone=[45.0, 57.5],
+                                    zone_asof="2026-09-05",
+                                    today_iso="2026-09-08", s=self.S)
+        self.assertAlmostEqual(w["ref_pct"], (64.0 / 57.5 - 1) * 100,
+                               places=6)
+
+    def test_open_pass_computes_watch_but_suppresses_notes(self):
+        # zone_asof 用永久超龄的 2020 日期绕开 datetime.now 注入问题:
+        # open pass 要携带 watch (持久化老坑) 但不出 notes (open 报告
+        # 不渲染 notes, 且计数/提示以收盘为准); close pass 出提示
+        cfg = {**sc.TICKER_DEFAULTS, "value_zone": [45.0, 57.5],
+               "zone_asof": "2020-01-01"}
+        r_open = sc.analyze_ticker("XX", cfg, _ohlcv_downtrend(50.0), {},
+                                   {"stage": "NORMAL"}, sc.SETTINGS_DEFAULTS,
+                                   "open", fetch_options=False)
+        self.assertIsNotNone(r_open["zone_watch"])
+        self.assertFalse(any("复核" in n for n in r_open["notes"]))
+        r_close = sc.analyze_ticker("XX", cfg, _ohlcv_downtrend(50.0), {},
+                                    {"stage": "NORMAL"}, sc.SETTINGS_DEFAULTS,
+                                    "close", fetch_options=False)
+        self.assertTrue(any("复核" in n for n in r_close["notes"]))
+
+
+class TestZoneDrift(unittest.TestCase):
+    """漂移检测: 上沿自校准阈值 max(基线 15%, 校准日 ref+8pts) × 连续
+    zone_drift_run 个收盘; 下沿连续 run 个收盘或单日深破 -10% →
+    "论点检查"升格"zone 重锚"。
+
+    机制测试用 run=3 的显式 settings (与默认值解耦 — 调 run 参数不该
+    红一片); AAPL 回代与 15 组新 zone 全量回放钉真实默认值 — 那两组是
+    校准回归 pin, 默认值动了就应该红。"""
+
+    S = sc.SETTINGS_DEFAULTS
+    S3 = {**sc.SETTINGS_DEFAULTS, "zone_drift_run": 3}
+    D0 = "2026-09-07"          # 周一
+
+    def _seq(self, zone, asof, closes, s):
+        """按**交易日**喂收盘序列 -> (最终 watch, [(idx, notes)]) —
+        run 计的是收盘数、频控 7 天计的是日历日, 生产里两种计数并存,
+        测试用 bdate 推进才分得开。"""
+        days = pd.bdate_range(self.D0, periods=len(closes))
+        w, fired = None, []
+        for i, c in enumerate(closes):
+            w, notes = sc.zone_watch_update(
+                w, close=c, zone=zone, zone_asof=asof,
+                today_iso=days[i].date().isoformat(), s=s)
+            if notes:
+                fired.append((i, notes))
+        return w, fired
+
+    def test_upper_drift_needs_consecutive_closes(self):
+        # 校准日 close 100 (ref +5.3% → 阈值 15), 随后 +16.8% 三连
+        closes = [100.0] + [111.0] * 3
+        _, fired = self._seq([80.0, 95.0], "2026-09-05", closes, self.S3)
+        self.assertEqual(len(fired), 1)
+        self.assertEqual(fired[0][0], 3)
+        self.assertTrue(any("过时" in n for n in fired[0][1]))
+
+    def test_upper_drift_interrupted_run_resets(self):
+        closes = [100.0] + [111.0] * 2 + [100.0] + [111.0] * 2
+        _, fired = self._seq([80.0, 95.0], "2026-09-05", closes, self.S3)
+        self.assertEqual(fired, [])            # 两段 2 连都不够 3
+
+    def test_upper_drift_repeats_weekly_while_sustained(self):
+        # 持续漂移: 首发后按日历日周频重复 (7 日历日 ≈ 5 个交易日)
+        closes = [100.0] + [111.0] * 12
+        _, fired = self._seq([80.0, 95.0], "2026-09-05", closes, self.S3)
+        idxs = [i for i, _ in fired]
+        self.assertEqual(len(idxs), 2)
+        self.assertEqual(idxs[0], 3)
+        days = pd.bdate_range(self.D0, periods=len(closes))
+        self.assertGreaterEqual((days[idxs[1]] - days[idxs[0]]).days, 7)
+
+    def test_upper_drift_rearms_after_dip(self):
+        # 首发 → 回落 (run 清零, flag 摘除) → 再漂移: 新一轮不等 7 天
+        closes = [100.0] + [111.0] * 3 + [100.0] + [111.0] * 3
+        _, fired = self._seq([80.0, 95.0], "2026-09-05", closes, self.S3)
+        self.assertEqual([i for i, _ in fired], [3, 7])
+
+    def test_deep_band_silent_flat_replay(self):
+        # AAPL 新带风格: 校准日就 +18.5% — ref 自校准把阈值抬到 26.5,
+        # 横盘 run+2 个收盘全程静默 (裸 15% 阈值会在第 run 个收盘误报)
+        _, fired = self._seq([240.0, 270.0], "2026-09-05",
+                             [319.97] * 5, self.S3)
+        self.assertEqual(fired, [])
+
+    def test_aapl_old_band_replay_fires_day_ten(self):
+        # 真实默认值回代: 旧带 [176,264] 首见 close 290 (ref +9.8% →
+        # 阈值 17.8), 涨到 313 (+18.6%) 后第 10 个超阈收盘报警 —
+        # 早于人工发现 ~3 周
+        closes = [290.0] + [313.0] * 12
+        _, fired = self._seq([176.0, 264.0], None, closes, self.S)
+        drift = [(i, n) for i, n in fired if any("过时" in x for x in n)]
+        self.assertEqual(len(drift), 1)
+        self.assertEqual(drift[0][0], 10)
+
+    def test_floor_break_consecutive_closes_escalates(self):
+        closes = [50.0] + [43.0] * 3           # 破下沿但不深 (-4.4%)
+        _, fired = self._seq([45.0, 57.5], "2026-09-05", closes, self.S3)
+        self.assertEqual(len(fired), 1)
+        self.assertEqual(fired[0][0], 3)
+        self.assertTrue(any("重锚" in n for n in fired[0][1]))
+
+    def test_instant_deep_floor_break_fires_same_day(self):
+        closes = [50.0, 40.0]                  # 40 < 45×0.9=40.5 → 当日升格
+        _, fired = self._seq([45.0, 57.5], "2026-09-05", closes, self.S3)
+        self.assertEqual(len(fired), 1)
+        self.assertEqual(fired[0][0], 1)
+        self.assertTrue(any("深破" in n for n in fired[0][1]))
+
+    def test_floor_recovery_resets_run(self):
+        closes = [43.0] * 2 + [50.0] + [43.0] * 2
+        _, fired = self._seq([45.0, 57.5], "2026-09-05", closes, self.S3)
+        self.assertEqual(fired, [])
+
+    def test_all_15_new_zones_full_replay_silent(self):
+        # 2026-09-05 校准的 15 组 (spot, zone) 按校准价横盘 run+2 个收盘
+        # 全量回放 — 必须全程静默。这是自校准设计的真正回归 pin: 裸 15%
+        # 阈值的实现会在 HOOD (+16.3%) 与 AAPL (+18.5%) 两行的第 run 个
+        # 收盘出声 (单日单次调用对 run 门永远静默, 测不出任何东西)
+        table = [
+            (718.96, [635.0, 685.0]), (230.36, [185.0, 205.0]),
+            (64.26, [45.0, 57.5]), (335.31, [315.0, 340.0]),
+            (406.77, [365.0, 385.0]), (499.70, [380.0, 440.0]),
+            (18.22, [13.0, 16.0]), (122.11, [85.0, 105.0]),
+            (281.86, [220.0, 260.0]), (428.91, [325.0, 390.0]),
+            (354.08, [260.0, 320.0]), (319.97, [240.0, 270.0]),
+            (366.70, [320.0, 365.0]), (59.69, [45.0, 55.0]),
+            (147.95, [105.0, 135.0]),
+        ]
+        n = self.S["zone_drift_run"] + 2
+        for spot, zone in table:
+            _, fired = self._seq(zone, "2026-09-05", [spot] * n, self.S)
+            self.assertEqual(fired, [], f"{zone} @ {spot}")
+
+
+class TestZoneRefFromHist(unittest.TestCase):
+    """确定性 ref: state.json 删除/换机器重建时, 漂移基准从 hist 里按
+    zone_asof 当日收盘复现 — 已漂移的 zone 不会被"重新校准"成永久静默。"""
+
+    def test_ref_at_asof_close(self):
+        hist = _ohlcv_downtrend(50.0)              # 单调下行收 50
+        asof = hist.index[-11].date().isoformat()  # 10 根前, close = 55
+        ref = sc.zone_ref_from_hist(hist, [30.0, 40.0], asof)
+        self.assertAlmostEqual(ref, (55.0 / 40.0 - 1) * 100, places=6)
+
+    def test_ref_none_when_underivable(self):
+        hist = _ohlcv_downtrend(50.0)
+        self.assertIsNone(sc.zone_ref_from_hist(hist, [30.0, 40.0], None))
+        self.assertIsNone(
+            sc.zone_ref_from_hist(hist, [30.0, 40.0], "2020-01-01"))
+        self.assertIsNone(sc.zone_ref_from_hist(None, [30.0, 40.0],
+                                                "2026-06-01"))
+
+    def test_state_rebuild_does_not_grandfather_drift(self):
+        # 灾后重建场景: 价已 +18.6% 时新建 watch。无 ref_hint (首见收盘
+        # 口径) 会把 ref 重置成 18.6 → 阈值 26.6 → 永久静默; 带 hist
+        # 推导的 ref_hint (+9.8%) 阈值仍 17.8 → 第 run 个收盘照样报
+        s3 = {**sc.SETTINGS_DEFAULTS, "zone_drift_run": 3}
+        zone = [176.0, 264.0]
+
+        def replay(ref_hint):
+            w, out = None, []
+            for i, day in enumerate(("2026-09-07", "2026-09-08",
+                                     "2026-09-09", "2026-09-10")):
+                w, notes = sc.zone_watch_update(
+                    w, close=313.0, zone=zone, zone_asof="2026-08-09",
+                    today_iso=day, s=s3, ref_hint=ref_hint)
+                out += notes
+            return out
+
+        self.assertTrue(any("过时" in n for n in replay(9.85)))
+        self.assertFalse(any("过时" in n for n in replay(None)))
+
 
 class TestActionBlockFloorTag(unittest.TestCase):
     """zone 评审: 破下沿铸出的 CSP 票在第一屏的 🔵 行必须自带论点检查前置
@@ -1479,13 +1777,22 @@ def _split(row: str) -> list[str]:
     return [c.strip() for c in row.strip().strip("|").split("|")]
 
 
-def _ohlcv_downtrend(last_close: float, n: int = 70) -> pd.DataFrame:
-    """单调下行、收在 last_close 的合成 OHLCV — 喂 technical_snapshot 够用。"""
+def _ohlcv_downtrend(last_close: float, n: int = 70,
+                     split=None) -> pd.DataFrame:
+    """单调下行、收在 last_close 的合成 OHLCV — 喂 technical_snapshot 够用。
+    split=(距最后一根的交易日数, 比率) 时附带 Stock Splits 列 (模拟
+    batch_history 的 actions=True)。"""
     idx = pd.bdate_range("2026-05-01", periods=n)
     c = pd.Series([last_close + (n - 1 - i) * 0.5 for i in range(n)],
                   index=idx, dtype=float)
-    return pd.DataFrame({"Open": c, "High": c * 1.01, "Low": c * 0.99,
-                         "Close": c, "Volume": 1_000_000.0}, index=idx)
+    df = pd.DataFrame({"Open": c, "High": c * 1.01, "Low": c * 0.99,
+                       "Close": c, "Volume": 1_000_000.0}, index=idx)
+    if split is not None:
+        days_ago, ratio = split
+        col = pd.Series(0.0, index=idx)
+        col.iloc[-1 - days_ago] = ratio
+        df["Stock Splits"] = col
+    return df
 
 
 class TestAnalyzeTickerBelowFloor(unittest.TestCase):
@@ -1512,6 +1819,207 @@ class TestAnalyzeTickerBelowFloor(unittest.TestCase):
     def test_flag_false_without_zone(self):
         r = self._run(40.0, None)
         self.assertFalse(r["below_floor"])
+
+
+class TestSplitAfter(unittest.TestCase):
+    """拆股检测: auto_adjust 让价格自洽而手工 zone 死掉 — zone 评审认定的
+    唯一"一夜致死"路径。"""
+
+    def test_no_split_column_none(self):
+        self.assertIsNone(sc.split_after(_ohlcv_downtrend(50.0), "2026-01-01"))
+        self.assertIsNone(sc.split_after(None, "2026-01-01"))
+
+    def test_split_after_asof_detected(self):
+        out = sc.split_after(_ohlcv_downtrend(50.0, split=(5, 10.0)),
+                             "2026-01-01")
+        self.assertIsNotNone(out)
+        self.assertEqual(out[1], 10.0)
+
+    def test_split_before_asof_ignored(self):
+        hist = _ohlcv_downtrend(50.0, split=(60, 10.0))
+        asof = hist.index[-30].date().isoformat()   # 重锚发生在拆股之后
+        self.assertIsNone(sc.split_after(hist, asof))
+
+    def test_no_asof_uses_fallback_window(self):
+        self.assertIsNotNone(
+            sc.split_after(_ohlcv_downtrend(50.0, split=(5, 4.0)), None))
+        self.assertIsNone(     # ~2 个月前的拆股不在 30 日保守窗内
+            sc.split_after(_ohlcv_downtrend(50.0, split=(45, 4.0)), None))
+
+    def test_tz_aware_index(self):
+        # 生产 hist 的 index 可能是交易所本地时区的 tz-aware Timestamp
+        hist = _ohlcv_downtrend(50.0, split=(5, 10.0))
+        hist.index = hist.index.tz_localize("America/New_York")
+        self.assertIsNotNone(sc.split_after(hist, "2026-01-01"))
+
+    def test_multi_split_returns_latest(self):
+        hist = _ohlcv_downtrend(50.0, split=(20, 2.0))
+        hist.loc[hist.index[-6], "Stock Splits"] = 10.0
+        out = sc.split_after(hist, "2026-01-01")
+        self.assertEqual(out[1], 10.0)
+
+
+class TestZoneInvalidOnSplit(unittest.TestCase):
+    def _run(self, split):
+        cfg = {**sc.TICKER_DEFAULTS, "value_zone": [45.0, 57.5],
+               "zone_asof": "2026-05-10"}
+        return sc.analyze_ticker(
+            "XX", cfg, _ohlcv_downtrend(50.0, split=split), {},
+            {"stage": "NORMAL"}, sc.SETTINGS_DEFAULTS, "close",
+            fetch_options=False)
+
+    def test_split_invalidates_zone(self):
+        r = self._run((5, 10.0))
+        self.assertIn("拆股", r["zone_invalid"])
+        self.assertTrue(any("作废" in n for n in r["notes"]))
+        # 分析已按无 zone 跑: 不打左侧标签、无下沿旗标、watch 清空;
+        # 粘性标记已铸造 (随 next_persisted_state 入 state.json)
+        self.assertEqual(r["state"], "PULLBACK")
+        self.assertFalse(r["below_floor"])
+        self.assertIsNone(r["zone_watch"])
+        self.assertEqual(r["zone_split"]["sig"],
+                         sc.zone_sig([45.0, 57.5], "2026-05-10"))
+
+    def test_no_split_zone_intact(self):
+        r = self._run(None)
+        self.assertIsNone(r.get("zone_invalid"))
+        self.assertEqual(r["state"], "LEFT_ZONE")
+
+    def test_invalidation_sticky_after_window(self):
+        # 事件已滑出检测窗 (hist 里无 split 行) 但 state 里有粘性标记 →
+        # 仍作废: 无 zone_asof 的标的不会在 30 日 fallback 窗过后静默复活
+        cfg = {**sc.TICKER_DEFAULTS, "value_zone": [45.0, 57.5]}
+        prev = {"zone_split": {"sig": sc.zone_sig([45.0, 57.5], None),
+                               "info": "拆股 10:1 @ 2026-06-15"}}
+        r = sc.analyze_ticker("XX", cfg, _ohlcv_downtrend(5.0), prev,
+                              {"stage": "NORMAL"}, sc.SETTINGS_DEFAULTS,
+                              "close", fetch_options=False)
+        self.assertIn("拆股", r["zone_invalid"])
+        self.assertEqual(r["zone_split"], prev["zone_split"])
+        self.assertNotEqual(r["state"], "LEFT_ZONE")
+
+    def test_reanchor_clears_sticky_invalidation(self):
+        # 重锚 (区间数值变 → sig 变) → 标记不认: zone 恢复生效, r 不再
+        # 携带 zone_split (next_persisted_state 里键自然掉落)
+        cfg = {**sc.TICKER_DEFAULTS, "value_zone": [4.5, 5.75],
+               "zone_asof": "2026-09-06"}
+        prev = {"zone_split": {"sig": "45-57.5@未标",
+                               "info": "拆股 10:1 @ 2026-06-15"}}
+        r = sc.analyze_ticker("XX", cfg, _ohlcv_downtrend(5.0), prev,
+                              {"stage": "NORMAL"}, sc.SETTINGS_DEFAULTS,
+                              "close", fetch_options=False)
+        self.assertIsNone(r.get("zone_invalid"))
+        self.assertIsNone(r.get("zone_split"))
+        self.assertEqual(r["state"], "LEFT_ZONE")   # 5.0 ∈ [4.5, 5.75]
+
+    def test_persisted_state_carries_split_marker(self):
+        zs = {"sig": "45-57.5@未标", "info": "拆股 10:1 @ 2026-06-15"}
+        entry = sc.next_persisted_state(
+            {}, {"state": "PULLBACK", "zone_split": zs}, "2026-09-07")
+        self.assertEqual(entry["zone_split"], zs)
+        entry2 = sc.next_persisted_state(
+            {"zone_split": zs}, {"state": "PULLBACK"}, "2026-09-08")
+        self.assertNotIn("zone_split", entry2)
+
+    def test_reverse_split_wording(self):
+        cfg = {**sc.TICKER_DEFAULTS, "value_zone": [45.0, 57.5],
+               "zone_asof": "2026-05-10"}
+        r = sc.analyze_ticker("XX", cfg,
+                              _ohlcv_downtrend(200.0, split=(5, 0.25)), {},
+                              {"stage": "NORMAL"}, sc.SETTINGS_DEFAULTS,
+                              "close", fetch_options=False)
+        self.assertIn("合股 1:4", r["zone_invalid"])
+        self.assertNotIn("拆股 0.25", r["zone_invalid"])
+
+    def test_action_label_and_overview_column(self):
+        r = self._run((5, 10.0))
+        self.assertEqual(sc.action_label(r, None), "拆股·重锚区间")
+        ivdf = pd.DataFrame(columns=["date", "symbol", "iv30", "rv30"])
+        now = datetime(2026, 9, 4, 15, 45, tzinfo=sc.ET)
+        text = sc.render_close([r], dict(TestRenderOpenZoneAlert.REGIME),
+                               ivdf, now)
+        self.assertIn("作废", text)
+        self.assertNotIn("45-57.5 (", text)   # 概览不照印已作废的旧区间
+
+    def test_open_pass_alert_says_invalid_not_in_zone(self):
+        # 开盘警报读的是 cfg 里的旧区间 — zone 作废后不能照常催接货
+        r = self._run((5, 10.0))
+        r["prev_state"] = "UPTREND"
+        now = datetime(2026, 9, 4, 9, 45, tzinfo=sc.ET)
+        text = sc.render_open([r], dict(TestRenderOpenZoneAlert.REGIME),
+                              now, sc.SETTINGS_DEFAULTS)
+        self.assertIn("作废", text)
+        self.assertNotIn("在价值区内", text)
+        self.assertNotIn("已跌破价值区下沿", text)
+
+
+class TestZoneReviewFixes(unittest.TestCase):
+    """PR #11 评审的三条 (逐条实测复现过)。"""
+
+    def test_sig_survives_seven_significant_digits(self):
+        # :g 只给 6 位有效数字 — 改了区间却共用身份, 漂移计数不归零,
+        # 上一版的粘性拆股作废还会挂在新区间上
+        a = sc.zone_sig([1000000.0, 1100000.0], "2026-09-05")
+        b = sc.zone_sig([1000001.0, 1100000.0], "2026-09-05")
+        self.assertNotEqual(a, b)
+        c = sc.zone_sig([1.2345678, 2.0], "2026-09-05")
+        d = sc.zone_sig([1.23456789, 2.0], "2026-09-05")
+        self.assertNotEqual(c, d)
+
+    def test_zone_invalid_beats_right_side_state_label(self):
+        # 拆股不清右侧状态: TREND 撞上拆股, 操作列原来显示"持有·跟20日线",
+        # 一个字不提区间已作废
+        idx = pd.bdate_range("2026-05-01", periods=70)
+        c = pd.Series([50.0 + i * 0.5 for i in range(70)], index=idx,
+                      dtype=float)
+        hist = pd.DataFrame({"Open": c, "High": c * 1.01, "Low": c * 0.99,
+                             "Close": c, "Volume": 1_000_000.0}, index=idx)
+        sp = pd.Series(0.0, index=idx)
+        sp.iloc[-6] = 10.0
+        hist["Stock Splits"] = sp
+        cfg = {**sc.TICKER_DEFAULTS, "value_zone": [45.0, 57.5],
+               "zone_asof": "2026-05-10"}
+        r = sc.analyze_ticker("XX", cfg, hist, {"state": "TREND"},
+                              {"stage": "NORMAL"}, sc.SETTINGS_DEFAULTS,
+                              "close", fetch_options=False)
+        self.assertEqual(r["state"], "TREND")      # 右侧状态确实还在
+        self.assertEqual(sc.action_label(r, None), "拆股·重锚区间")
+
+    def test_split_history_coverage_gap_is_reported(self):
+        # 日线窗只有 1 年: 校准日更早时 split_after 的 None 是"查不到"
+        # 而非"没有" — 不能装作已证伪
+        hist = _ohlcv_downtrend(50.0)
+        start = hist.index[0].date().isoformat()
+        self.assertTrue(sc.split_history_covers(hist, start))
+        self.assertFalse(sc.split_history_covers(hist, "2024-01-01"))
+        self.assertTrue(sc.split_history_covers(hist, None))
+        cfg = {**sc.TICKER_DEFAULTS, "value_zone": [45.0, 57.5],
+               "zone_asof": "2024-01-01"}
+        r = sc.analyze_ticker("XX", cfg, hist, {}, {"stage": "NORMAL"},
+                              sc.SETTINGS_DEFAULTS, "close",
+                              fetch_options=False)
+        self.assertTrue(any("拆股检测只覆盖到" in n for n in r["notes"]))
+        self.assertIsNone(r.get("zone_invalid"))   # 提示而非作废
+        # 与其余 zone 生命周期提示同规矩: open pass 不出
+        r_open = sc.analyze_ticker("XX", cfg, hist, {}, {"stage": "NORMAL"},
+                                   sc.SETTINGS_DEFAULTS, "open",
+                                   fetch_options=False)
+        self.assertFalse(any("拆股检测只覆盖到" in n for n in r_open["notes"]))
+
+
+class TestIdentityMismatch(unittest.TestCase):
+    """kind=etf/index 却有真实财报日 = 身份体检 (SPCX 案 ~85 天无人发现)。"""
+
+    def test_etf_with_real_earnings_flags(self):
+        note = sc.identity_mismatch_note("etf", "2026-10-20")
+        self.assertIsNotNone(note)
+        self.assertIn("身份", note)
+
+    def test_quiet_cases(self):
+        self.assertIsNone(sc.identity_mismatch_note("etf", ""))
+        self.assertIsNone(sc.identity_mismatch_note("etf", None))
+        self.assertIsNone(sc.identity_mismatch_note("index", ""))
+        self.assertIsNone(sc.identity_mismatch_note("stock", "2026-10-20"))
 
 
 class TestZonePosition(unittest.TestCase):
