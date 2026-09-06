@@ -1306,6 +1306,45 @@ class TestLoadConfig(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._load("[tickers.GOOG]\nvalue_zone = [0, 340]\n")
 
+    def test_nonfinite_settings_raise(self):
+        # PR #10 评审: TOML 的 nan 是合法 float, 而 nan 参与的比较恒为
+        # False — near_zone_pct = nan 会让 NEAR_ZONE 永远不成立, 报告
+        # 照出、零错误, 信号静默消失
+        with self.assertRaises(ValueError):
+            self._load("[settings]\nnear_zone_pct = nan\n[tickers.QQQ]\n")
+        with self.assertRaises(ValueError):
+            self._load("[settings]\nvvix_halt = inf\n[tickers.QQQ]\n")
+        with self.assertRaises(ValueError):
+            self._load("[settings]\ncsp_dte_normal = [nan, 31]\n"
+                       "[tickers.QQQ]\n")
+
+    def test_ticker_value_types_gated(self):
+        # options = "false" 是合法 TOML 字符串且非空为真 — 想关期权票,
+        # 结果照常抓链出票, 与配置意图相反
+        with self.assertRaises(ValueError):
+            self._load('[tickers.QQQ]\noptions = "false"\n')
+        with self.assertRaises(ValueError):
+            self._load('[tickers.QQQ]\nhigh_beta = "true"\n')
+        with self.assertRaises(ValueError):
+            self._load("[tickers.QQQ]\nkind = 123\n")
+        with self.assertRaises(ValueError):
+            self._load("[tickers.QQQ]\ntwo_x = 2\n")
+
+    def test_unknown_kind_raises(self):
+        # kind 只在相等比较里出现: "ETF" 静默退化成个股 LEAP delta 带,
+        # 并让 ETF/index 的财报豁免失效
+        with self.assertRaises(ValueError):
+            self._load('[tickers.QQQ]\nkind = "ETF"\n')
+        _, tk = self._load('[tickers.QQQ]\nkind = "index"\n')
+        self.assertEqual(tk["QQQ"]["kind"], "index")
+
+    def test_unknown_toplevel_table_raises(self):
+        # [setting] 手滑: 整段阈值连同你以为改过的每个键被静默忽略
+        with self.assertRaises(ValueError):
+            self._load("[setting]\nnear_zone_pct = 4.0\n[tickers.QQQ]\n")
+        with self.assertRaises(ValueError):
+            self._load('[ticker.QQQ]\nkind = "index"\n')
+
     def test_case_collision_raises(self):
         with self.assertRaises(ValueError):
             self._load("[tickers.spcx]\noptions = false\n"

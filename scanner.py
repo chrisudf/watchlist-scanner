@@ -147,12 +147,23 @@ SETTINGS_DEFAULTS = {
 }
 
 
+TICKER_KINDS = ("index", "stock", "etf")
+
+
+def _finite_num(x) -> bool:
+    """有限数值。bool 是 int 的子类, 显式排除。
+
+    nan/inf 必须在这里拦住: TOML 的 `nan` 是合法 float 字面量, 而 nan
+    参与的比较**恒为 False** — near_zone_pct = nan 会让 NEAR_ZONE 判定
+    永远不成立, 报告照常出、没有任何错误, 信号静默消失 (PR #10 评审)。"""
+    return (isinstance(x, (int, float)) and not isinstance(x, bool)
+            and math.isfinite(x))
+
+
 def _valid_zone(zone) -> bool:
-    """[低, 高] 两个有限正数, 低 < 高。bool 是 int 的子类, 显式排除。"""
+    """[低, 高] 两个有限正数, 低 < 高。"""
     return (isinstance(zone, (list, tuple)) and len(zone) == 2
-            and all(isinstance(x, (int, float)) and not isinstance(x, bool)
-                    and math.isfinite(x) for x in zone)
-            and 0 < zone[0] < zone[1])
+            and all(_finite_num(x) for x in zone) and 0 < zone[0] < zone[1])
 
 
 def load_config(path: Path = CONFIG_FILE) -> tuple[dict, dict]:
@@ -164,6 +175,13 @@ def load_config(path: Path = CONFIG_FILE) -> tuple[dict, dict]:
     TypeError, 或者阈值默认值顶着你以为改过的名字继续生效。"""
     with open(path, "rb") as f:
         raw = tomllib.load(f)
+    unknown_top = set(raw) - {"settings", "tickers"}
+    if unknown_top:
+        # [setting] / [ticker.QQQ] 这类表名手滑不会报错, 整段配置连同
+        # 你以为改过的每个阈值一起被静默忽略 (PR #10 评审)
+        raise ValueError(
+            f"顶层未知表 (typo?): {', '.join('[' + k + ']' for k in sorted(unknown_top))} "
+            f"— 只认 [settings] 与 [tickers.*]")
     settings_raw = raw.get("settings", {})
     unknown = set(settings_raw) - set(SETTINGS_DEFAULTS)
     if unknown:
@@ -175,11 +193,10 @@ def load_config(path: Path = CONFIG_FILE) -> tuple[dict, dict]:
         if isinstance(default, bool):
             ok = isinstance(v, bool)
         elif isinstance(default, (int, float)):
-            ok = isinstance(v, (int, float)) and not isinstance(v, bool)
+            ok = _finite_num(v)
         elif isinstance(default, list):
             ok = (isinstance(v, (list, tuple)) and len(v) == len(default)
-                  and all(isinstance(x, (int, float))
-                          and not isinstance(x, bool) for x in v))
+                  and all(_finite_num(x) for x in v))
         else:
             ok = isinstance(v, type(default))
         if not ok:
@@ -192,6 +209,27 @@ def load_config(path: Path = CONFIG_FILE) -> tuple[dict, dict]:
         if unknown:
             raise ValueError(
                 f"[tickers.{sym}] 未知键 (typo?): {', '.join(sorted(unknown))}")
+        for k, v in tcfg.items():
+            # 键名对了不代表值对: options = "false" 是合法 TOML 字符串,
+            # 而非空字符串为真 — 想关期权票, 结果照常抓链出票 (PR #10 评审)
+            if k == "value_zone":
+                continue                      # 下面单独校验 (可为 None)
+            default = TICKER_DEFAULTS[k]
+            if isinstance(default, bool):     # options / high_beta
+                ok = isinstance(v, bool)
+            elif isinstance(default, str):    # kind / notes
+                ok = isinstance(v, str)
+            else:                             # two_x: 默认 None
+                ok = v is None or isinstance(v, str)
+            if not ok:
+                raise ValueError(f"[tickers.{sym}] {k} 类型错误: 期望与默认值 "
+                                 f"{default!r} 同类, 得到 {v!r}")
+        kind = tcfg.get("kind", TICKER_DEFAULTS["kind"])
+        if kind not in TICKER_KINDS:
+            # kind 只在三处相等比较里出现 — 拼错不报错, 只是悄悄换成
+            # 个股 LEAP delta 带并让 ETF/index 的财报豁免失效
+            raise ValueError(f"[tickers.{sym}] kind 未知: {kind!r} "
+                             f"— 只认 {', '.join(TICKER_KINDS)}")
         cfg = {**TICKER_DEFAULTS, **tcfg}
         zone = cfg["value_zone"]
         if zone is not None:
