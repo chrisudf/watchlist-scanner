@@ -152,6 +152,27 @@ class TestStateMachine(unittest.TestCase):
         self.assertEqual(state, "LEFT_ZONE")
         self.assertFalse(any("下沿" in n for n in notes))
 
+    def test_near_zone_boundary_is_inclusive(self):
+        # QQQ 上线态: zone [635,685], 685*1.05=719.25, 收 718.96 距边界
+        # 0.04% — 边界语义 (<=) 必须钉死, 两份 in/near 实现 (next_state 与
+        # analyze_ticker) 都以此为准
+        state, _ = sc.next_state("PULLBACK", close=719.25, sma20=720,
+                                 confirmed=False, zone=[635, 685], near_pct=5)
+        self.assertEqual(state, "NEAR_ZONE")
+        state, _ = sc.next_state("PULLBACK", close=719.26, sma20=720,
+                                 confirmed=False, zone=[635, 685], near_pct=5)
+        self.assertEqual(state, "PULLBACK")
+
+    def test_stop_beats_zone_label(self):
+        # 右侧持仓破 20 日线且落进价值区: 止损优先, 是 PULLBACK 不是
+        # LEFT_ZONE — 止损日的动作是减/清多头, 不是接货打标签
+        for prev in ("CONFIRMED", "TREND"):
+            state, notes = sc.next_state(prev, close=250, sma20=255,
+                                         confirmed=False, zone=[200, 260],
+                                         near_pct=5)
+            self.assertEqual(state, "PULLBACK", prev)
+            self.assertTrue(any("止损" in n for n in notes), prev)
+
 
 class TestOptionMath(unittest.TestCase):
     def test_sixteen_rule(self):
@@ -1139,6 +1160,68 @@ class TestActionBlockHaltDedup(unittest.TestCase):
         self.assertIn("⏸ **AAA** CSP: 年化仅", text)
         self.assertIn("⏸ **AAA** LEAP: 财报", text)
         self.assertNotIn("全市场硬停牌", text)
+
+
+class TestCSPTicketZoneCap(unittest.TestCase):
+    """CSP 的接货带上沿硬 cap — 整个 CSP 设计的唯一硬门 — 此前在
+    csp_ticket 内零直接断言 (9/4 评审 D2 的 zone 特化落地)。合成链按
+    BS 定价, 复用 TestRR25Snapshot 的 fake 基建路数。
+
+    对 SETTINGS_DEFAULTS 的耦合余量 (改这些参数前先看这里):
+    - test_strike_hard_capped: cap 87 必须真 binding (无 cap 时 delta 带
+      自己选 88) — 选中的 86.5 档年化 ~11.9%, csp_min_annualized 上调到
+      12+ 会误红本测试; sigma 调高不可行 (0.6 起 delta 带滑到 85 以下,
+      cap 又不 binding)
+    - test_thin_premium_skips 有 mid<0.20 与年化双门兜底, 对阈值不敏感
+    - csp_dte_normal 必须仍含 21 DTE"""
+
+    T_DTE = 21
+    EXPIRIES = [("2026-10-02", 21)]
+
+    def _cc(self, spot=100.0, sigma=0.50, oi=500):
+        T = self.T_DTE / 365.0
+        traded = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=1)
+        rows = []
+        for i in range(30):
+            k = round(spot * (0.55 + 0.015 * i), 2)   # 55 … 98.5
+            px = sc.bs_price(spot, k, T, sc.RATE, sigma, is_call=False)
+            half = max(px * 0.02, 0.005)
+            rows.append({"strike": k, "lastPrice": px, "lastTradeDate": traded,
+                         "openInterest": oi, "bid": px - half, "ask": px + half})
+        df = pd.DataFrame(rows)
+        return _FakeCC(_FakeChain(pd.DataFrame([]), df),
+                       expiries=list(self.EXPIRIES))
+
+    def test_strike_hard_capped_at_zone_top(self):
+        # cap 必须真 binding: 此 fixture 下无 cap 时 delta 带选 88.0
+        # (> 87), 有 cap 时退到 86.5 — cap 被删掉或放松 (如 *1.05)
+        # 本断言都会红。zone [80,95] 之类宽带是空转 pin: delta 带自己
+        # 就选在 cap 之下, 删 cap 照样绿
+        t = sc.csp_ticket(self._cc(), 100.0, None, "2026-11-20", "NORMAL",
+                          [70.0, 87.0], sc.SETTINGS_DEFAULTS)
+        self.assertNotIn("skip_reason", t)
+        self.assertLessEqual(t["strike"], 87.0)
+
+    def test_no_strike_under_cap_skips_whole_ticket(self):
+        # zone 上沿低于链上全部行权价 → 整票 skip, 不是退而求其次选高 strike
+        t = sc.csp_ticket(self._cc(), 100.0, None, "2026-11-20", "NORMAL",
+                          [40.0, 50.0], sc.SETTINGS_DEFAULTS)
+        self.assertIn("skip_reason", t)
+        self.assertIn("上沿", t["skip_reason"])
+
+    def test_thin_premium_skips(self):
+        # 低 IV → 接货档年化过不了下限 → 拒票 (剧本: 改正股限价单)
+        t = sc.csp_ticket(self._cc(sigma=0.10), 100.0, None, "2026-11-20",
+                          "NORMAL", [80.0, 95.0], sc.SETTINGS_DEFAULTS)
+        self.assertIn("skip_reason", t)
+        self.assertIn("太薄", t["skip_reason"])
+
+    def test_earnings_inside_window_blocks(self):
+        # short 不跨财报: 窗口内唯一到期日在财报之后 → 整票 skip
+        t = sc.csp_ticket(self._cc(), 100.0, None, "2026-09-20", "NORMAL",
+                          [80.0, 95.0], sc.SETTINGS_DEFAULTS)
+        self.assertIn("skip_reason", t)
+        self.assertIn("财报", t["skip_reason"])
 
 
 class TestLoadConfig(unittest.TestCase):
