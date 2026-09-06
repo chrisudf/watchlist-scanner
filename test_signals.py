@@ -8,8 +8,10 @@ No network access needed — everything here is synthetic data.
 import io
 import json
 import math
+import tempfile
 import unittest
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -118,6 +120,58 @@ class TestStateMachine(unittest.TestCase):
         state, _ = sc.next_state("LEFT_ZONE", close=250, sma20=240,
                                  confirmed=True, zone=[200, 260], near_pct=5)
         self.assertEqual(state, "CONFIRMED")
+
+    def test_floor_break_note_decoupled_from_state(self):
+        # zone 评审: 破下沿的"检查论点"跟价格走, 不跟状态标签走 — 深跌后
+        # 反弹站上塌陷的 20 日线 (UPTREND) 时原实现一声不响, 而 CSP/档位
+        # 照常可执行
+        state, notes = sc.next_state("UPTREND", close=190, sma20=185,
+                                     confirmed=False, zone=[200, 260], near_pct=5)
+        self.assertEqual(state, "UPTREND")
+        self.assertTrue(any("下沿" in n for n in notes))
+        # TREND 持续期 (收盘在20日线上) 同理
+        state, notes = sc.next_state("TREND", close=190, sma20=185,
+                                     confirmed=False, zone=[200, 260], near_pct=5)
+        self.assertEqual(state, "TREND")
+        self.assertTrue(any("下沿" in n for n in notes))
+
+    def test_floor_break_note_on_stop_day(self):
+        # 止损转 PULLBACK 当日 (原实现只出止损, 下沿警告被状态分支吞掉):
+        # 两条 note 并存, 且状态仍是 PULLBACK 不是 LEFT_ZONE (止损优先)
+        state, notes = sc.next_state("TREND", close=190, sma20=195,
+                                     confirmed=False, zone=[200, 260], near_pct=5)
+        self.assertEqual(state, "PULLBACK")
+        self.assertTrue(any("止损" in n for n in notes))
+        self.assertTrue(any("下沿" in n for n in notes))
+
+    def test_no_floor_note_inside_zone(self):
+        # 在区内 (未破下沿) 不出论点检查 — 与既有 test_zone_states 的
+        # 破下沿用例互为边界
+        state, notes = sc.next_state("UPTREND", close=210, sma20=260,
+                                     confirmed=False, zone=[200, 260], near_pct=5)
+        self.assertEqual(state, "LEFT_ZONE")
+        self.assertFalse(any("下沿" in n for n in notes))
+
+    def test_near_zone_boundary_is_inclusive(self):
+        # QQQ 上线态: zone [635,685], 685*1.05=719.25, 收 718.96 距边界
+        # 0.04% — 边界语义 (<=) 必须钉死, 两份 in/near 实现 (next_state 与
+        # analyze_ticker) 都以此为准
+        state, _ = sc.next_state("PULLBACK", close=719.25, sma20=720,
+                                 confirmed=False, zone=[635, 685], near_pct=5)
+        self.assertEqual(state, "NEAR_ZONE")
+        state, _ = sc.next_state("PULLBACK", close=719.26, sma20=720,
+                                 confirmed=False, zone=[635, 685], near_pct=5)
+        self.assertEqual(state, "PULLBACK")
+
+    def test_stop_beats_zone_label(self):
+        # 右侧持仓破 20 日线且落进价值区: 止损优先, 是 PULLBACK 不是
+        # LEFT_ZONE — 止损日的动作是减/清多头, 不是接货打标签
+        for prev in ("CONFIRMED", "TREND"):
+            state, notes = sc.next_state(prev, close=250, sma20=255,
+                                         confirmed=False, zone=[200, 260],
+                                         near_pct=5)
+            self.assertEqual(state, "PULLBACK", prev)
+            self.assertTrue(any("止损" in n for n in notes), prev)
 
 
 class TestOptionMath(unittest.TestCase):
@@ -440,10 +494,10 @@ class TestEmailHtml(unittest.TestCase):
         # Gmail 超过 ~102KB 会截断成 "[Message clipped]" — 报告被静默切掉
         # 一半比不发还糟。20 只标的的概览表 + 每只两行 note 是个偏悲观的
         # 规模, 留足余量。
-        head = "| 标的 | 状态 | 操作 | 收盘 | Δ% | vs20日 | 量比 | 三选二 | 价值区 | iv/rv | IVP |"
+        head = "| 标的 | 价值区 | 收盘 | 状态 | 操作 | Δ% | vs20日 | 量比 | 三选二 | iv/rv | IVP |"
         sep = "|" + "---|" * 11
-        rows = ["| SYM%02d | 回调中(20日线下) | 设区间 | 709.24 | +1.2 | -0.0%% "
-                "| 1.0x | 低✓ 收· 破· | 380-440 (上方+16%%) | 25/47%% | 62 |" % i
+        rows = ["| SYM%02d | 380-440 (上方+16%%) | 709.24 | 回调中(20日线下) "
+                "| 设区间 | +1.2 | -0.0%% | 1.0x | 低✓ 收· 破· | 25/47%% | 62 |" % i
                 for i in range(20)]
         notes = []
         for i in range(20):
@@ -474,6 +528,17 @@ class TestEmailHtml(unittest.TestCase):
         self.assertIn("709.24", cards)
         self.assertIn("量比", cards)
         self.assertNotIn("价值区", cards)          # 空值列不占位
+
+    def test_narrow_card_subtitle_follows_state_column(self):
+        # 概览表把价值区提到第二列后, 卡片标题旁的副标题必须还是状态 —
+        # 按列序写死会变成 "QQQ 未设" (无 zone 的标的) 或 "SYM —"
+        md = ("| 标的 | 价值区 | 状态 | 收盘 |\n|---|---|---|---|\n"
+              "| QQQ | 未设 | 回调中 | 709.24 |")
+        cards = sc.md_to_email_html(md).split('class="wl-narrow"')[1]
+        title = cards[cards.index("QQQ"):cards.index("</div>")]
+        self.assertIn("回调中", title)             # 副标题 = 状态
+        self.assertNotIn("未设", title)            # 不是价值区, 更不是空值
+        self.assertIn("收盘", cards)               # 其余列照常带标签摊开
 
     def test_resend_payload_carries_both_text_and_html(self):
         from unittest.mock import patch, MagicMock
@@ -1106,6 +1171,434 @@ class TestActionBlockHaltDedup(unittest.TestCase):
         self.assertIn("⏸ **AAA** CSP: 年化仅", text)
         self.assertIn("⏸ **AAA** LEAP: 财报", text)
         self.assertNotIn("全市场硬停牌", text)
+
+
+class TestCSPTicketZoneCap(unittest.TestCase):
+    """CSP 的接货带上沿硬 cap — 整个 CSP 设计的唯一硬门 — 此前在
+    csp_ticket 内零直接断言 (9/4 评审 D2 的 zone 特化落地)。合成链按
+    BS 定价, 复用 TestRR25Snapshot 的 fake 基建路数。
+
+    对 SETTINGS_DEFAULTS 的耦合余量 (改这些参数前先看这里):
+    - test_strike_hard_capped: cap 87 必须真 binding (无 cap 时 delta 带
+      自己选 88) — 选中的 86.5 档年化 ~11.9%, csp_min_annualized 上调到
+      12+ 会误红本测试; sigma 调高不可行 (0.6 起 delta 带滑到 85 以下,
+      cap 又不 binding)
+    - test_thin_premium_skips 有 mid<0.20 与年化双门兜底, 对阈值不敏感
+    - csp_dte_normal 必须仍含 21 DTE"""
+
+    T_DTE = 21
+    EXPIRIES = [("2026-10-02", 21)]
+
+    def _cc(self, spot=100.0, sigma=0.50, oi=500):
+        T = self.T_DTE / 365.0
+        traded = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=1)
+        rows = []
+        for i in range(30):
+            k = round(spot * (0.55 + 0.015 * i), 2)   # 55 … 98.5
+            px = sc.bs_price(spot, k, T, sc.RATE, sigma, is_call=False)
+            half = max(px * 0.02, 0.005)
+            rows.append({"strike": k, "lastPrice": px, "lastTradeDate": traded,
+                         "openInterest": oi, "bid": px - half, "ask": px + half})
+        df = pd.DataFrame(rows)
+        return _FakeCC(_FakeChain(pd.DataFrame([]), df),
+                       expiries=list(self.EXPIRIES))
+
+    def test_strike_hard_capped_at_zone_top(self):
+        # cap 必须真 binding: 此 fixture 下无 cap 时 delta 带选 88.0
+        # (> 87), 有 cap 时退到 86.5 — cap 被删掉或放松 (如 *1.05)
+        # 本断言都会红。zone [80,95] 之类宽带是空转 pin: delta 带自己
+        # 就选在 cap 之下, 删 cap 照样绿
+        t = sc.csp_ticket(self._cc(), 100.0, None, "2026-11-20", "NORMAL",
+                          [70.0, 87.0], sc.SETTINGS_DEFAULTS)
+        self.assertNotIn("skip_reason", t)
+        self.assertLessEqual(t["strike"], 87.0)
+
+    def test_no_strike_under_cap_skips_whole_ticket(self):
+        # zone 上沿低于链上全部行权价 → 整票 skip, 不是退而求其次选高 strike
+        t = sc.csp_ticket(self._cc(), 100.0, None, "2026-11-20", "NORMAL",
+                          [40.0, 50.0], sc.SETTINGS_DEFAULTS)
+        self.assertIn("skip_reason", t)
+        self.assertIn("上沿", t["skip_reason"])
+
+    def test_thin_premium_skips(self):
+        # 低 IV → 接货档年化过不了下限 → 拒票 (剧本: 改正股限价单)
+        t = sc.csp_ticket(self._cc(sigma=0.10), 100.0, None, "2026-11-20",
+                          "NORMAL", [80.0, 95.0], sc.SETTINGS_DEFAULTS)
+        self.assertIn("skip_reason", t)
+        self.assertIn("太薄", t["skip_reason"])
+
+    def test_earnings_inside_window_blocks(self):
+        # short 不跨财报: 窗口内唯一到期日在财报之后 → 整票 skip
+        t = sc.csp_ticket(self._cc(), 100.0, None, "2026-09-20", "NORMAL",
+                          [80.0, 95.0], sc.SETTINGS_DEFAULTS)
+        self.assertIn("skip_reason", t)
+        self.assertIn("财报", t["skip_reason"])
+
+
+class TestLoadConfig(unittest.TestCase):
+    """配置错误要在装载时炸 (zone 评审): 字符串 zone 此前能穿过校验,
+    运行期变成被宽 except 吞掉的 TypeError; 拼错的键静默落回默认值;
+    [tickers.spcx]+[tickers.SPCX] 合法共存, upper() 后 last-wins 丢条目。"""
+
+    def _load(self, text):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "watchlist.toml"
+            p.write_text(text, encoding="utf-8")
+            return sc.load_config(p)
+
+    def test_valid_config_loads_and_normalizes_zone(self):
+        s, t = self._load(
+            "[settings]\nnear_zone_pct = 4.0\n"
+            "[tickers.rklb]\nhigh_beta = true\nvalue_zone = [45, 57.5]\n")
+        self.assertEqual(s["near_zone_pct"], 4.0)
+        self.assertEqual(t["RKLB"]["value_zone"], [45.0, 57.5])
+        self.assertIsInstance(t["RKLB"]["value_zone"][0], float)
+
+    def test_repo_watchlist_still_loads(self):
+        # 白名单/类型门不得误伤真实配置文件
+        s, t = sc.load_config()
+        self.assertTrue(t)
+
+    def test_unknown_settings_key_raises(self):
+        # 已知 D1: vvix_halt 拼成 vivx_halt → 默认值顶着你以为改过的名字生效
+        with self.assertRaises(ValueError):
+            self._load("[settings]\nvivx_halt = 105\n[tickers.QQQ]\n")
+
+    def test_settings_value_type_gated(self):
+        # TOML 引号手滑: 键名合法、值是字符串 — 会在 render_open 的
+        # abs(gap) >= s[...] 处裸崩 (宽 except 之外), 无报告无邮件
+        with self.assertRaises(ValueError):
+            self._load('[settings]\ngap_alert_pct = "1.5"\n[tickers.QQQ]\n')
+        with self.assertRaises(ValueError):
+            self._load("[settings]\nvvix_halt = true\n[tickers.QQQ]\n")
+        with self.assertRaises(ValueError):
+            self._load("[settings]\ncsp_dte_normal = [12]\n[tickers.QQQ]\n")
+        # int 给 float 键是合法宽容 (TOML 里 5 与 5.0 都常见)
+        s, _ = self._load("[settings]\nnear_zone_pct = 5\n[tickers.QQQ]\n")
+        self.assertEqual(s["near_zone_pct"], 5)
+
+    def test_unknown_ticker_key_raises(self):
+        with self.assertRaises(ValueError):
+            self._load("[tickers.QQQ]\nvalue_zon = [600, 700]\n")
+
+    def test_string_zone_raises(self):
+        with self.assertRaises(ValueError):
+            self._load('[tickers.GOOG]\nvalue_zone = ["315", "340"]\n')
+
+    def test_scalar_zone_raises_valueerror_not_typeerror(self):
+        # 旧代码在 len(int) 处裸崩 TypeError, 整个 load 无提示炸掉
+        with self.assertRaises(ValueError):
+            self._load("[tickers.GOOG]\nvalue_zone = 315\n")
+
+    def test_bool_zone_raises(self):
+        with self.assertRaises(ValueError):
+            self._load("[tickers.GOOG]\nvalue_zone = [true, 340]\n")
+
+    def test_nonfinite_zone_raises(self):
+        with self.assertRaises(ValueError):
+            self._load("[tickers.GOOG]\nvalue_zone = [315, inf]\n")
+        with self.assertRaises(ValueError):
+            self._load("[tickers.GOOG]\nvalue_zone = [nan, 340]\n")
+
+    def test_reversed_or_nonpositive_zone_raises(self):
+        with self.assertRaises(ValueError):
+            self._load("[tickers.GOOG]\nvalue_zone = [340, 315]\n")
+        with self.assertRaises(ValueError):
+            self._load("[tickers.GOOG]\nvalue_zone = [0, 340]\n")
+
+    def test_nonfinite_settings_raise(self):
+        # PR #10 评审: TOML 的 nan 是合法 float, 而 nan 参与的比较恒为
+        # False — near_zone_pct = nan 会让 NEAR_ZONE 永远不成立, 报告
+        # 照出、零错误, 信号静默消失
+        with self.assertRaises(ValueError):
+            self._load("[settings]\nnear_zone_pct = nan\n[tickers.QQQ]\n")
+        with self.assertRaises(ValueError):
+            self._load("[settings]\nvvix_halt = inf\n[tickers.QQQ]\n")
+        with self.assertRaises(ValueError):
+            self._load("[settings]\ncsp_dte_normal = [nan, 31]\n"
+                       "[tickers.QQQ]\n")
+
+    def test_ticker_value_types_gated(self):
+        # options = "false" 是合法 TOML 字符串且非空为真 — 想关期权票,
+        # 结果照常抓链出票, 与配置意图相反
+        with self.assertRaises(ValueError):
+            self._load('[tickers.QQQ]\noptions = "false"\n')
+        with self.assertRaises(ValueError):
+            self._load('[tickers.QQQ]\nhigh_beta = "true"\n')
+        with self.assertRaises(ValueError):
+            self._load("[tickers.QQQ]\nkind = 123\n")
+        with self.assertRaises(ValueError):
+            self._load("[tickers.QQQ]\ntwo_x = 2\n")
+
+    def test_unknown_kind_raises(self):
+        # kind 只在相等比较里出现: "ETF" 静默退化成个股 LEAP delta 带,
+        # 并让 ETF/index 的财报豁免失效
+        with self.assertRaises(ValueError):
+            self._load('[tickers.QQQ]\nkind = "ETF"\n')
+        _, tk = self._load('[tickers.QQQ]\nkind = "index"\n')
+        self.assertEqual(tk["QQQ"]["kind"], "index")
+
+    def test_unknown_toplevel_table_raises(self):
+        # [setting] 手滑: 整段阈值连同你以为改过的每个键被静默忽略
+        with self.assertRaises(ValueError):
+            self._load("[setting]\nnear_zone_pct = 4.0\n[tickers.QQQ]\n")
+        with self.assertRaises(ValueError):
+            self._load('[ticker.QQQ]\nkind = "index"\n')
+
+    def test_case_collision_raises(self):
+        with self.assertRaises(ValueError):
+            self._load("[tickers.spcx]\noptions = false\n"
+                       "[tickers.SPCX]\nkind = \"stock\"\n")
+
+    def test_empty_tickers_raises(self):
+        with self.assertRaises(ValueError):
+            self._load("[settings]\nnear_zone_pct = 5.0\n")
+
+
+class TestActionBlockFloorTag(unittest.TestCase):
+    """zone 评审: 破下沿铸出的 CSP 票在第一屏的 🔵 行必须自带论点检查前置
+    — 原实现的 SELL 行不携带任何 note, 警告只可能藏在详情区。"""
+
+    CSP = {"exp": "2026-10-02", "strike": 50.0, "mid": 0.60, "delta": 0.12,
+           "annualized_pct": 15.0}
+
+    def _r(self, **kw):
+        base = {"symbol": "RKLB", "error": None, "tech": {"close": 40.0},
+                "notes": [], "state": "LEFT_ZONE", "leap": None,
+                "csp": dict(self.CSP), "iv30": None,
+                "cfg": {"value_zone": [45.0, 57.5], "options": True}}
+        base.update(kw)
+        return base
+
+    def test_below_floor_prefixes_sell_line(self):
+        ivdf = pd.DataFrame(columns=["date", "symbol", "iv30", "rv30"])
+        text = "\n".join(sc.action_block([self._r(below_floor=True)], ivdf))
+        self.assertIn("破下沿", text)
+        self.assertIn("论点检查", text)
+        self.assertIn("SELL 2026-10-02 50P", text)
+
+    def test_in_zone_sell_line_unprefixed(self):
+        ivdf = pd.DataFrame(columns=["date", "symbol", "iv30", "rv30"])
+        text = "\n".join(sc.action_block(
+            [self._r(below_floor=False, tech={"close": 50.0})], ivdf))
+        self.assertNotIn("破下沿", text)
+        self.assertIn("SELL 2026-10-02 50P", text)
+
+    def test_leap_line_carries_floor_tag(self):
+        # CONFIRMED+破下沿可达 (深跌后不再新低+突破前20日高即三选二) —
+        # 开新多头的论点检查分量不低于卖 put, 🟢 行同样带前置
+        leap = {"exp": "2028-01-21", "strike": 30.0, "mid": 12.0,
+                "delta": 0.80}
+        ivdf = pd.DataFrame(columns=["date", "symbol", "iv30", "rv30"])
+        text = "\n".join(sc.action_block(
+            [self._r(below_floor=True, csp=None, leap=leap)], ivdf))
+        self.assertIn("🟢", text)
+        self.assertIn("破下沿", text)
+
+    def test_ladder_only_below_floor_gets_standalone_warning(self):
+        # DRAM/SPCX 场景 (options=false 只有分批档): 破下沿恰是剧本要求
+        # 论点检查的日子, 不能被第一屏归进"其余今日无动作"
+        ivdf = pd.DataFrame(columns=["date", "symbol", "iv30", "rv30"])
+        r = self._r(below_floor=True, csp=None,
+                    ladder=[57.5, 45.0, 36.9],
+                    cfg={"value_zone": [45.0, 57.5], "options": False})
+        text = "\n".join(sc.action_block([r], ivdf))
+        self.assertIn("已破价值区下沿", text)
+        self.assertNotIn("其余今日无动作", text)
+
+    def test_csp_skipped_below_floor_gets_standalone_warning(self):
+        # CSP 被 skip (权利金太薄) 时 ⏸ 行原文是"改正股限价单" — 破下沿
+        # 当天这等于催继续摊, 独立 ⚠️ 行必须在场
+        ivdf = pd.DataFrame(columns=["date", "symbol", "iv30", "rv30"])
+        r = self._r(below_floor=True,
+                    csp={"skip_reason": "接货档权利金太薄: 年化仅 4.1%"})
+        text = "\n".join(sc.action_block([r], ivdf))
+        self.assertIn("已破价值区下沿", text)
+
+
+class TestFinishCSPFloorNote(unittest.TestCase):
+    """_finish_csp: 现价破 zone 下沿时票面第一条 note = 论点检查前置。"""
+
+    C = {"exp": "2026-10-02", "dte": 21, "strike": 34.0, "mid": 0.50,
+         "src": "live", "iv": 0.8, "delta": 0.12, "oi": 500,
+         "spread_pct": 4.0}
+
+    def test_below_floor_prepends_thesis_check(self):
+        t = sc._finish_csp(dict(self.C), spot=40.0, s=sc.SETTINGS_DEFAULTS,
+                           zone=[45.0, 57.5], panic=False, extra_notes=[])
+        self.assertTrue(t["notes"])
+        self.assertIn("论点", t["notes"][0])
+        self.assertIn("下沿", t["notes"][0])
+
+    def test_in_zone_no_floor_note(self):
+        t = sc._finish_csp(dict(self.C), spot=50.0, s=sc.SETTINGS_DEFAULTS,
+                           zone=[45.0, 57.5], panic=False, extra_notes=[])
+        self.assertFalse(any("下沿" in n for n in t["notes"]))
+
+    def test_no_zone_no_floor_note(self):
+        t = sc._finish_csp(dict(self.C), spot=40.0, s=sc.SETTINGS_DEFAULTS,
+                           zone=None, panic=False, extra_notes=[])
+        self.assertFalse(any("下沿" in n for n in t["notes"]))
+
+
+class TestRenderOpenZoneAlert(unittest.TestCase):
+    """开盘 pass 的价值区警报: 破下沿 ≠ 在价值区内 — 原实现对两种情形
+    同一句"核对 CSP 挂单/接货档位", 对破下沿的标的是在催继续摊。"""
+
+    REGIME = {"vix": 15.0, "vix3m": 17.0, "ratio": 0.882, "vxn": None,
+              "as_of": "2026-09-04", "source": "CBOE", "stage": "NORMAL",
+              "vx": {}, "vvix": {}, "move": {}, "stale_days": 0,
+              "last_episode": None, "crossed_up": False,
+              "crossed_down": False}
+
+    def _r(self, sym, close, zone):
+        return {"symbol": sym, "error": None, "earnings": "",
+                "prev_state": "UPTREND", "notes": [],
+                "tech": {"close": close, "sma20": close, "gap_pct": 0.0,
+                         "change_pct": 0.0},
+                "cfg": {"value_zone": zone, "options": True}}
+
+    def _render(self, r):
+        now = datetime(2026, 9, 4, 9, 45, tzinfo=sc.ET)
+        return sc.render_open([r], dict(self.REGIME), now,
+                              sc.SETTINGS_DEFAULTS)
+
+    def test_below_floor_says_thesis_check_not_buy(self):
+        text = self._render(self._r("RKLB", 40.0, [45.0, 57.5]))
+        self.assertIn("已跌破价值区下沿", text)
+        self.assertIn("论点", text)
+        self.assertNotIn("核对 CSP 挂单", text)
+
+    def test_in_zone_still_prompts_orders(self):
+        text = self._render(self._r("GOOG", 335.31, [315.0, 340.0]))
+        self.assertIn("在价值区内", text)
+        self.assertIn("核对 CSP 挂单", text)
+
+
+def _split(row: str) -> list[str]:
+    return [c.strip() for c in row.strip().strip("|").split("|")]
+
+
+def _ohlcv_downtrend(last_close: float, n: int = 70) -> pd.DataFrame:
+    """单调下行、收在 last_close 的合成 OHLCV — 喂 technical_snapshot 够用。"""
+    idx = pd.bdate_range("2026-05-01", periods=n)
+    c = pd.Series([last_close + (n - 1 - i) * 0.5 for i in range(n)],
+                  index=idx, dtype=float)
+    return pd.DataFrame({"Open": c, "High": c * 1.01, "Low": c * 0.99,
+                         "Close": c, "Volume": 1_000_000.0}, index=idx)
+
+
+class TestAnalyzeTickerBelowFloor(unittest.TestCase):
+    """below_floor 旗标的生产端接线 (fetch_options=False 纯离线路径)。
+    消费端 (action_block) 只用 .get() — 生产端键名/逻辑被挪走时 get 会
+    静默吞掉, 第一屏 ⚠️ 整体消失而全套件保绿, 必须钉住生产端本身。"""
+
+    def _run(self, close, zone):
+        cfg = {**sc.TICKER_DEFAULTS, "value_zone": zone}
+        return sc.analyze_ticker("XX", cfg, _ohlcv_downtrend(close), {},
+                                 {"stage": "NORMAL"}, sc.SETTINGS_DEFAULTS,
+                                 "close", fetch_options=False)
+
+    def test_flag_and_note_below_floor(self):
+        r = self._run(40.0, [45.0, 57.5])
+        self.assertTrue(r["below_floor"])
+        self.assertTrue(any("下沿" in n for n in r["notes"]))
+
+    def test_flag_false_in_zone(self):
+        r = self._run(50.0, [45.0, 57.5])
+        self.assertFalse(r["below_floor"])
+        self.assertFalse(any("下沿" in n for n in r["notes"]))
+
+    def test_flag_false_without_zone(self):
+        r = self._run(40.0, None)
+        self.assertFalse(r["below_floor"])
+
+
+class TestZonePosition(unittest.TestCase):
+    """概览表"现价 vs 接货带"那半句的措辞。"""
+
+    def test_hairline_gets_one_decimal(self):
+        # ISRG 实况: 收 366.70, 上沿 365 — 差 0.46%, 取整成 "上方+0%" 与
+        # 同一行的"接近价值区"自相矛盾
+        self.assertEqual(sc.zone_position(366.70, [320.0, 365.0]),
+                         "上方+0.5%")
+        self.assertEqual(sc.zone_position(363.5, [365.0, 400.0]),
+                         "破下沿-0.4%")
+
+    def test_normal_distance_stays_integer(self):
+        self.assertEqual(sc.zone_position(499.70, [380.0, 440.0]),
+                         "上方+14%")
+        self.assertEqual(sc.zone_position(40.0, [45.0, 57.5]),
+                         "破下沿-11%")
+
+    def test_inside_zone(self):
+        self.assertEqual(sc.zone_position(335.31, [315.0, 340.0]), "区内")
+        self.assertEqual(sc.zone_position(340.0, [315.0, 340.0]), "区内")
+        self.assertEqual(sc.zone_position(315.0, [315.0, 340.0]), "区内")
+
+
+class TestRenderCloseZoneLines(unittest.TestCase):
+    """render_close 的两处 zone 分支烟测: CSP 三档措辞 (strike<下沿不再说
+    "在价值区内") 与 ladder 档位相对现价的计数 (挂 GTC 会立即成交的实钱
+    footgun) — render_close 此前在本套件里从未被调用过。"""
+
+    def _result(self, close, zone, strike, ladder=None):
+        cfg = {**sc.TICKER_DEFAULTS, "value_zone": list(zone)}
+        r = sc.analyze_ticker("XX", cfg, _ohlcv_downtrend(close), {},
+                              {"stage": "NORMAL"}, sc.SETTINGS_DEFAULTS,
+                              "close", fetch_options=False)
+        base = {"exp": "2026-10-02", "dte": 21, "strike": strike, "mid": 0.60,
+                "src": "live", "iv": 0.6, "delta": 0.12, "oi": 500,
+                "spread_pct": 4.0}
+        r["csp"] = sc._finish_csp(base, close, sc.SETTINGS_DEFAULTS,
+                                  list(zone), False, [])
+        if ladder is not None:
+            r["ladder"] = ladder
+        return r
+
+    def _render(self, r):
+        ivdf = pd.DataFrame(columns=["date", "symbol", "iv30", "rv30"])
+        now = datetime(2026, 9, 4, 15, 45, tzinfo=sc.ET)
+        return sc.render_close([r], dict(TestRenderOpenZoneAlert.REGIME),
+                               ivdf, now)
+
+    def test_csp_wording_below_floor_strike(self):
+        # GOOG 在区内, delta 带选到下沿之下的 310P — 不再说"在价值区内"
+        text = self._render(self._result(335.31, (315.0, 340.0), 310.0))
+        self.assertIn("已低于价值区下沿", text)
+        self.assertNotIn("行权价在价值区内", text)
+
+    def test_csp_wording_in_zone_strike(self):
+        text = self._render(self._result(335.31, (315.0, 340.0), 320.0))
+        self.assertIn("行权价在价值区内", text)
+
+    def test_ladder_counts_rungs_above_close(self):
+        # 破下沿: ①② 档全在现价上方 (③ 恐慌档还在下方) → 前 2 档
+        text = self._render(self._result(40.0, (45.0, 57.5), 34.0,
+                                         ladder=[57.5, 45.0, 36.9]))
+        self.assertIn("前 2 档已在现价上方", text)
+
+    def test_ladder_first_rung_above_close_in_zone(self):
+        # 区内: 只有 ① 档 (带上沿) 高于现价 → 前 1 档
+        text = self._render(self._result(335.31, (315.0, 340.0), 310.0,
+                                         ladder=[340.0, 315.0, 258.3]))
+        self.assertIn("前 1 档已在现价上方", text)
+
+    def test_overview_puts_zone_next_to_symbol(self):
+        # 手机上"这票的接货带在哪"要和标的挨着 — 原来隔了 7 列 (状态/操作/
+        # 收盘/Δ%/vs20日/量比/三选二), 横向扫过去才对得上
+        text = self._render(self._result(335.31, (315.0, 340.0), 310.0))
+        self.assertIn("| 标的 | 价值区 | 收盘 | 状态 |", text)
+        row = next(l for l in text.splitlines() if l.startswith("| XX |"))
+        self.assertEqual(_split(row)[1], "315-340 (区内)")
+        self.assertEqual(_split(row)[2], "335.31")
+        self.assertEqual(_split(row)[3], "价值区内(左侧)")
+        self.assertEqual(len(_split(row)), 11)     # 列数不变, 只换位
+
+    def test_ladder_all_rungs_below_close_no_note(self):
+        text = self._render(self._result(400.0, (315.0, 340.0), 310.0,
+                                         ladder=[340.0, 315.0, 258.3]))
+        self.assertNotIn("已在现价上方", text)
 
 
 class _FakeChain:

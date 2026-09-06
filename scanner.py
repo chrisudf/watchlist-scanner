@@ -147,18 +147,104 @@ SETTINGS_DEFAULTS = {
 }
 
 
+TICKER_KINDS = ("index", "stock", "etf")
+
+
+def _finite_num(x) -> bool:
+    """有限数值。bool 是 int 的子类, 显式排除。
+
+    nan/inf 必须在这里拦住: TOML 的 `nan` 是合法 float 字面量, 而 nan
+    参与的比较**恒为 False** — near_zone_pct = nan 会让 NEAR_ZONE 判定
+    永远不成立, 报告照常出、没有任何错误, 信号静默消失 (PR #10 评审)。"""
+    return (isinstance(x, (int, float)) and not isinstance(x, bool)
+            and math.isfinite(x))
+
+
+def _valid_zone(zone) -> bool:
+    """[低, 高] 两个有限正数, 低 < 高。"""
+    return (isinstance(zone, (list, tuple)) and len(zone) == 2
+            and all(_finite_num(x) for x in zone) and 0 < zone[0] < zone[1])
+
+
 def load_config(path: Path = CONFIG_FILE) -> tuple[dict, dict]:
-    """-> (settings, {symbol: ticker_cfg}). Ticker order follows the file."""
+    """-> (settings, {symbol: ticker_cfg}). Ticker order follows the file.
+
+    配置错误在装载时就炸, 不留到运行期 (zone 评审): 手编 15 行 zone 的
+    那天, 一个字符串 zone / 拼错的键 / 大小写重复条目在这里报错是一条
+    带原因的 ValueError; 漏到运行期就是每天扫描里被宽 except 吞掉的
+    TypeError, 或者阈值默认值顶着你以为改过的名字继续生效。"""
     with open(path, "rb") as f:
         raw = tomllib.load(f)
-    settings = {**SETTINGS_DEFAULTS, **raw.get("settings", {})}
+    unknown_top = set(raw) - {"settings", "tickers"}
+    if unknown_top:
+        # [setting] / [ticker.QQQ] 这类表名手滑不会报错, 整段配置连同
+        # 你以为改过的每个阈值一起被静默忽略 (PR #10 评审)
+        raise ValueError(
+            f"顶层未知表 (typo?): {', '.join('[' + k + ']' for k in sorted(unknown_top))} "
+            f"— 只认 [settings] 与 [tickers.*]")
+    settings_raw = raw.get("settings", {})
+    unknown = set(settings_raw) - set(SETTINGS_DEFAULTS)
+    if unknown:
+        raise ValueError(f"[settings] 未知键 (typo?): {', '.join(sorted(unknown))}")
+    for k, v in settings_raw.items():
+        # 值类型跟着默认值走 — TOML 引号手滑 (gap_alert_pct = "1.5")
+        # 会穿过键白名单, 在 render_open 的比较处裸崩且没有报告
+        default = SETTINGS_DEFAULTS[k]
+        if isinstance(default, bool):
+            ok = isinstance(v, bool)
+        elif isinstance(default, (int, float)):
+            ok = _finite_num(v)
+        elif isinstance(default, list):
+            ok = (isinstance(v, (list, tuple)) and len(v) == len(default)
+                  and all(_finite_num(x) for x in v))
+        else:
+            ok = isinstance(v, type(default))
+        if not ok:
+            raise ValueError(f"[settings] {k} 类型错误: 期望与默认值 "
+                             f"{default!r} 同类, 得到 {v!r}")
+    settings = {**SETTINGS_DEFAULTS, **settings_raw}
     tickers = {}
     for sym, tcfg in raw.get("tickers", {}).items():
+        unknown = set(tcfg) - set(TICKER_DEFAULTS)
+        if unknown:
+            raise ValueError(
+                f"[tickers.{sym}] 未知键 (typo?): {', '.join(sorted(unknown))}")
+        for k, v in tcfg.items():
+            # 键名对了不代表值对: options = "false" 是合法 TOML 字符串,
+            # 而非空字符串为真 — 想关期权票, 结果照常抓链出票 (PR #10 评审)
+            if k == "value_zone":
+                continue                      # 下面单独校验 (可为 None)
+            default = TICKER_DEFAULTS[k]
+            if isinstance(default, bool):     # options / high_beta
+                ok = isinstance(v, bool)
+            elif isinstance(default, str):    # kind / notes
+                ok = isinstance(v, str)
+            else:                             # two_x: 默认 None
+                ok = v is None or isinstance(v, str)
+            if not ok:
+                raise ValueError(f"[tickers.{sym}] {k} 类型错误: 期望与默认值 "
+                                 f"{default!r} 同类, 得到 {v!r}")
+        kind = tcfg.get("kind", TICKER_DEFAULTS["kind"])
+        if kind not in TICKER_KINDS:
+            # kind 只在三处相等比较里出现 — 拼错不报错, 只是悄悄换成
+            # 个股 LEAP delta 带并让 ETF/index 的财报豁免失效
+            raise ValueError(f"[tickers.{sym}] kind 未知: {kind!r} "
+                             f"— 只认 {', '.join(TICKER_KINDS)}")
         cfg = {**TICKER_DEFAULTS, **tcfg}
         zone = cfg["value_zone"]
-        if zone is not None and (len(zone) != 2 or zone[0] >= zone[1]):
-            raise ValueError(f"{sym}: value_zone must be [low, high]")
-        tickers[sym.upper()] = cfg
+        if zone is not None:
+            if not _valid_zone(zone):
+                raise ValueError(
+                    f"{sym}: value_zone 必须是 [低, 高] 两个正数 "
+                    f"(低 < 高), 得到 {zone!r}")
+            # 统一成 float — TOML 里 [45, 57.5] 混用 int/float 是合法的
+            cfg["value_zone"] = [float(zone[0]), float(zone[1])]
+        key = sym.upper()
+        if key in tickers:
+            # [tickers.spcx] 与 [tickers.SPCX] 是合法的两张 TOML 表 —
+            # upper() 归一后 last-wins 会静默丢前者
+            raise ValueError(f"[tickers] 重复条目 (含大小写差异): {key}")
+        tickers[key] = cfg
     if not tickers:
         raise ValueError("watchlist.toml has no [tickers.*] entries")
     return settings, tickers
@@ -699,14 +785,18 @@ def next_state(prev: str, *, close: float, sma20: float, confirmed: bool,
     elif close < sma20:
         if in_zone:
             state = "LEFT_ZONE"
-            if close < zone[0]:
-                notes.append("已跌破价值区下沿 — 剧本: 检查论点是否失效, 而不是继续摊")
         elif near_zone:
             state = "NEAR_ZONE"
         else:
             state = "PULLBACK"
     else:
         state = "UPTREND"
+    # 破下沿 = 论点检查, 纯价格判定, 与状态标签解耦 — 原来绑在 LEFT_ZONE
+    # 分支里, 破下沿后反弹站上塌陷的 20 日线 (UPTREND/TREND) 或止损转
+    # PULLBACK 当日就一声不响, 而 CSP/分批档位照常可执行 (zone 评审):
+    # 警告必须跟着价格走, 不跟状态标签走
+    if zone is not None and close < zone[0]:
+        notes.append("已跌破价值区下沿 — 剧本: 检查论点是否失效, 而不是继续摊")
     return state, notes
 
 
@@ -1176,6 +1266,12 @@ def _finish_csp(c: dict, spot: float, s: dict, zone, panic: bool,
         notes.append("盘口不可用, 按最近成交价估算 — 下单前实查")
     if zone is not None and c["strike"] > zone[1]:
         notes.append(f"行权价高于价值区上沿 {zone[1]:g} — 被行权成本不在接货区, 可下移到 <= {zone[1]:g}")
+    if zone is not None and spot < zone[0]:
+        # 破下沿的票必须自带论点检查前置 — strike<=上沿的硬 cap 只保证接货
+        # 价不高, 保证不了论点还活着 (zone 评审: RKLB [45,57.5] 跌到 40 时
+        # 照常铸 32-34P 置顶, 全报告可以零警告)
+        notes.insert(0, "⚠️ 现价已破价值区下沿 — 剧本: 先过论点检查再卖; "
+                        "论点失效则跳过, 仍成立则重锚 zone 后再挂")
     c["notes"] = notes
     return c
 
@@ -1586,6 +1682,9 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
                 "右侧确认需 61 根日线, 当前只看价格/20日线/价值区")
         if zone is not None:
             r["zone_dist_pct"] = (tech["close"] / zone[1] - 1) * 100
+        # 与 next_state/_finish_csp 的下沿判定同一口径 — note 给人读,
+        # 这个旗标给 action_block 等渲染路由用
+        r["below_floor"] = zone is not None and tech["close"] < zone[0]
 
         if not fetch_options:
             return r
@@ -1928,6 +2027,12 @@ def action_block(results: list[dict], ivdf) -> list[str]:
         if _has_stop(r):
             items.append((sym, f"- ⚠️ **{sym}** 右侧止损: 收盘跌破20日线 — "
                                "凸性档减半 / 结构破清仓"))
+        # 破下沿的可执行票在第一屏就要带着论点检查, 不能只藏在详情区
+        # note 里; CSP/LEAP/spread 同权 — 破自己接货带下沿时开新多头的
+        # 论点检查分量不低于卖 put (CONFIRMED+破下沿实测可达: 深跌后
+        # 不再新低+突破前20日高即三选二)
+        floor_tag = ("⚠️破下沿·先过论点检查 — " if r.get("below_floor") else "")
+        floor_tagged = False
         leap, csp = r["leap"], r["csp"]
         if leap and "skip_reason" not in leap:
             ivp = self_ivp(ivdf, sym, r["iv30"]) if r["iv30"] else None
@@ -1935,19 +2040,21 @@ def action_block(results: list[dict], ivdf) -> list[str]:
                 items.append((sym, f"- 🟡 **{sym}** 右侧确认但自建IVP "
                                    f"{ivp:.0f}>60 — 改 spread/PMCC (见下)"))
             else:
-                items.append((sym, f"- 🟢 **{sym}** LEAP: BUY {leap['exp']} "
+                items.append((sym, f"- 🟢 **{sym}** LEAP: {floor_tag}BUY {leap['exp']} "
                                    f"{leap['strike']:g}C @ ~{leap['mid']:.2f} "
                                    f"(delta {leap['delta']:.2f}, 详见下)"))
+                floor_tagged = floor_tagged or bool(floor_tag)
         elif _regime_halted(leap):
             if sym not in halted:
                 halted.append(sym)
         elif leap:
             items.append((sym, f"- ⏸ **{sym}** LEAP: {leap['skip_reason']}"))
         if csp and "skip_reason" not in csp:
-            items.append((sym, f"- 🔵 **{sym}** CSP: SELL {csp['exp']} "
+            items.append((sym, f"- 🔵 **{sym}** CSP: {floor_tag}SELL {csp['exp']} "
                                f"{csp['strike']:g}P @ ~{csp['mid']:.2f} "
                                f"(delta {csp['delta']:.2f}, 年化 "
                                f"~{csp['annualized_pct']:.0f}%, 详见下)"))
+            floor_tagged = floor_tagged or bool(floor_tag)
         elif _regime_halted(csp):
             if sym not in halted:
                 halted.append(sym)
@@ -1955,10 +2062,11 @@ def action_block(results: list[dict], ivdf) -> list[str]:
             items.append((sym, f"- ⏸ **{sym}** CSP: {csp['skip_reason']}"))
         spread = r.get("spread")
         if spread and "skip_reason" not in spread:
-            items.append((sym, f"- 🟣 **{sym}** 回踩 spread: BUY {spread['exp']} "
+            items.append((sym, f"- 🟣 **{sym}** 回踩 spread: {floor_tag}BUY {spread['exp']} "
                                f"{spread['long_strike']:g}C / SELL "
                                f"{spread['short_strike']:g}C 净支出 "
                                f"~{spread['debit']:.2f} (详见下)"))
+            floor_tagged = floor_tagged or bool(floor_tag)
         elif _regime_halted(spread):
             if sym not in halted:
                 halted.append(sym)
@@ -1967,6 +2075,12 @@ def action_block(results: list[dict], ivdf) -> list[str]:
         elif r.get("retest"):
             items.append((sym, f"- 👀 **{sym}** 首次回踩20日线不破 — 剧本首选"
                                "加仓点 (3-6个月 call spread, 手动构造)"))
+        if r.get("below_floor") and not floor_tagged:
+            # 没有任何带前置的真票 (ladder-only 的 options=false 标的、
+            # CSP 被 skip/halt) — 破下沿恰是剧本要求做论点检查的日子,
+            # 不能让它落进"其余今日无动作"
+            items.append((sym, f"- ⚠️ **{sym}** 已破价值区下沿 — 剧本: 先过"
+                               "论点检查; 分批档/被拦票见下, 别按旧接货档继续摊"))
     if stale:
         # 手机上扫一眼的那一屏必须看得到 — 概览表里这些标的的收盘价与
         # 右侧状态都建立在过期日线上
@@ -2070,6 +2184,21 @@ def regime_block(regime: dict) -> list[str]:
     return lines
 
 
+def zone_position(close: float, zone) -> str:
+    """概览表里"现价相对接货带"的那半句。
+
+    贴边时 0 位小数会自相矛盾 — ISRG 收 366.70 距上沿 365 只有 0.46%,
+    显示 "上方+0%" 却挂着"接近价值区"的状态。|X| < 1% 时给一位小数,
+    其余照旧取整 (带子本身是手估的, 两位小数是假精度)。"""
+    def pct(v: float) -> str:
+        return f"{v:+.1f}%" if abs(v) < 1 else f"{v:+.0f}%"
+    if close > zone[1]:
+        return f"上方{pct((close / zone[1] - 1) * 100)}"
+    if close < zone[0]:
+        return f"破下沿{pct((close / zone[0] - 1) * 100)}"
+    return "区内"
+
+
 def render_close(results, regime, ivdf, now_et) -> str:
     d = now_et.strftime("%Y-%m-%d")
     lines = [f"# 左右侧 watchlist 扫描 — {d} 尾盘 "
@@ -2079,24 +2208,20 @@ def render_close(results, regime, ivdf, now_et) -> str:
 
     ordered = by_actionability(results)
     lines += ["## 概览 (按可操作性排序)", "",
-              "| 标的 | 状态 | 操作 | 收盘 | Δ% | vs20日 | 量比 | 三选二 "
-              "| 价值区 | iv/rv | IVP |",
+              "| 标的 | 价值区 | 收盘 | 状态 | 操作 | Δ% | vs20日 "
+              "| 量比 | 三选二 | iv/rv | IVP |",
               "|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in ordered:
         t = r["tech"]
         if t is None:
-            lines.append(f"| {r['symbol']} | {STATE_LABEL['NO_DATA']} | — | — "
+            lines.append(f"| {r['symbol']} | — | — "
+                         f"| {STATE_LABEL['NO_DATA']} "
                          f"| — | — | — | — | — | — | — |")
             continue
         zone = r["cfg"]["value_zone"]
         if zone:
-            if t["close"] > zone[1]:
-                pos = f"上方+{(t['close'] / zone[1] - 1) * 100:.0f}%"
-            elif t["close"] < zone[0]:
-                pos = f"破下沿{(t['close'] / zone[0] - 1) * 100:.0f}%"
-            else:
-                pos = "区内"
-            zone_s = f"{zone[0]:g}-{zone[1]:g} ({pos})"
+            zone_s = (f"{zone[0]:g}-{zone[1]:g} "
+                      f"({zone_position(t['close'], zone)})")
         else:
             zone_s = "未设"
         ivp = self_ivp(ivdf, r["symbol"], r["iv30"]) if r["iv30"] else None
@@ -2104,11 +2229,11 @@ def render_close(results, regime, ivdf, now_et) -> str:
                 if r["iv30"] and t["rv30"]
                 else fmt(r["iv30"] and r["iv30"] * 100, ".0f", "%"))
         lines.append(
-            f"| {r['symbol']} | {STATE_LABEL[r['state']]} "
-            f"| {action_label(r, ivp)} | {t['close']:.2f} "
+            f"| {r['symbol']} | {zone_s} | {t['close']:.2f} "
+            f"| {STATE_LABEL[r['state']]} | {action_label(r, ivp)} "
             f"| {t['change_pct']:+.1f} | {t['vs_sma20_pct']:+.1f}% "
             f"| {t['vol_ratio']:.1f}x | {sig_marks(t['signals'])} "
-            f"| {zone_s} | {ivrv} | {fmt(ivp, '.0f')} |")
+            f"| {ivrv} | {fmt(ivp, '.0f')} |")
     lines += [
         "",
         "> 三选二: **低**=不再新低(近5日低点 > 前15日低点) · **收**=放量收复"
@@ -2161,7 +2286,13 @@ def render_close(results, regime, ivdf, now_et) -> str:
                 for n in csp["notes"]:
                     lines.append(f"  - {n}")
                 zone = r["cfg"]["value_zone"]
-                if zone is not None and csp["strike"] <= zone[1]:
+                if zone is not None and csp["strike"] < zone[0]:
+                    # GOOG [315,340] 在区内时 delta 带常选到 310-312.5P —
+                    # 低于下沿, 说"在价值区内"字面为假
+                    lines.append(f"  - 愿意接货档 (行权价已低于价值区下沿 "
+                                 f"{zone[0]:g}): 拿到到期, 跌破行权价 = 接货"
+                                 "流程; 赚 50-60% 权利金可提前收")
+                elif zone is not None and csp["strike"] <= zone[1]:
                     lines.append("  - 愿意接货档 (行权价在价值区内): 拿到到期, "
                                  "跌破行权价 = 接货流程; 赚 50-60% 权利金可提前收")
                 else:
@@ -2173,9 +2304,14 @@ def render_close(results, regime, ivdf, now_et) -> str:
             widening = (ladder[1] - ladder[2]) > (ladder[0] - ladder[1])
             spacing_note = ("间距递增" if widening else
                             "区间较宽, 末档间距未递增 — 剧本要求间距递增, 自行加深恐慌档")
+            # 档位是 GTC 限价买单位 — 已在现价上方的档挂上去会立即成交,
+            # 必须点名 (区内标的的 ① 档天然高于现价; 破下沿时 ①② 都是)
+            above = sum(1 for x in ladder if x > t["close"])
+            pos_note = (f"前 {above} 档已在现价上方, 挂 GTC 会立即成交 — "
+                        "按现价决策, 别机械挂单; " if above else "")
             lines.append(
                 f"- 正股分批档位: ① {ladder[0]:g} ② {ladder[1]:g} "
-                f"③ {ladder[2]:g} (恐慌档) — {spacing_note}; 总仓位按\"还能再跌"
+                f"③ {ladder[2]:g} (恐慌档) — {pos_note}{spacing_note}; 总仓位按\"还能再跌"
                 f"30-50%\"定, 打完末档仍扛得住再跌; 止损靠论点失效不靠价格")
         leap = r["leap"]
         if leap:
@@ -2254,7 +2390,13 @@ def render_open(results, regime, now_et, s: dict) -> str:
             alerts.append(f"- **{sym}** 盘初波动 {t['change_pct']:+.1f}% "
                           f"(现价 {t['close']:.2f})")
         zone = r["cfg"]["value_zone"]
-        if zone and t["close"] <= zone[1]:
+        if zone and t["close"] < zone[0]:
+            # 破下沿 ≠ 在价值区内 — 剧本这时要的是论点检查, 不是接货动作;
+            # 原来两种情形同一句"核对 CSP 挂单/接货档位"会催人继续摊
+            alerts.append(f"- **{sym}** 已跌破价值区下沿 ({zone[0]:g}-{zone[1]:g}, "
+                          f"现价 {t['close']:.2f}) — 剧本: 检查论点是否失效, "
+                          f"而不是按旧接货档继续摊")
+        elif zone and t["close"] <= zone[1]:
             alerts.append(f"- **{sym}** 在价值区内 ({zone[0]:g}-{zone[1]:g}, "
                           f"现价 {t['close']:.2f}) — 核对 CSP 挂单/接货档位")
         if r.get("prev_state") in ("CONFIRMED", "TREND") and t["close"] < t["sma20"]:
@@ -2371,12 +2513,18 @@ def _html_cards(rows: list[list[str]]) -> str:
     所以窄屏直接换布局: 首列 (标的) 当标题, 其余列摊成 `标签 值` 的流式
     文本, 自然换行。"""
     head, body = rows[0], rows[1:]
+    # 副标题认"状态"这一列, 不认列序 — 概览表把价值区提到了第二列
+    # (2026-09-06: 手机上标的与接货带要挨着看), 位置写死会把卡片标题
+    # 变成 "NVDA 未设", NO_DATA 行更是变成 "SYM —"
+    sub_i = head.index("状态") if "状态" in head else 1
     cards = []
     for row in body:
         title = _md_inline(row[0]) if row else ""
-        state = _md_inline(row[1]) if len(row) > 1 else ""
+        state = _md_inline(row[sub_i]) if len(row) > sub_i else ""
         bits = []
-        for label, val in zip(head[2:], row[2:]):
+        for i, (label, val) in enumerate(zip(head, row)):
+            if i in (0, sub_i):
+                continue
             v = val.strip()
             if not v or v in ("—", "-", "未设"):
                 continue
