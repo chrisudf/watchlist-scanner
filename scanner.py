@@ -149,6 +149,16 @@ SETTINGS_DEFAULTS = {
     # 4/15 旧锚在三周~一个月内作废而扫描器全程无感)
     "zone_asof_stale_days": 60,      # zone_asof 距今超此天数 = 超龄复核提醒
     "zone_flag_repeat_days": 7,      # 同一 zone 提示的重复间隔 (首发+每 N 天)
+    # 漂移检测: 裸阈值不行 — 校准日就 +16~18% 的深接货带 (HOOD/AAPL 新带)
+    # 会当天误报, 按带宽缩放又让 50% 宽的旧带永远不报 → 自校准: 阈值 =
+    # max(基线, 校准日距离 ref + 余量), 连续 N 收盘才算 (回代: AAPL 旧带
+    # 击穿后第 10 个交易日即报, 早于人工发现 ~3 周; 15 个新 zone 校准日
+    # 全部静默)
+    "zone_drift_run": 10,            # 漂移判定的连续收盘数
+    "zone_drift_base_pct": 15.0,     # 上沿漂移阈值下限 (%)
+    "zone_drift_margin_pts": 8.0,    # 自校准余量: 校准日距离 + N pts
+    "zone_floor_instant_pct": 10.0,  # 下沿瞬时升格线: 收盘 < 下沿×(1-N%)
+                                     # (取下沿与恐慌档 -18% 的中点)
 }
 
 
@@ -856,8 +866,24 @@ def _zone_flag_due(flags: dict, name: str, today_iso: str,
     return True
 
 
+def zone_ref_from_hist(hist, zone, zone_asof):
+    """确定性的漂移基准: zone_asof 当日 (或其前最后一根) 的收盘距上沿的
+    距离 — state.json 删除/换机器重建 watch 时 ref 可复现, 一个已经漂移
+    很远的 zone 不会被"重新校准"成永久静默 (auto_adjust 的分红微调可
+    忽略; 拆股情形 zone 反正已作废)。asof 缺失或早于 hist 起点 → None
+    (退回首见收盘口径, 由 60d 超龄提醒兜底)。"""
+    if zone is None or not zone_asof or hist is None or hist.empty:
+        return None
+    cut = date.fromisoformat(zone_asof)
+    sel = hist["Close"][[ts.date() <= cut for ts in hist.index]]
+    if sel.empty:
+        return None
+    return max(0.0, (float(sel.iloc[-1]) / zone[1] - 1) * 100)
+
+
 def zone_watch_update(prev_watch, *, close: float, zone, zone_asof,
-                      today_iso: str, s: dict) -> tuple[dict | None, list[str]]:
+                      today_iso: str, s: dict,
+                      ref_hint=None) -> tuple[dict | None, list[str]]:
     """zone 生命周期监控 (纯函数, close 口径) -> (新 watch 状态, notes)。
 
     手工维护的 zone 会腐烂而扫描器此前完全无感 (2026-09-05 zone 评审
@@ -869,11 +895,16 @@ def zone_watch_update(prev_watch, *, close: float, zone, zone_asof,
     if zone is None:
         return None, []
     sig = zone_sig(zone, zone_asof)
+    # ref 优先用 zone_ref_from_hist 的确定性口径 (zone_asof 当日收盘),
+    # 拿不到才退回首见收盘 — 后者在 state.json 重建时会把已漂移的 zone
+    # "重新校准"成静默, 只能当兜底
+    ref0 = ref_hint if ref_hint is not None \
+        else max(0.0, (close / zone[1] - 1) * 100)
     w = dict(prev_watch) if prev_watch and prev_watch.get("sig") == sig \
-        else {"sig": sig, "ref_pct": max(0.0, (close / zone[1] - 1) * 100)}
-    # 手编/损坏的 state.json 可能丢 ref_pct — 缺失按当日距离重锚, 单日
+        else {"sig": sig, "ref_pct": ref0}
+    # 手编/损坏的 state.json 可能丢 ref_pct — 缺失按同口径重锚, 单日
     # 自愈, 别让 KeyError 经宽 except 把整个标的吞成 r[error]
-    w.setdefault("ref_pct", max(0.0, (close / zone[1] - 1) * 100))
+    w.setdefault("ref_pct", ref0)
     w["flags"] = dict(w.get("flags") or {})
     notes = []
     if zone_asof is None:
@@ -889,6 +920,38 @@ def zone_watch_update(prev_watch, *, close: float, zone, zone_asof,
             notes.append(f"zone 校准已 {age} 天 (zone_asof {zone_asof}) — "
                          "剧本: 对照最新估值带/支撑复核区间, 复核后更新 "
                          "zone_asof")
+    # 上沿漂移: 价格涨着涨着把 zone 抛在身后 = zone 过时(偏低)。阈值
+    # 自校准 (max(基线, ref+余量)): 故意设深的接货带在校准日静默, 只有
+    # "此后又拉开了余量以上的距离"且持续 run 个收盘才报
+    dist = (close / zone[1] - 1) * 100
+    threshold = max(s["zone_drift_base_pct"],
+                    w["ref_pct"] + s["zone_drift_margin_pts"])
+    w["above_run"] = (w.get("above_run", 0) + 1) if dist > threshold else 0
+    if w["above_run"] == 0:
+        w["flags"].pop("upper", None)   # 条件解除 → 下一轮漂移重新首发
+    elif w["above_run"] >= s["zone_drift_run"] and _zone_flag_due(
+            w["flags"], "upper", today_iso, s["zone_flag_repeat_days"]):
+        notes.append(
+            f"现价高于接货带上沿 {dist:+.1f}%, 连续 {w['above_run']} 个收盘"
+            f"超过漂移阈值 {threshold:.1f}% — zone 可能过时(偏低): "
+            "重校区间, 或明确接受长期不接货")
+    # 下沿漂移: L703 的"检查论点"是单日提示 — 持续 run 个收盘破下沿,
+    # 或单日深破 (下沿再 -instant%), 升格为"zone 重锚"级别
+    below = close < zone[0]
+    w["below_run"] = (w.get("below_run", 0) + 1) if below else 0
+    instant = close < zone[0] * (1 - s["zone_floor_instant_pct"] / 100)
+    if w["below_run"] == 0:
+        w["flags"].pop("lower", None)
+    elif (w["below_run"] >= s["zone_drift_run"] or instant) \
+            and _zone_flag_due(w["flags"], "lower", today_iso,
+                               s["zone_flag_repeat_days"]):
+        how = (f"收盘已深破下沿 {s['zone_floor_instant_pct']:g}%+"
+               if instant and w["below_run"] < s["zone_drift_run"]
+               else f"连续 {w['below_run']} 个收盘破下沿")
+        notes.append(
+            f"{how} — 论点检查升格为 zone 重锚: 论点失效则离场, "
+            "仍成立则按新支撑/估值重画区间; 重锚前下方档位只当参考价, "
+            "先过论点检查再执行")
     return w, notes
 
 
@@ -1776,7 +1839,8 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
         r["zone_watch"], zw_notes = zone_watch_update(
             prev_state.get("zone_watch"), close=tech["close"], zone=zone,
             zone_asof=cfg.get("zone_asof"),
-            today_iso=datetime.now(ET).date().isoformat(), s=s)
+            today_iso=datetime.now(ET).date().isoformat(), s=s,
+            ref_hint=zone_ref_from_hist(hist, zone, cfg.get("zone_asof")))
         if mode == "close":
             r["notes"].extend(zw_notes)
 

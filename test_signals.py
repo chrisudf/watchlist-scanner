@@ -10,7 +10,7 @@ import json
 import math
 import tempfile
 import unittest
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -1496,6 +1496,158 @@ class TestZoneWatchScaffold(unittest.TestCase):
                                     {"stage": "NORMAL"}, sc.SETTINGS_DEFAULTS,
                                     "close", fetch_options=False)
         self.assertTrue(any("复核" in n for n in r_close["notes"]))
+
+
+class TestZoneDrift(unittest.TestCase):
+    """漂移检测: 上沿自校准阈值 max(基线 15%, 校准日 ref+8pts) × 连续
+    zone_drift_run 个收盘; 下沿连续 run 个收盘或单日深破 -10% →
+    "论点检查"升格"zone 重锚"。
+
+    机制测试用 run=3 的显式 settings (与默认值解耦 — 调 run 参数不该
+    红一片); AAPL 回代与 15 组新 zone 全量回放钉真实默认值 — 那两组是
+    校准回归 pin, 默认值动了就应该红。"""
+
+    S = sc.SETTINGS_DEFAULTS
+    S3 = {**sc.SETTINGS_DEFAULTS, "zone_drift_run": 3}
+    D0 = "2026-09-07"          # 周一
+
+    def _seq(self, zone, asof, closes, s):
+        """按**交易日**喂收盘序列 -> (最终 watch, [(idx, notes)]) —
+        run 计的是收盘数、频控 7 天计的是日历日, 生产里两种计数并存,
+        测试用 bdate 推进才分得开。"""
+        days = pd.bdate_range(self.D0, periods=len(closes))
+        w, fired = None, []
+        for i, c in enumerate(closes):
+            w, notes = sc.zone_watch_update(
+                w, close=c, zone=zone, zone_asof=asof,
+                today_iso=days[i].date().isoformat(), s=s)
+            if notes:
+                fired.append((i, notes))
+        return w, fired
+
+    def test_upper_drift_needs_consecutive_closes(self):
+        # 校准日 close 100 (ref +5.3% → 阈值 15), 随后 +16.8% 三连
+        closes = [100.0] + [111.0] * 3
+        _, fired = self._seq([80.0, 95.0], "2026-09-05", closes, self.S3)
+        self.assertEqual(len(fired), 1)
+        self.assertEqual(fired[0][0], 3)
+        self.assertTrue(any("过时" in n for n in fired[0][1]))
+
+    def test_upper_drift_interrupted_run_resets(self):
+        closes = [100.0] + [111.0] * 2 + [100.0] + [111.0] * 2
+        _, fired = self._seq([80.0, 95.0], "2026-09-05", closes, self.S3)
+        self.assertEqual(fired, [])            # 两段 2 连都不够 3
+
+    def test_upper_drift_repeats_weekly_while_sustained(self):
+        # 持续漂移: 首发后按日历日周频重复 (7 日历日 ≈ 5 个交易日)
+        closes = [100.0] + [111.0] * 12
+        _, fired = self._seq([80.0, 95.0], "2026-09-05", closes, self.S3)
+        idxs = [i for i, _ in fired]
+        self.assertEqual(len(idxs), 2)
+        self.assertEqual(idxs[0], 3)
+        days = pd.bdate_range(self.D0, periods=len(closes))
+        self.assertGreaterEqual((days[idxs[1]] - days[idxs[0]]).days, 7)
+
+    def test_upper_drift_rearms_after_dip(self):
+        # 首发 → 回落 (run 清零, flag 摘除) → 再漂移: 新一轮不等 7 天
+        closes = [100.0] + [111.0] * 3 + [100.0] + [111.0] * 3
+        _, fired = self._seq([80.0, 95.0], "2026-09-05", closes, self.S3)
+        self.assertEqual([i for i, _ in fired], [3, 7])
+
+    def test_deep_band_silent_flat_replay(self):
+        # AAPL 新带风格: 校准日就 +18.5% — ref 自校准把阈值抬到 26.5,
+        # 横盘 run+2 个收盘全程静默 (裸 15% 阈值会在第 run 个收盘误报)
+        _, fired = self._seq([240.0, 270.0], "2026-09-05",
+                             [319.97] * 5, self.S3)
+        self.assertEqual(fired, [])
+
+    def test_aapl_old_band_replay_fires_day_ten(self):
+        # 真实默认值回代: 旧带 [176,264] 首见 close 290 (ref +9.8% →
+        # 阈值 17.8), 涨到 313 (+18.6%) 后第 10 个超阈收盘报警 —
+        # 早于人工发现 ~3 周
+        closes = [290.0] + [313.0] * 12
+        _, fired = self._seq([176.0, 264.0], None, closes, self.S)
+        drift = [(i, n) for i, n in fired if any("过时" in x for x in n)]
+        self.assertEqual(len(drift), 1)
+        self.assertEqual(drift[0][0], 10)
+
+    def test_floor_break_consecutive_closes_escalates(self):
+        closes = [50.0] + [43.0] * 3           # 破下沿但不深 (-4.4%)
+        _, fired = self._seq([45.0, 57.5], "2026-09-05", closes, self.S3)
+        self.assertEqual(len(fired), 1)
+        self.assertEqual(fired[0][0], 3)
+        self.assertTrue(any("重锚" in n for n in fired[0][1]))
+
+    def test_instant_deep_floor_break_fires_same_day(self):
+        closes = [50.0, 40.0]                  # 40 < 45×0.9=40.5 → 当日升格
+        _, fired = self._seq([45.0, 57.5], "2026-09-05", closes, self.S3)
+        self.assertEqual(len(fired), 1)
+        self.assertEqual(fired[0][0], 1)
+        self.assertTrue(any("深破" in n for n in fired[0][1]))
+
+    def test_floor_recovery_resets_run(self):
+        closes = [43.0] * 2 + [50.0] + [43.0] * 2
+        _, fired = self._seq([45.0, 57.5], "2026-09-05", closes, self.S3)
+        self.assertEqual(fired, [])
+
+    def test_all_15_new_zones_full_replay_silent(self):
+        # 2026-09-05 校准的 15 组 (spot, zone) 按校准价横盘 run+2 个收盘
+        # 全量回放 — 必须全程静默。这是自校准设计的真正回归 pin: 裸 15%
+        # 阈值的实现会在 HOOD (+16.3%) 与 AAPL (+18.5%) 两行的第 run 个
+        # 收盘出声 (单日单次调用对 run 门永远静默, 测不出任何东西)
+        table = [
+            (718.96, [635.0, 685.0]), (230.36, [185.0, 205.0]),
+            (64.26, [45.0, 57.5]), (335.31, [315.0, 340.0]),
+            (406.77, [365.0, 385.0]), (499.70, [380.0, 440.0]),
+            (18.22, [13.0, 16.0]), (122.11, [85.0, 105.0]),
+            (281.86, [220.0, 260.0]), (428.91, [325.0, 390.0]),
+            (354.08, [260.0, 320.0]), (319.97, [240.0, 270.0]),
+            (366.70, [320.0, 365.0]), (59.69, [45.0, 55.0]),
+            (147.95, [105.0, 135.0]),
+        ]
+        n = self.S["zone_drift_run"] + 2
+        for spot, zone in table:
+            _, fired = self._seq(zone, "2026-09-05", [spot] * n, self.S)
+            self.assertEqual(fired, [], f"{zone} @ {spot}")
+
+
+class TestZoneRefFromHist(unittest.TestCase):
+    """确定性 ref: state.json 删除/换机器重建时, 漂移基准从 hist 里按
+    zone_asof 当日收盘复现 — 已漂移的 zone 不会被"重新校准"成永久静默。"""
+
+    def test_ref_at_asof_close(self):
+        hist = _ohlcv_downtrend(50.0)              # 单调下行收 50
+        asof = hist.index[-11].date().isoformat()  # 10 根前, close = 55
+        ref = sc.zone_ref_from_hist(hist, [30.0, 40.0], asof)
+        self.assertAlmostEqual(ref, (55.0 / 40.0 - 1) * 100, places=6)
+
+    def test_ref_none_when_underivable(self):
+        hist = _ohlcv_downtrend(50.0)
+        self.assertIsNone(sc.zone_ref_from_hist(hist, [30.0, 40.0], None))
+        self.assertIsNone(
+            sc.zone_ref_from_hist(hist, [30.0, 40.0], "2020-01-01"))
+        self.assertIsNone(sc.zone_ref_from_hist(None, [30.0, 40.0],
+                                                "2026-06-01"))
+
+    def test_state_rebuild_does_not_grandfather_drift(self):
+        # 灾后重建场景: 价已 +18.6% 时新建 watch。无 ref_hint (首见收盘
+        # 口径) 会把 ref 重置成 18.6 → 阈值 26.6 → 永久静默; 带 hist
+        # 推导的 ref_hint (+9.8%) 阈值仍 17.8 → 第 run 个收盘照样报
+        s3 = {**sc.SETTINGS_DEFAULTS, "zone_drift_run": 3}
+        zone = [176.0, 264.0]
+
+        def replay(ref_hint):
+            w, out = None, []
+            for i, day in enumerate(("2026-09-07", "2026-09-08",
+                                     "2026-09-09", "2026-09-10")):
+                w, notes = sc.zone_watch_update(
+                    w, close=313.0, zone=zone, zone_asof="2026-08-09",
+                    today_iso=day, s=s3, ref_hint=ref_hint)
+                out += notes
+            return out
+
+        self.assertTrue(any("过时" in n for n in replay(9.85)))
+        self.assertFalse(any("过时" in n for n in replay(None)))
 
 
 class TestActionBlockFloorTag(unittest.TestCase):
