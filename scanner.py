@@ -874,6 +874,16 @@ def split_after(hist, asof_iso: str | None, fallback_days: int = 30):
     return ev.index[-1].date().isoformat(), float(ev.iloc[-1])
 
 
+def split_history_covers(hist, asof_iso: str | None) -> bool:
+    """日线窗是否覆盖到 zone_asof — batch_history 只取 1 年, 校准日更早时
+    split_after 的 None 是"查不到"而非"没有", 旧股本 zone 会带着失束的
+    CSP 硬 cap 继续生效 (PR #11 评审)。缺 asof 时按 30 日 fallback 窗算,
+    正常 hist 必然覆盖。"""
+    if not asof_iso or hist is None or getattr(hist, "empty", True):
+        return True
+    return hist.index[0].date() <= date.fromisoformat(asof_iso)
+
+
 def identity_mismatch_note(kind: str, earnings) -> str | None:
     """kind=etf/index 却查到真实财报日 = 标的身份可能已变 — ETF/指数没有
     财报日历 (代码在两处都依赖"ETF 日历 404 是常态"这一事实), 反过来就是
@@ -891,7 +901,10 @@ def zone_sig(zone, zone_asof) -> str | None:
     提示频控全部归零, 新身份从零开始观察。"""
     if zone is None:
         return None
-    return f"{zone[0]:g}-{zone[1]:g}@{zone_asof or '未标'}"
+    # repr 而非 :g — :g 只给 6 位有效数字, [1000000,1100000] 与
+    # [1000001,1100000] 会共用身份 "1e+06-1.1e+06": 改了区间却不归零漂移
+    # 计数, 还可能让上一版的粘性拆股作废挂在新区间上 (PR #11 评审)
+    return f"{zone[0]!r}-{zone[1]!r}@{zone_asof or '未标'}"
 
 
 def _zone_flag_due(flags: dict, name: str, today_iso: str,
@@ -1872,6 +1885,14 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
                               "作废状态, 重锚 zone (并更新 zone_asof) 后恢复")
             zone = None
         else:
+            if (zone is not None and mode == "close"
+                    and not split_history_covers(
+                        hist, cfg.get("zone_asof"))):
+                # 不作废 (旧 zone 未必错), 但别让"没报拆股"读成"确认没拆股"
+                r["notes"].append(
+                    f"拆股检测只覆盖到 {hist.index[0].date()} (日线窗 1 年), "
+                    f"zone_asof {cfg['zone_asof']} 更早 — 这段空窗里的拆股"
+                    "查不到, 复核 zone 时一并确认")
             split = split_after(hist, cfg.get("zone_asof")) \
                 if zone is not None else None
             if split:
@@ -2216,6 +2237,11 @@ def action_label(r: dict, ivp) -> str:
         return "spread票👇"
     if r.get("retest"):
         return "回踩中👀"
+    if r.get("zone_invalid"):
+        # 必须排在纯状态标签之前: 拆股不清右侧状态, 右侧持仓 (TREND) 撞上
+        # 拆股时原来会显示"持有·跟20日线", 操作列一个字不提区间已作废
+        # (PR #11 评审)。止损/真票等更高优先级的标签仍在其上
+        return "拆股·重锚区间"  # zone 已作废, 左侧工具停用直到重锚
     state = r["state"]
     if state == "TREND":
         return "持有·跟20日线"
@@ -2223,8 +2249,6 @@ def action_label(r: dict, ivp) -> str:
         return "确认·看下文"
     if r.get("ladder") and not csp:
         return "分批档👇"  # 无期权链但在接货带内 — 正股分批是唯一工具
-    if r.get("zone_invalid"):
-        return "拆股·重锚区间"  # zone 已作废, 左侧工具停用直到重锚
     zone = r["cfg"]["value_zone"]
     if zone is not None and r["tech"]["close"] > zone[1]:
         return "等回落入区"  # 设了接货带, 现价还在上方 — 等价格回来

@@ -1402,7 +1402,7 @@ class TestZoneWatchScaffold(unittest.TestCase):
         w, _ = sc.zone_watch_update(None, close=230.36, zone=[185.0, 205.0],
                                     zone_asof="2026-09-05",
                                     today_iso="2026-09-07", s=self.S)
-        self.assertEqual(w["sig"], "185-205@2026-09-05")
+        self.assertEqual(w["sig"], sc.zone_sig([185.0, 205.0], "2026-09-05"))
         self.assertAlmostEqual(w["ref_pct"], (230.36 / 205 - 1) * 100,
                                places=6)
 
@@ -1418,7 +1418,7 @@ class TestZoneWatchScaffold(unittest.TestCase):
         w, _ = sc.zone_watch_update(prev, close=230.0, zone=[185.0, 210.0],
                                     zone_asof="2026-11-15",
                                     today_iso="2026-11-16", s=self.S)
-        self.assertEqual(w["sig"], "185-210@2026-11-15")
+        self.assertEqual(w["sig"], sc.zone_sig([185.0, 210.0], "2026-11-15"))
         self.assertEqual(w["flags"], {})
 
     def test_age_reminder_fires_and_repeats_weekly(self):
@@ -1455,7 +1455,8 @@ class TestZoneWatchScaffold(unittest.TestCase):
         self.assertEqual(notes2, [])          # 只提示一次, 一个月后也不再提
 
     def test_persisted_state_carries_watch(self):
-        watch = {"sig": "45-57.5@2026-09-05", "ref_pct": 11.8, "flags": {}}
+        watch = {"sig": sc.zone_sig([45.0, 57.5], "2026-09-05"),
+                 "ref_pct": 11.8, "flags": {}}
         entry = sc.next_persisted_state(
             {}, {"state": "PULLBACK", "zone_watch": watch}, "2026-09-07")
         self.assertEqual(entry["zone_watch"], watch)
@@ -1470,11 +1471,13 @@ class TestZoneWatchScaffold(unittest.TestCase):
         r = sc.analyze_ticker("XX", cfg, _ohlcv_downtrend(50.0), {},
                               {"stage": "NORMAL"}, sc.SETTINGS_DEFAULTS,
                               "close", fetch_options=False)
-        self.assertEqual(r["zone_watch"]["sig"], "45-57.5@2026-09-05")
+        self.assertEqual(r["zone_watch"]["sig"],
+                         sc.zone_sig([45.0, 57.5], "2026-09-05"))
 
     def test_legacy_watch_missing_ref_self_heals(self):
         # 手编/损坏的 state.json 丢了 ref_pct — 按当日距离重锚, 不 KeyError
-        w, _ = sc.zone_watch_update({"sig": "45-57.5@2026-09-05"},
+        w, _ = sc.zone_watch_update(
+            {"sig": sc.zone_sig([45.0, 57.5], "2026-09-05")},
                                     close=64.0, zone=[45.0, 57.5],
                                     zone_asof="2026-09-05",
                                     today_iso="2026-09-08", s=self.S)
@@ -1948,6 +1951,60 @@ class TestZoneInvalidOnSplit(unittest.TestCase):
         self.assertIn("作废", text)
         self.assertNotIn("在价值区内", text)
         self.assertNotIn("已跌破价值区下沿", text)
+
+
+class TestZoneReviewFixes(unittest.TestCase):
+    """PR #11 评审的三条 (逐条实测复现过)。"""
+
+    def test_sig_survives_seven_significant_digits(self):
+        # :g 只给 6 位有效数字 — 改了区间却共用身份, 漂移计数不归零,
+        # 上一版的粘性拆股作废还会挂在新区间上
+        a = sc.zone_sig([1000000.0, 1100000.0], "2026-09-05")
+        b = sc.zone_sig([1000001.0, 1100000.0], "2026-09-05")
+        self.assertNotEqual(a, b)
+        c = sc.zone_sig([1.2345678, 2.0], "2026-09-05")
+        d = sc.zone_sig([1.23456789, 2.0], "2026-09-05")
+        self.assertNotEqual(c, d)
+
+    def test_zone_invalid_beats_right_side_state_label(self):
+        # 拆股不清右侧状态: TREND 撞上拆股, 操作列原来显示"持有·跟20日线",
+        # 一个字不提区间已作废
+        idx = pd.bdate_range("2026-05-01", periods=70)
+        c = pd.Series([50.0 + i * 0.5 for i in range(70)], index=idx,
+                      dtype=float)
+        hist = pd.DataFrame({"Open": c, "High": c * 1.01, "Low": c * 0.99,
+                             "Close": c, "Volume": 1_000_000.0}, index=idx)
+        sp = pd.Series(0.0, index=idx)
+        sp.iloc[-6] = 10.0
+        hist["Stock Splits"] = sp
+        cfg = {**sc.TICKER_DEFAULTS, "value_zone": [45.0, 57.5],
+               "zone_asof": "2026-05-10"}
+        r = sc.analyze_ticker("XX", cfg, hist, {"state": "TREND"},
+                              {"stage": "NORMAL"}, sc.SETTINGS_DEFAULTS,
+                              "close", fetch_options=False)
+        self.assertEqual(r["state"], "TREND")      # 右侧状态确实还在
+        self.assertEqual(sc.action_label(r, None), "拆股·重锚区间")
+
+    def test_split_history_coverage_gap_is_reported(self):
+        # 日线窗只有 1 年: 校准日更早时 split_after 的 None 是"查不到"
+        # 而非"没有" — 不能装作已证伪
+        hist = _ohlcv_downtrend(50.0)
+        start = hist.index[0].date().isoformat()
+        self.assertTrue(sc.split_history_covers(hist, start))
+        self.assertFalse(sc.split_history_covers(hist, "2024-01-01"))
+        self.assertTrue(sc.split_history_covers(hist, None))
+        cfg = {**sc.TICKER_DEFAULTS, "value_zone": [45.0, 57.5],
+               "zone_asof": "2024-01-01"}
+        r = sc.analyze_ticker("XX", cfg, hist, {}, {"stage": "NORMAL"},
+                              sc.SETTINGS_DEFAULTS, "close",
+                              fetch_options=False)
+        self.assertTrue(any("拆股检测只覆盖到" in n for n in r["notes"]))
+        self.assertIsNone(r.get("zone_invalid"))   # 提示而非作废
+        # 与其余 zone 生命周期提示同规矩: open pass 不出
+        r_open = sc.analyze_ticker("XX", cfg, hist, {}, {"stage": "NORMAL"},
+                                   sc.SETTINGS_DEFAULTS, "open",
+                                   fetch_options=False)
+        self.assertFalse(any("拆股检测只覆盖到" in n for n in r_open["notes"]))
 
 
 class TestIdentityMismatch(unittest.TestCase):
