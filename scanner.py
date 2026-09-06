@@ -83,7 +83,8 @@ MAX_STALE_TRADE_DAYS = 5         # option lastPrice older than this = unusable
 # --------------------------------------------------------------------------
 
 TICKER_DEFAULTS = {"kind": "stock", "options": True, "high_beta": False,
-                   "value_zone": None, "two_x": None, "notes": ""}
+                   "value_zone": None, "zone_asof": None, "two_x": None,
+                   "notes": ""}
 
 SETTINGS_DEFAULTS = {
     "gap_alert_pct": 1.5,        # open pass: flag |gap| above this
@@ -144,6 +145,10 @@ SETTINGS_DEFAULTS = {
     # rebate 可能触发, 但那种标的本来也值得看一眼 (2026-09-04 实测: 陈旧
     # 一天的日线造成 2.0%~16.5% 的差, 3% 会漏掉 MSFT 这档)
     "rr_spot_gap_warn": 0.015,
+    # zone 生命周期腐烂检测 (2026-09-05 zone 评审: 手工 zone 会烂 —
+    # 4/15 旧锚在三周~一个月内作废而扫描器全程无感)
+    "zone_asof_stale_days": 60,      # zone_asof 距今超此天数 = 超龄复核提醒
+    "zone_flag_repeat_days": 7,      # 同一 zone 提示的重复间隔 (首发+每 N 天)
 }
 
 
@@ -212,8 +217,9 @@ def load_config(path: Path = CONFIG_FILE) -> tuple[dict, dict]:
         for k, v in tcfg.items():
             # 键名对了不代表值对: options = "false" 是合法 TOML 字符串,
             # 而非空字符串为真 — 想关期权票, 结果照常抓链出票 (PR #10 评审)
-            if k == "value_zone":
-                continue                      # 下面单独校验 (可为 None)
+            if k in ("value_zone", "zone_asof"):
+                continue                      # 下面单独校验 (都可为 None,
+                                              # zone_asof 还收裸 date)
             default = TICKER_DEFAULTS[k]
             if isinstance(default, bool):     # options / high_beta
                 ok = isinstance(v, bool)
@@ -239,6 +245,25 @@ def load_config(path: Path = CONFIG_FILE) -> tuple[dict, dict]:
                     f"(低 < 高), 得到 {zone!r}")
             # 统一成 float — TOML 里 [45, 57.5] 混用 int/float 是合法的
             cfg["value_zone"] = [float(zone[0]), float(zone[1])]
+        asof = cfg["zone_asof"]
+        if asof is not None:
+            if zone is None:
+                raise ValueError(f"{sym}: zone_asof 只在设了 value_zone 时有意义")
+            # TOML 裸日期解析成 date, 带引号是 str — 都归一成 ISO 字符串
+            if isinstance(asof, datetime):
+                asof = asof.date()
+            if not isinstance(asof, date):
+                try:
+                    asof = date.fromisoformat(str(asof))
+                except (ValueError, TypeError):
+                    raise ValueError(f"{sym}: zone_asof 必须是日期 "
+                                     f"(YYYY-MM-DD), 得到 {asof!r}") from None
+            if asof > datetime.now(ET).date():
+                # 年份 typo 会同时静默废掉超龄提醒 (age 恒负) 与拆股检测
+                # (cutoff 在未来) — 装载时就拒, 别留两个机制无声关闭
+                raise ValueError(f"{sym}: zone_asof {asof} 在未来 — 校准"
+                                 "日期只能是今天或过去")
+            cfg["zone_asof"] = asof.isoformat()
         key = sym.upper()
         if key in tickers:
             # [tickers.spcx] 与 [tickers.SPCX] 是合法的两张 TOML 表 —
@@ -279,6 +304,10 @@ def next_persisted_state(prev: dict, r: dict, today: str) -> dict:
     lw = r.get("leap_window") or prev.get("leap_window")
     if lw:
         entry["leap_window"] = lw
+    # zone 生命周期监控状态: 本次结果直接覆盖 (zone_watch_update 自己
+    # 负责沿用/归零), zone 被删时 r["zone_watch"] 为 None → 键自然消失
+    if r.get("zone_watch"):
+        entry["zone_watch"] = r["zone_watch"]
     # NORMAL 期 LEAP 被硬停牌拦下的补发标记: 确认转换是一次性的且会被
     # state.json 无条件消耗, halt 不该吞掉它 — 标记随右侧状态存活,
     # 止损出局 (转 PULLBACK) 即失效; 真票发出当日不再置位, 自然清除
@@ -806,6 +835,61 @@ STATE_LABEL = {
     "CONFIRMED": "右侧确认", "TREND": "右侧持仓(跟踪20日线)",
     "NO_DATA": "数据不足",
 }
+
+
+def zone_sig(zone, zone_asof) -> str | None:
+    """zone 配置身份 — 数值或 zone_asof 变了 = 人已重校: 漂移计数与
+    提示频控全部归零, 新身份从零开始观察。"""
+    if zone is None:
+        return None
+    return f"{zone[0]:g}-{zone[1]:g}@{zone_asof or '未标'}"
+
+
+def _zone_flag_due(flags: dict, name: str, today_iso: str,
+                   repeat_days: int) -> bool:
+    """同一提示首发 + 每 repeat_days 天一次 — 命中即更新 flags[name]。"""
+    last = flags.get(name)
+    if last is not None and (date.fromisoformat(today_iso)
+                             - date.fromisoformat(last)).days < repeat_days:
+        return False
+    flags[name] = today_iso
+    return True
+
+
+def zone_watch_update(prev_watch, *, close: float, zone, zone_asof,
+                      today_iso: str, s: dict) -> tuple[dict | None, list[str]]:
+    """zone 生命周期监控 (纯函数, close 口径) -> (新 watch 状态, notes)。
+
+    手工维护的 zone 会腐烂而扫描器此前完全无感 (2026-09-05 zone 评审
+    实证: AAPL 旧带被实价击穿 +21% 一个月, 过时警告只写在 config notes
+    这个 write-only 字段里从未上报)。watch 存 state.json 随
+    next_persisted_state 跨日携带 (manual/stale 日不落盘 — 计数只按
+    正式收盘推进); ref_pct 记本 zone 身份首个收盘距上沿的距离, 给漂移
+    阈值做自校准基准 (故意设深的接货带不该在校准日就报警)。"""
+    if zone is None:
+        return None, []
+    sig = zone_sig(zone, zone_asof)
+    w = dict(prev_watch) if prev_watch and prev_watch.get("sig") == sig \
+        else {"sig": sig, "ref_pct": max(0.0, (close / zone[1] - 1) * 100)}
+    # 手编/损坏的 state.json 可能丢 ref_pct — 缺失按当日距离重锚, 单日
+    # 自愈, 别让 KeyError 经宽 except 把整个标的吞成 r[error]
+    w.setdefault("ref_pct", max(0.0, (close / zone[1] - 1) * 100))
+    w["flags"] = dict(w.get("flags") or {})
+    notes = []
+    if zone_asof is None:
+        if "no_asof" not in w["flags"]:      # 每个 zone 身份只提示一次
+            w["flags"]["no_asof"] = today_iso
+            notes.append("zone 未标 zone_asof — 在 watchlist.toml 补上校准"
+                         "日期 (YYYY-MM-DD) 才能启用超龄复核提醒")
+    else:
+        age = (date.fromisoformat(today_iso)
+               - date.fromisoformat(zone_asof)).days
+        if age > s["zone_asof_stale_days"] and _zone_flag_due(
+                w["flags"], "age", today_iso, s["zone_flag_repeat_days"]):
+            notes.append(f"zone 校准已 {age} 天 (zone_asof {zone_asof}) — "
+                         "剧本: 对照最新估值带/支撑复核区间, 复核后更新 "
+                         "zone_asof")
+    return w, notes
 
 
 def yang_zhang(price_data, window=30, trading_periods=252):
@@ -1685,6 +1769,16 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
         # 与 next_state/_finish_csp 的下沿判定同一口径 — note 给人读,
         # 这个旗标给 action_block 等渲染路由用
         r["below_floor"] = zone is not None and tech["close"] < zone[0]
+        # zone 生命周期监控 — 放在 fetch_options 返回之前: --no-options
+        # 的非 manual 收盘跑也要携带 watch, 否则持久化循环会把它抹掉
+        # (与 leap_pending 同一个坑, 见 next_persisted_state docstring)。
+        # notes 只在 close 出 (open 报告不渲染 notes, 且计数以收盘为准)
+        r["zone_watch"], zw_notes = zone_watch_update(
+            prev_state.get("zone_watch"), close=tech["close"], zone=zone,
+            zone_asof=cfg.get("zone_asof"),
+            today_iso=datetime.now(ET).date().isoformat(), s=s)
+        if mode == "close":
+            r["notes"].extend(zw_notes)
 
         if not fetch_options:
             return r

@@ -1354,6 +1354,149 @@ class TestLoadConfig(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._load("[settings]\nnear_zone_pct = 5.0\n")
 
+    def test_zone_asof_accepted_and_normalized(self):
+        _, t = self._load('[tickers.NVDA]\nvalue_zone = [185, 205]\n'
+                          'zone_asof = "2026-09-05"\n')
+        self.assertEqual(t["NVDA"]["zone_asof"], "2026-09-05")
+        # TOML 裸日期 (无引号) 解析成 date 对象 — 同样归一成 ISO 字符串
+        _, t = self._load("[tickers.NVDA]\nvalue_zone = [185, 205]\n"
+                          "zone_asof = 2026-09-05\n")
+        self.assertEqual(t["NVDA"]["zone_asof"], "2026-09-05")
+        # TOML 裸 datetime (带时间) 是 datetime 对象 — isinstance 分支
+        # 顺序 (datetime 先于 date) 的 pin
+        _, t = self._load("[tickers.NVDA]\nvalue_zone = [185, 205]\n"
+                          "zone_asof = 2026-09-05T10:00:00\n")
+        self.assertEqual(t["NVDA"]["zone_asof"], "2026-09-05")
+
+    def test_zone_asof_without_zone_raises(self):
+        with self.assertRaisesRegex(ValueError, "只在设了 value_zone"):
+            self._load('[tickers.NVDA]\nzone_asof = "2026-09-05"\n')
+
+    def test_zone_asof_bad_format_raises(self):
+        with self.assertRaisesRegex(ValueError, "必须是日期"):
+            self._load('[tickers.NVDA]\nvalue_zone = [185, 205]\n'
+                       'zone_asof = "09/05/2026"\n')
+
+    def test_zone_asof_future_raises(self):
+        # 年份 typo (2026→2062) 会同时静默废掉超龄提醒与拆股检测
+        with self.assertRaisesRegex(ValueError, "在未来"):
+            self._load('[tickers.NVDA]\nvalue_zone = [185, 205]\n'
+                       'zone_asof = "2062-09-05"\n')
+
+
+class TestZoneWatchScaffold(unittest.TestCase):
+    """zone 生命周期监控脚手架: sig 身份 / ref 自校准基准 / 提示频控 /
+    超龄提醒 / state.json 携带 (zone 评审: AAPL 旧带带着自己写在 notes
+    里的过时警告烂了 26 天, 因为 notes 是 write-only 字段)。"""
+
+    S = sc.SETTINGS_DEFAULTS
+
+    def test_no_zone_no_watch(self):
+        w, notes = sc.zone_watch_update(None, close=100.0, zone=None,
+                                        zone_asof=None,
+                                        today_iso="2026-09-07", s=self.S)
+        self.assertIsNone(w)
+        self.assertEqual(notes, [])
+
+    def test_init_captures_sig_and_ref(self):
+        w, _ = sc.zone_watch_update(None, close=230.36, zone=[185.0, 205.0],
+                                    zone_asof="2026-09-05",
+                                    today_iso="2026-09-07", s=self.S)
+        self.assertEqual(w["sig"], "185-205@2026-09-05")
+        self.assertAlmostEqual(w["ref_pct"], (230.36 / 205 - 1) * 100,
+                               places=6)
+
+    def test_ref_floored_at_zero_inside_zone(self):
+        w, _ = sc.zone_watch_update(None, close=335.31, zone=[315.0, 340.0],
+                                    zone_asof="2026-09-05",
+                                    today_iso="2026-09-07", s=self.S)
+        self.assertEqual(w["ref_pct"], 0.0)
+
+    def test_sig_change_resets_flags(self):
+        prev = {"sig": "185-205@2026-09-05", "ref_pct": 12.4,
+                "flags": {"age": "2026-11-10"}}
+        w, _ = sc.zone_watch_update(prev, close=230.0, zone=[185.0, 210.0],
+                                    zone_asof="2026-11-15",
+                                    today_iso="2026-11-16", s=self.S)
+        self.assertEqual(w["sig"], "185-210@2026-11-15")
+        self.assertEqual(w["flags"], {})
+
+    def test_age_reminder_fires_and_repeats_weekly(self):
+        zone = [185.0, 205.0]
+        w, notes = sc.zone_watch_update(None, close=230.0, zone=zone,
+                                        zone_asof="2026-09-05",
+                                        today_iso="2026-11-05", s=self.S)
+        self.assertTrue(any("复核" in n for n in notes))     # 61 天 > 60
+        w, notes2 = sc.zone_watch_update(w, close=230.0, zone=zone,
+                                         zone_asof="2026-09-05",
+                                         today_iso="2026-11-06", s=self.S)
+        self.assertEqual(notes2, [])                          # 频控: 次日静默
+        _, notes3 = sc.zone_watch_update(w, close=230.0, zone=zone,
+                                         zone_asof="2026-09-05",
+                                         today_iso="2026-11-12", s=self.S)
+        self.assertTrue(any("复核" in n for n in notes3))     # 7 天后重复
+
+    def test_fresh_zone_is_silent(self):
+        _, notes = sc.zone_watch_update(None, close=230.0,
+                                        zone=[185.0, 205.0],
+                                        zone_asof="2026-09-05",
+                                        today_iso="2026-09-07", s=self.S)
+        self.assertEqual(notes, [])
+
+    def test_no_asof_hint_once_per_sig(self):
+        zone = [45.0, 57.5]
+        w, notes = sc.zone_watch_update(None, close=64.0, zone=zone,
+                                        zone_asof=None,
+                                        today_iso="2026-09-07", s=self.S)
+        self.assertTrue(any("zone_asof" in n for n in notes))
+        _, notes2 = sc.zone_watch_update(w, close=64.0, zone=zone,
+                                         zone_asof=None,
+                                         today_iso="2026-10-07", s=self.S)
+        self.assertEqual(notes2, [])          # 只提示一次, 一个月后也不再提
+
+    def test_persisted_state_carries_watch(self):
+        watch = {"sig": "45-57.5@2026-09-05", "ref_pct": 11.8, "flags": {}}
+        entry = sc.next_persisted_state(
+            {}, {"state": "PULLBACK", "zone_watch": watch}, "2026-09-07")
+        self.assertEqual(entry["zone_watch"], watch)
+        entry2 = sc.next_persisted_state(
+            {"zone_watch": watch},
+            {"state": "PULLBACK", "zone_watch": None}, "2026-09-08")
+        self.assertNotIn("zone_watch", entry2)   # zone 删掉 → watch 消失
+
+    def test_analyze_ticker_wires_watch(self):
+        cfg = {**sc.TICKER_DEFAULTS, "value_zone": [45.0, 57.5],
+               "zone_asof": "2026-09-05"}
+        r = sc.analyze_ticker("XX", cfg, _ohlcv_downtrend(50.0), {},
+                              {"stage": "NORMAL"}, sc.SETTINGS_DEFAULTS,
+                              "close", fetch_options=False)
+        self.assertEqual(r["zone_watch"]["sig"], "45-57.5@2026-09-05")
+
+    def test_legacy_watch_missing_ref_self_heals(self):
+        # 手编/损坏的 state.json 丢了 ref_pct — 按当日距离重锚, 不 KeyError
+        w, _ = sc.zone_watch_update({"sig": "45-57.5@2026-09-05"},
+                                    close=64.0, zone=[45.0, 57.5],
+                                    zone_asof="2026-09-05",
+                                    today_iso="2026-09-08", s=self.S)
+        self.assertAlmostEqual(w["ref_pct"], (64.0 / 57.5 - 1) * 100,
+                               places=6)
+
+    def test_open_pass_computes_watch_but_suppresses_notes(self):
+        # zone_asof 用永久超龄的 2020 日期绕开 datetime.now 注入问题:
+        # open pass 要携带 watch (持久化老坑) 但不出 notes (open 报告
+        # 不渲染 notes, 且计数/提示以收盘为准); close pass 出提示
+        cfg = {**sc.TICKER_DEFAULTS, "value_zone": [45.0, 57.5],
+               "zone_asof": "2020-01-01"}
+        r_open = sc.analyze_ticker("XX", cfg, _ohlcv_downtrend(50.0), {},
+                                   {"stage": "NORMAL"}, sc.SETTINGS_DEFAULTS,
+                                   "open", fetch_options=False)
+        self.assertIsNotNone(r_open["zone_watch"])
+        self.assertFalse(any("复核" in n for n in r_open["notes"]))
+        r_close = sc.analyze_ticker("XX", cfg, _ohlcv_downtrend(50.0), {},
+                                    {"stage": "NORMAL"}, sc.SETTINGS_DEFAULTS,
+                                    "close", fetch_options=False)
+        self.assertTrue(any("复核" in n for n in r_close["notes"]))
+
 
 class TestActionBlockFloorTag(unittest.TestCase):
     """zone 评审: 破下沿铸出的 CSP 票在第一屏的 🔵 行必须自带论点检查前置
