@@ -494,10 +494,10 @@ class TestEmailHtml(unittest.TestCase):
         # Gmail 超过 ~102KB 会截断成 "[Message clipped]" — 报告被静默切掉
         # 一半比不发还糟。20 只标的的概览表 + 每只两行 note 是个偏悲观的
         # 规模, 留足余量。
-        head = "| 标的 | 价值区 | 状态 | 操作 | 收盘 | Δ% | vs20日 | 量比 | 三选二 | iv/rv | IVP |"
+        head = "| 标的 | 价值区 | 收盘 | 状态 | 操作 | Δ% | vs20日 | 量比 | 三选二 | iv/rv | IVP |"
         sep = "|" + "---|" * 11
-        rows = ["| SYM%02d | 380-440 (上方+16%%) | 回调中(20日线下) | 设区间 "
-                "| 709.24 | +1.2 | -0.0%% | 1.0x | 低✓ 收· 破· | 25/47%% | 62 |" % i
+        rows = ["| SYM%02d | 380-440 (上方+16%%) | 709.24 | 回调中(20日线下) "
+                "| 设区间 | +1.2 | -0.0%% | 1.0x | 低✓ 收· 破· | 25/47%% | 62 |" % i
                 for i in range(20)]
         notes = []
         for i in range(20):
@@ -1475,6 +1475,29 @@ class TestAnalyzeTickerBelowFloor(unittest.TestCase):
         self.assertFalse(r["below_floor"])
 
 
+class TestZonePosition(unittest.TestCase):
+    """概览表"现价 vs 接货带"那半句的措辞。"""
+
+    def test_hairline_gets_one_decimal(self):
+        # ISRG 实况: 收 366.70, 上沿 365 — 差 0.46%, 取整成 "上方+0%" 与
+        # 同一行的"接近价值区"自相矛盾
+        self.assertEqual(sc.zone_position(366.70, [320.0, 365.0]),
+                         "上方+0.5%")
+        self.assertEqual(sc.zone_position(363.5, [365.0, 400.0]),
+                         "破下沿-0.4%")
+
+    def test_normal_distance_stays_integer(self):
+        self.assertEqual(sc.zone_position(499.70, [380.0, 440.0]),
+                         "上方+14%")
+        self.assertEqual(sc.zone_position(40.0, [45.0, 57.5]),
+                         "破下沿-11%")
+
+    def test_inside_zone(self):
+        self.assertEqual(sc.zone_position(335.31, [315.0, 340.0]), "区内")
+        self.assertEqual(sc.zone_position(340.0, [315.0, 340.0]), "区内")
+        self.assertEqual(sc.zone_position(315.0, [315.0, 340.0]), "区内")
+
+
 class TestRenderCloseZoneLines(unittest.TestCase):
     """render_close 的两处 zone 分支烟测: CSP 三档措辞 (strike<下沿不再说
     "在价值区内") 与 ladder 档位相对现价的计数 (挂 GTC 会立即成交的实钱
@@ -1526,10 +1549,11 @@ class TestRenderCloseZoneLines(unittest.TestCase):
         # 手机上"这票的接货带在哪"要和标的挨着 — 原来隔了 7 列 (状态/操作/
         # 收盘/Δ%/vs20日/量比/三选二), 横向扫过去才对得上
         text = self._render(self._result(335.31, (315.0, 340.0), 310.0))
-        self.assertIn("| 标的 | 价值区 | 状态 | 操作 |", text)
+        self.assertIn("| 标的 | 价值区 | 收盘 | 状态 |", text)
         row = next(l for l in text.splitlines() if l.startswith("| XX |"))
         self.assertEqual(_split(row)[1], "315-340 (区内)")
-        self.assertEqual(_split(row)[2], "价值区内(左侧)")
+        self.assertEqual(_split(row)[2], "335.31")
+        self.assertEqual(_split(row)[3], "价值区内(左侧)")
         self.assertEqual(len(_split(row)), 11)     # 列数不变, 只换位
 
     def test_ladder_all_rungs_below_close_no_note(self):

@@ -2146,6 +2146,21 @@ def regime_block(regime: dict) -> list[str]:
     return lines
 
 
+def zone_position(close: float, zone) -> str:
+    """概览表里"现价相对接货带"的那半句。
+
+    贴边时 0 位小数会自相矛盾 — ISRG 收 366.70 距上沿 365 只有 0.46%,
+    显示 "上方+0%" 却挂着"接近价值区"的状态。|X| < 1% 时给一位小数,
+    其余照旧取整 (带子本身是手估的, 两位小数是假精度)。"""
+    def pct(v: float) -> str:
+        return f"{v:+.1f}%" if abs(v) < 1 else f"{v:+.0f}%"
+    if close > zone[1]:
+        return f"上方{pct((close / zone[1] - 1) * 100)}"
+    if close < zone[0]:
+        return f"破下沿{pct((close / zone[0] - 1) * 100)}"
+    return "区内"
+
+
 def render_close(results, regime, ivdf, now_et) -> str:
     d = now_et.strftime("%Y-%m-%d")
     lines = [f"# 左右侧 watchlist 扫描 — {d} 尾盘 "
@@ -2155,24 +2170,20 @@ def render_close(results, regime, ivdf, now_et) -> str:
 
     ordered = by_actionability(results)
     lines += ["## 概览 (按可操作性排序)", "",
-              "| 标的 | 价值区 | 状态 | 操作 | 收盘 | Δ% | vs20日 "
+              "| 标的 | 价值区 | 收盘 | 状态 | 操作 | Δ% | vs20日 "
               "| 量比 | 三选二 | iv/rv | IVP |",
               "|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in ordered:
         t = r["tech"]
         if t is None:
-            lines.append(f"| {r['symbol']} | — | {STATE_LABEL['NO_DATA']} "
-                         f"| — | — | — | — | — | — | — | — |")
+            lines.append(f"| {r['symbol']} | — | — "
+                         f"| {STATE_LABEL['NO_DATA']} "
+                         f"| — | — | — | — | — | — | — |")
             continue
         zone = r["cfg"]["value_zone"]
         if zone:
-            if t["close"] > zone[1]:
-                pos = f"上方+{(t['close'] / zone[1] - 1) * 100:.0f}%"
-            elif t["close"] < zone[0]:
-                pos = f"破下沿{(t['close'] / zone[0] - 1) * 100:.0f}%"
-            else:
-                pos = "区内"
-            zone_s = f"{zone[0]:g}-{zone[1]:g} ({pos})"
+            zone_s = (f"{zone[0]:g}-{zone[1]:g} "
+                      f"({zone_position(t['close'], zone)})")
         else:
             zone_s = "未设"
         ivp = self_ivp(ivdf, r["symbol"], r["iv30"]) if r["iv30"] else None
@@ -2180,8 +2191,8 @@ def render_close(results, regime, ivdf, now_et) -> str:
                 if r["iv30"] and t["rv30"]
                 else fmt(r["iv30"] and r["iv30"] * 100, ".0f", "%"))
         lines.append(
-            f"| {r['symbol']} | {zone_s} | {STATE_LABEL[r['state']]} "
-            f"| {action_label(r, ivp)} | {t['close']:.2f} "
+            f"| {r['symbol']} | {zone_s} | {t['close']:.2f} "
+            f"| {STATE_LABEL[r['state']]} | {action_label(r, ivp)} "
             f"| {t['change_pct']:+.1f} | {t['vs_sma20_pct']:+.1f}% "
             f"| {t['vol_ratio']:.1f}x | {sig_marks(t['signals'])} "
             f"| {ivrv} | {fmt(ivp, '.0f')} |")
