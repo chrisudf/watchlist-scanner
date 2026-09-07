@@ -2419,5 +2419,111 @@ class TestRR25(unittest.TestCase):
             sc.rr25([self._row(115, None, 0.25)], [self._row(90, 0.3, -0.25)]))
 
 
+class TestWatchdogExpectation(unittest.TestCase):
+    """看门狗"这天该不该有报告"的判定 — 2026-09-07 劳工节误报后补的。
+    判据是 NYSE 日历; 盘面只有**否决沉默**的权力, 没有制造沉默的权力。"""
+
+    @staticmethod
+    def _bars(*stamps):
+        idx = pd.DatetimeIndex([pd.Timestamp(s, tz=sc.ET) for s in stamps])
+        return pd.DataFrame({"Close": [1.0] * len(idx)}, index=idx)
+
+    @staticmethod
+    def _tape(ret=None, exc=None):
+        from unittest.mock import patch, MagicMock
+        tk = MagicMock()
+        if exc is not None:
+            tk.history.side_effect = exc
+        else:
+            tk.history.return_value = ret
+        return patch.object(sc.yf, "Ticker", return_value=tk)
+
+    @staticmethod
+    def _no_network():
+        from unittest.mock import patch
+        return patch.object(sc.yf, "Ticker",
+                            side_effect=AssertionError("这条分支不该联网"))
+
+    # --- 日历直接给答案, 一次网络都不该发 ---
+
+    def test_ordinary_trading_day(self):
+        with self._no_network():
+            modes, why = sc.expected_report_modes("2026-09-04")   # 周五
+        self.assertEqual(modes, ["open", "close"])
+        self.assertIn("整日", why)
+
+    def test_weekend(self):
+        with self._no_network():
+            modes, why = sc.expected_report_modes("2026-09-05")   # 周六
+        self.assertEqual(modes, [])
+        self.assertIn("周末", why)
+
+    def test_beyond_calendar_coverage_assumes_full_day(self):
+        beyond = (sc.NYSE_CALENDAR_THROUGH + timedelta(days=5)).isoformat()
+        with self._no_network():
+            modes, why = sc.expected_report_modes(beyond)
+        self.assertEqual(modes, ["open", "close"])
+        self.assertIn("按整日算", why)       # 表过期只会变吵, 不会变哑
+
+    # --- 假日 / 半日市: 日历要沉默, 盘面有否决权 ---
+
+    def test_holiday_expects_nothing(self):
+        with self._tape(self._bars("2026-09-04 15:59")):    # 当天无 bar
+            modes, why = sc.expected_report_modes("2026-09-07")   # 劳工节
+        self.assertEqual(modes, [])
+        self.assertIn("休市", why)
+
+    def test_half_day_expects_open_only(self):
+        with self._tape(self._bars("2026-11-27 12:59")):
+            modes, why = sc.expected_report_modes("2026-11-27")   # 感恩节次日
+        self.assertEqual(modes, ["open"])
+        self.assertIn("半日市", why)
+
+    def test_tape_vetoes_a_stale_holiday_entry(self):
+        # 日历说休市, 盘面却显示当天交易了一整天 -> 表过期, 照常要两份
+        with self._tape(self._bars("2026-09-07 09:30", "2026-09-07 15:59")):
+            modes, why = sc.expected_report_modes("2026-09-07")
+        self.assertEqual(modes, ["open", "close"])
+        self.assertIn("日历过期", why)
+
+    def test_tape_vetoes_a_stale_half_day_entry(self):
+        with self._tape(self._bars("2026-11-27 15:59")):
+            modes, why = sc.expected_report_modes("2026-11-27")
+        self.assertEqual(modes, ["open", "close"])
+        self.assertIn("日历过期", why)
+
+    def test_broken_tape_cannot_undo_calendar_silence(self):
+        # 否决权可以缺席: 盘面取不到就沿用日历的判定
+        with self._tape(exc=RuntimeError("boom")):
+            modes, _ = sc.expected_report_modes("2026-09-07")
+        self.assertEqual(modes, [])
+
+    # --- 第一版的 bug (PR #12 评审): 盘面不能用来制造沉默 ---
+
+    def test_yahoo_outage_on_a_trading_day_still_alerts(self):
+        # 普通交易日 Yahoo 抽风、当天一根 bar 都没有。第一版据此判"休市"
+        # 返回 [], 而扫描器同一时刻也因 stale feed 两次全 skip —— 合起来
+        # 就是整天静默丢报, 正好是看门狗存在的意义被绕过。现在日历说话。
+        with self._tape(self._bars("2026-09-03 15:59")):
+            modes, why = sc.expected_report_modes("2026-09-04")
+        self.assertEqual(modes, ["open", "close"])
+        self.assertIn("整日", why)
+
+    # --- 日历表自身的体检 ---
+
+    def test_calendar_entries_are_weekdays_within_coverage(self):
+        # 假日抄成周末日期 = 那天的漏报会静默; 超出覆盖声明同理
+        for d in sc.NYSE_HOLIDAYS | sc.NYSE_HALF_DAYS:
+            self.assertLess(d.weekday(), 5, f"{d} 落在周末")
+            self.assertLessEqual(d, sc.NYSE_CALENDAR_THROUGH, f"{d} 超出覆盖")
+        self.assertFalse(sc.NYSE_HOLIDAYS & sc.NYSE_HALF_DAYS,
+                         "同一天不能既全休又半日")
+
+    def test_empty_week_is_a_feed_problem_not_a_closure(self):
+        with self._tape(pd.DataFrame()):
+            with self.assertRaises(RuntimeError):
+                sc.last_session_bar("2026-09-04")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
