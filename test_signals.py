@@ -2419,5 +2419,72 @@ class TestRR25(unittest.TestCase):
             sc.rr25([self._row(115, None, 0.25)], [self._row(90, 0.3, -0.25)]))
 
 
+class TestWatchdogExpectation(unittest.TestCase):
+    """看门狗"这天该不该有报告"的判定 — 2026-09-07 劳工节误报后补的。"""
+
+    @staticmethod
+    def _bars(*stamps):
+        idx = pd.DatetimeIndex([pd.Timestamp(s, tz=sc.ET) for s in stamps])
+        return pd.DataFrame({"Close": [1.0] * len(idx)}, index=idx)
+
+    @staticmethod
+    def _patch(ret=None, exc=None):
+        from unittest.mock import patch, MagicMock
+        tk = MagicMock()
+        if exc is not None:
+            tk.history.side_effect = exc
+        else:
+            tk.history.return_value = ret
+        return patch.object(sc.yf, "Ticker", return_value=tk)
+
+    def test_full_session_expects_both(self):
+        bars = self._bars("2026-09-03 15:59", "2026-09-04 09:30",
+                          "2026-09-04 15:59")
+        with self._patch(bars):
+            modes, why = sc.expected_report_modes("2026-09-04")
+        self.assertEqual(modes, ["open", "close"])
+        self.assertIn("15:59", why)
+
+    def test_holiday_expects_nothing(self):
+        # 劳工节: 一周里别的交易日有 bar, 就是没有当天的 —— 休市, 不是坏 feed
+        bars = self._bars("2026-09-03 15:59", "2026-09-04 15:59")
+        with self._patch(bars):
+            modes, why = sc.expected_report_modes("2026-09-07")
+        self.assertEqual(modes, [])
+        self.assertIn("休市", why)
+
+    def test_half_day_expects_open_only(self):
+        # 感恩节次日 13:00 ET 收盘: open 该有, close 本就无盘可扫
+        bars = self._bars("2026-11-25 15:59", "2026-11-27 12:59")
+        with self._patch(bars):
+            modes, why = sc.expected_report_modes("2026-11-27")
+        self.assertEqual(modes, ["open"])
+        self.assertIn("半日市", why)
+
+    def test_weekend_short_circuits_without_a_fetch(self):
+        from unittest.mock import patch
+        with patch.object(sc.yf, "Ticker",
+                          side_effect=AssertionError("周末不该联网")):
+            modes, why = sc.expected_report_modes("2026-09-05")   # 周六
+        self.assertEqual(modes, [])
+        self.assertIn("周末", why)
+
+    def test_lookup_failure_still_alerts(self):
+        # 判定器坏掉不能让看门狗静默 —— 宁可误报, 不可漏报
+        with self._patch(exc=RuntimeError("boom")):
+            modes, why = sc.expected_report_modes("2026-09-04")
+        self.assertEqual(modes, ["open", "close"])
+        self.assertIn("按整日算", why)
+
+    def test_empty_frame_is_a_feed_problem_not_a_holiday(self):
+        # 整周一根 bar 都没有 = 数据源坏了, 必须 raise 而不是当成休市
+        with self._patch(pd.DataFrame()):
+            with self.assertRaises(RuntimeError):
+                sc.last_session_bar("2026-09-04")
+        with self._patch(pd.DataFrame()):
+            modes, _ = sc.expected_report_modes("2026-09-04")
+        self.assertEqual(modes, ["open", "close"])   # 降级后照常报警
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

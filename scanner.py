@@ -387,6 +387,59 @@ def market_is_live() -> bool:
     return (datetime.now(timezone.utc) - last).total_seconds() < 20 * 60
 
 
+def last_session_bar(day: str) -> datetime | None:
+    """Last regular-session 1m bar SPY printed on `day` (YYYY-MM-DD, ET), or
+    None when the US market never opened that day.
+
+    Same calendar-free trick as market_is_live() — ask the tape, not a holiday
+    list. Pulls the week *ending* on `day` so "no bars anywhere" (broken feed,
+    raises) stays distinguishable from "no bars on that date" (weekend/holiday,
+    returns None); a single-day fetch makes the two look identical.
+    """
+    d = datetime.strptime(day, "%Y-%m-%d").date()
+    try:
+        bars = yf.Ticker("SPY").history(
+            start=(d - timedelta(days=6)).isoformat(),
+            end=(d + timedelta(days=1)).isoformat(), interval="1m")
+    except Exception as e:
+        raise RuntimeError(
+            f"SPY session fetch failed for {day} "
+            f"({type(e).__name__}: {e})") from e
+    if bars.empty:
+        raise RuntimeError(
+            f"SPY 1m history empty for the week ending {day} — feed problem")
+    idx = bars.index
+    idx = idx.tz_convert(ET) if idx.tz is not None else idx.tz_localize(ET)
+    on_day = idx[idx.date == d]
+    if len(on_day) == 0:
+        return None
+    return on_day[-1].to_pydatetime()
+
+
+def expected_report_modes(day: str) -> tuple[list[str], str]:
+    """What the watchdog is entitled to demand for ET trading day `day`:
+    (modes, reason). [] on a weekend/holiday, ["open"] on a half day whose
+    tape stopped before the close window, both after a full session.
+
+    Fails LOUD by design: if the lookup itself breaks, assume a full session,
+    so a broken feed can never *silence* a genuinely missed scan. A false
+    MISSED alert is cheap; a swallowed one is the exact failure this watchdog
+    exists to catch.
+    """
+    d = datetime.strptime(day, "%Y-%m-%d").date()
+    if d.weekday() >= 5:
+        return [], "周末 — 本就不该有报告"
+    try:
+        end = last_session_bar(day)
+    except Exception as e:
+        return ["open", "close"], f"盘面查询失败 ({e}) — 按整日算"
+    if end is None:
+        return [], "美股休市 (假日) — 本就不该有报告"
+    if (end.hour, end.minute) < CLOSE_WINDOW[0]:
+        return ["open"], f"半日市 (盘面停在 {end:%H:%M} ET) — 尾盘无盘可扫"
+    return ["open", "close"], f"整日 (盘面到 {end:%H:%M} ET)"
+
+
 # --------------------------------------------------------------------------
 # Regime: VIX/VIX3M term-structure state machine
 # --------------------------------------------------------------------------
