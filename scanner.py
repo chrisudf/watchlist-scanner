@@ -77,6 +77,24 @@ CLOSE_WINDOW = ((15, 30), (16, 5))
 
 MAX_STALE_TRADE_DAYS = 5         # option lastPrice older than this = unusable
 
+# NYSE 全休市日 + 半日市 (13:00 ET 收盘)。交易所提前数年公布, 所以这里显式
+# 列表而不是问盘面 —— 理由见 expected_report_modes(): "那天没数据"既可能是
+# 休市也可能是数据源坏了, 盘面分不开这两种, 而它们要走相反的分支。
+# 覆盖范围外一律按整日交易算 (即照常报警), 所以过期的表只会变吵不会变哑。
+# 半日市宁缺勿滥: 多列一天会让真丢的 close 报告静默, 少列一天只是误报一次。
+NYSE_CALENDAR_THROUGH = date(2027, 12, 31)
+NYSE_HOLIDAYS = frozenset(map(date.fromisoformat, (
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
+    "2026-06-19", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+    "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31",
+    "2027-06-18", "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24",
+)))
+NYSE_HALF_DAYS = frozenset(map(date.fromisoformat, (
+    "2026-11-27", "2026-12-24",   # 感恩节次日 / 平安夜
+    "2027-11-26",                 # 感恩节次日 (2027 平安夜就是圣诞观察日, 全休)
+)))
+
+
 
 # --------------------------------------------------------------------------
 # Config / persistence
@@ -389,12 +407,15 @@ def market_is_live() -> bool:
 
 def last_session_bar(day: str) -> datetime | None:
     """Last regular-session 1m bar SPY printed on `day` (YYYY-MM-DD, ET), or
-    None when the US market never opened that day.
+    None when the tape shows no session that day.
 
-    Same calendar-free trick as market_is_live() — ask the tape, not a holiday
-    list. Pulls the week *ending* on `day` so "no bars anywhere" (broken feed,
-    raises) stays distinguishable from "no bars on that date" (weekend/holiday,
-    returns None); a single-day fetch makes the two look identical.
+    Pulls the week *ending* on `day` so "no bars anywhere" (broken feed —
+    raises) stays distinguishable from "no bars on that date" (returns None);
+    a single-day fetch makes those two look identical.
+
+    NOTE: None is NOT proof the market was shut — a Yahoo outage looks exactly
+    the same. Only ever use this to *contradict* a calendar, never to conclude
+    a closure. See expected_report_modes().
     """
     d = datetime.strptime(day, "%Y-%m-%d").date()
     try:
@@ -416,28 +437,49 @@ def last_session_bar(day: str) -> datetime | None:
     return on_day[-1].to_pydatetime()
 
 
-def expected_report_modes(day: str) -> tuple[list[str], str]:
-    """What the watchdog is entitled to demand for ET trading day `day`:
-    (modes, reason). [] on a weekend/holiday, ["open"] on a half day whose
-    tape stopped before the close window, both after a full session.
+def _tape_session_end(day: str) -> datetime | None:
+    """last_session_bar() 的不抛版本 —— 任何故障都当作"盘面无话可说"。
+    只用来否决日历的沉默: 否决权可以缺席, 不可以误用。"""
+    try:
+        return last_session_bar(day)
+    except Exception:
+        return None
 
-    Fails LOUD by design: if the lookup itself breaks, assume a full session,
-    so a broken feed can never *silence* a genuinely missed scan. A false
-    MISSED alert is cheap; a swallowed one is the exact failure this watchdog
-    exists to catch.
+
+def expected_report_modes(day: str) -> tuple[list[str], str]:
+    """看门狗对 ET 交易日 `day` 有权要求存在的报告: (modes, 人读的理由)。
+    休市 [] / 半日市 ["open"] / 整日 ["open", "close"]。
+
+    判据是**交易所日历**而不是盘面 —— 这是本函数与 market_is_live() 的关键
+    分歧, 也是第一版的 bug。同样一句"那天没有 bar", 对扫描器意味着"别扫了"
+    (安全方向: 最多少扫一次), 对看门狗却意味着"别报警"(危险方向: 真丢了也
+    没人知道)。而"休市"和"数据源坏了"在盘面上长得一模一样, 所以 Yahoo 抽风
+    的那个交易日, 第一版会两次扫描全 skip、看门狗还判成休市跟着闭嘴。
+    **盘面能安全地回答"现在能不能扫", 回答不了"那天本该有没有"。**
+
+    盘面因此只剩一个方向的权力: 日历说"该沉默"而盘面显示当天确实在交易时,
+    否决这次沉默 (日历过期或临时休市判错了)。取不到盘面就不否决。这样盘面
+    故障只可能让告警变多, 永远不会让告警消失。
     """
     d = datetime.strptime(day, "%Y-%m-%d").date()
+    both = ["open", "close"]
     if d.weekday() >= 5:
         return [], "周末 — 本就不该有报告"
-    try:
-        end = last_session_bar(day)
-    except Exception as e:
-        return ["open", "close"], f"盘面查询失败 ({e}) — 按整日算"
-    if end is None:
-        return [], "美股休市 (假日) — 本就不该有报告"
-    if (end.hour, end.minute) < CLOSE_WINDOW[0]:
-        return ["open"], f"半日市 (盘面停在 {end:%H:%M} ET) — 尾盘无盘可扫"
-    return ["open", "close"], f"整日 (盘面到 {end:%H:%M} ET)"
+    if d > NYSE_CALENDAR_THROUGH:
+        return both, f"NYSE 日历只覆盖到 {NYSE_CALENDAR_THROUGH} — 按整日算"
+    if d in NYSE_HOLIDAYS:
+        end = _tape_session_end(day)
+        if end is not None:
+            return both, (f"日历标为休市, 但盘面走到 {end:%H:%M} ET —"
+                          " 日历过期, 按整日算")
+        return [], "NYSE 休市 (假日) — 本就不该有报告"
+    if d in NYSE_HALF_DAYS:
+        end = _tape_session_end(day)
+        if end is not None and (end.hour, end.minute) >= CLOSE_WINDOW[0]:
+            return both, (f"日历标为半日市, 但盘面走到 {end:%H:%M} ET —"
+                          " 日历过期, 按整日算")
+        return ["open"], "NYSE 半日市 (13:00 ET 收盘) — 尾盘无盘可扫"
+    return both, "NYSE 整日交易"
 
 
 # --------------------------------------------------------------------------
