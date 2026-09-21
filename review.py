@@ -187,6 +187,31 @@ def dict_rows(rows):
 
 
 # ---------------------------------------------------------------- 汇总
+def delta_baseline(done: list[dict]) -> dict | None:
+    """卖方作废率 vs delta 隐含的理论作废率 (纯函数) -> dict|None。
+
+    **为什么必须有这条**: put 的 |delta| 近似它到期 ITM 的概率, 所以卖 0.12
+    delta 就"本该"有约 88% 作废。不给基准线, 一个 95% 的作废率会被读成
+    "系统很准", 而它可能只是按定义就该这么高 —— 甚至可能低于应有水平还被
+    当成好消息。要看的是**超出基准多少**, 以及样本够不够撑住那个差。
+
+    一起给 sigma: 二项标准误 sqrt(p(1-p)/n)。mock 实测 n=39 时 se≈5.2pp,
+    +7.1pp 的超额只有 1.4σ —— 看起来很像 edge, 统计上还什么都不是。
+    """
+    dl = [abs(r["delta"]) for r in done if r.get("delta") is not None]
+    if not dl or not done:
+        return None
+    n = len(done)
+    exp_otm = sum(1 - d for d in dl) / len(dl)
+    real = sum(1 for r in done if r.get("status") == "expired_otm") / n
+    se = (exp_otm * (1 - exp_otm) / n) ** 0.5
+    return {"n": n, "avg_delta": sum(dl) / len(dl), "expected_otm": exp_otm,
+            "realized_otm": real, "excess": real - exp_otm, "se": se,
+            "sigma": (real - exp_otm) / se if se > 0 else 0.0,
+            "n_for_half_se": n * 4}
+
+
+
 def summarize(res: list[dict]) -> str:
     L = []
     csp = [r for r in res if r["kind"] == "csp"]
@@ -201,7 +226,10 @@ def summarize(res: list[dict]) -> str:
     for r in res:
         src[r.get("source", "?")] = src.get(r.get("source", "?"), 0) + 1
     L.append(f"来源: " + " / ".join(f"{k} {v}" for k, v in sorted(src.items()))
-             + "   (backfill 缺 zone/stage/现价, 数据质量低于 scan)")
+             + ("   (backfill 缺 zone/stage/现价, 数据质量低于 scan)"
+                if src.get("backfill") else ""))
+    if src.get("mock"):
+        L.append("⚠️ 含 mock 数据 —— 那是为了看报表长什么样造的, 不是业绩估计")
     rt = {}
     for r in res:
         rt[r.get("run_type") or "auto"] = rt.get(r.get("run_type") or "auto", 0) + 1
@@ -227,9 +255,40 @@ def summarize(res: list[dict]) -> str:
                  "行权价压在愿意接货的价值区里, 接货是预期内结果不是失败")
         L.append(f"  持有期内曾跌破行权价: {len(brc)}/{len(done)} = "
                  f"{len(brc) / len(done):.0%}  (曾破位 ≠ 到期被行权)")
+        # —— delta 基准线 ——
+        # 卖 0.12 delta 的 put, 本来就"应该"有约 88% 到期作废: delta 近似
+        # 到期 ITM 概率。不给基准线, 一个 95% 的作废率会被读成"系统很准",
+        # 而它可能只是"按定义就该这么高"。要看的是**超出基准多少**, 以及
+        # 样本量够不够支撑那个差。
+        bl = delta_baseline(done)
+        if bl:
+            L.append(f"  ★ delta 基准: 均 delta {bl['avg_delta']:.3f} → 理论作废率 "
+                     f"{bl['expected_otm']:.0%}; 实际 {bl['realized_otm']:.0%}, "
+                     f"差 {bl['excess']:+.1%}")
+            L.append(f"    n={bl['n']}, 标准误 {bl['se']:.1%} → {abs(bl['sigma']):.1f}σ "
+                     + ("—— 在噪声范围内, **还不能说系统有 edge**"
+                        if abs(bl["sigma"]) < 2 else "—— 超出 2σ, 值得继续观察")
+                     + f"; 要把 ±{bl['se'] * 100:.0f}pp 的误差压到一半"
+                       f"需要约 {bl['n_for_half_se']} 笔")
+            L.append("    (作废率高本身不是本事: delta 越低越容易作废, 代价是"
+                     "权利金越薄。真正要看的是下面按抵押金归一的收益率)")
+        # —— 按抵押金归一 ——
+        # 每股金额跨标的不可加: NVDA 200 的票和 RKLB 50 的票占用的保证金差 4 倍。
+        # CSP 抵押 ≈ 行权价 × 100, 所以 pnl/行权价 才是可比的资金回报率。
+        roc = [(r["pnl_per_share"] / r["strike"]) for r in done
+               if r.get("pnl_per_share") is not None and r.get("strike")]
+        if roc:
+            days = [r.get("dte") or 21 for r in done
+                    if r.get("pnl_per_share") is not None and r.get("strike")]
+            avg_d = sum(days) / len(days)
+            tot = sum(roc)
+            L.append(f"  抵押金回报率 (pnl/行权价, 每笔独立占用): 合计 {tot:+.2%} / "
+                     f"单均 {tot / len(roc):+.3%} / 平均持有 {avg_d:.0f} 天")
+            L.append(f"    单笔年化当量 ~{(tot / len(roc)) * 365 / avg_d:+.1%} "
+                     "(假设资金连续复用且始终有票可卖 —— 实际有空窗, 别当真实年化)")
         if pnl:
             L.append(f"  每股账面合计 {sum(pnl):+.2f} / 单均 {sum(pnl) / len(pnl):+.2f} "
-                     f"(= 权利金 + min(0, 到期收盘 − 行权价), 未计手续费与资金占用)")
+                     "(跨标的每股金额**不可加**, 仅供对账; 归一口径看上面一行)")
     else:
         L.append("  (还没有到期的 CSP —— 胜率要等第一批到期后才有意义)")
     if openc:

@@ -2663,5 +2663,45 @@ class TestReviewBackfill(unittest.TestCase):
         self.assertEqual(review._on_or_before(ser, date(2026, 8, 19)), (None, None))
 
 
+
+class TestDeltaBaseline(unittest.TestCase):
+    """作废率必须对着 delta 隐含的理论值读, 否则高胜率会被误读成 edge。"""
+
+    def _done(self, n_otm, n_assigned, delta=0.12):
+        return ([{"status": "expired_otm", "delta": delta}] * n_otm
+                + [{"status": "assigned", "delta": delta}] * n_assigned)
+
+    def test_realized_equals_expected_is_zero_edge(self):
+        """88 作废 / 12 被行权 @ delta 0.12 = 正好等于理论值, 超额应为 0。"""
+        import review
+        b = review.delta_baseline(self._done(88, 12))
+        self.assertAlmostEqual(b["expected_otm"], 0.88, places=6)
+        self.assertAlmostEqual(b["realized_otm"], 0.88, places=6)
+        self.assertAlmostEqual(b["excess"], 0.0, places=6)
+        self.assertAlmostEqual(b["sigma"], 0.0, places=6)
+
+    def test_high_win_rate_can_still_be_noise(self):
+        """mock 实测形态: 95% 作废看着很强, n=39 时只有 ~1.4σ。"""
+        import review
+        b = review.delta_baseline(self._done(37, 2))
+        self.assertEqual(b["n"], 39)
+        self.assertGreater(b["excess"], 0.05)          # 超额 +7pp
+        self.assertLess(abs(b["sigma"]), 2.0)          # 但不显著
+        self.assertEqual(b["n_for_half_se"], 156)
+
+    def test_low_delta_makes_high_otm_rate_unremarkable(self):
+        """同样 95% 的作废率, 卖 0.05 delta 时反而是**跑输**基准。"""
+        import review
+        b = review.delta_baseline(self._done(37, 2, delta=0.05))
+        self.assertAlmostEqual(b["expected_otm"], 0.95, places=6)
+        self.assertLess(b["excess"], 0.01)
+
+    def test_guards(self):
+        import review
+        self.assertIsNone(review.delta_baseline([]))
+        self.assertIsNone(review.delta_baseline(
+            [{"status": "expired_otm", "delta": None}]))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
