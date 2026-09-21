@@ -298,6 +298,58 @@ zone 建议同时填 `zone_asof = 2026-09-05` (校准日期); 收盘扫描会盯
 (`zone_asof_stale_days` / `zone_drift_*` / `zone_floor_instant_pct` /
 `zone_flag_repeat_days`)。
 
+## 推荐复盘 / 胜率 (`review.py`)
+
+每次**自动**收盘扫描会把当天出的 CSP / LEAP 真票追加进
+`data/recommendations.jsonl`, 供日后复盘。`--force` / `--tickers` 的手工跑
+**不记** —— 与 `state.json` / `iv_history.csv` 同一条纪律: 手工重算是为了看
+一眼, 记进去只会给胜率的分母灌水, 而且只灌在被手工跑过的那些天上。
+
+```bash
+.venv/Scripts/python.exe review.py                    # 结算 + 汇总
+.venv/Scripts/python.exe review.py --backfill         # 从 reports/*-close*.md 反解历史
+.venv/Scripts/python.exe review.py --symbol NVDA,GLD  # 只看某几只
+.venv/Scripts/python.exe review.py --exclude-manual   # 剔掉手工跑的采样偏差
+.venv/Scripts/python.exe review.py --json out.json    # 结算明细另存
+```
+
+**为什么是 JSONL 不是 JSON 数组 / CSV**: 追加写不需要读-改-写整份文件 (中断
+或并发时最坏少一行, 不会写坏历史); 每行独立可解析, 坏一行不影响其余,
+`tail`/`grep`/`jq` 直接可用; 票据带 `notes` 列表, CSV 得拍平 (`iv_history.csv`
+存纯标量, 那里 CSV 合适)。`pd.read_json(path, lines=True)` 一行读进 pandas。
+
+去重键 = `date|symbol|kind|exp|strike`, 所以 DST 双发、看门狗补发、同一天重算
+都不会把一张票记成两笔。
+
+### CSP 和 LEAP 不合成一个胜率
+
+**CSP** 有自然的二元结局 (到期那天要么在行权价上方作废、要么被行权), 到期
+即可结算。**LEAP** 是 450-1100 DTE 的多头仓, 复盘窗口内**没有结局** —— 胜负
+取决于你何时平仓, 那是持仓决策不是推荐决策。把未平仓的 LEAP 按当前浮盈算进
+胜率, 等于拿"还没结束的比赛"的中场比分凑胜场数。所以报告分两块, LEAP 只给
+未实现状态 (当前 ITM 比例 + 正股自推荐日涨跌) 并明确标注不计入胜率。
+
+### CSP 的"胜"有两个口径, 都要看
+
+- **① 作废率**: 到期收盘 > 行权价, 权利金全收。这是机械胜率。
+- **② 越过盈亏平衡率**: 到期收盘 > 行权价 − 权利金。
+
+被行权**不等于**亏 —— 这套剧本的 CSP 行权价本来就压在"愿意接货"的价值区
+里, 接到货是预期内结果。只报 ① 会把"按计划接货"记成失败; 只报 ② 会掩盖接货
+频率。另给"持有期内曾跌破行权价"的比例 (曾破位 ≠ 到期被行权) 和每股账面
+结果 (= 权利金 + min(0, 到期收盘 − 行权价), 未计手续费与资金占用)。
+
+### 回填历史
+
+`--backfill` 从 `reports/*-close*.md` 正文反解票据行。这是**有损**的 —— 报告
+是给人读的不是结构化存档, 拿不到 zone/stage/当时现价, 所以标
+`source="backfill"` 与 `source="scan"` 分开统计, 别把两种数据质量混成一回事。
+`-manual` 报告里的票当时确实推荐过, 收进来但打 `run_type="manual"`, 汇总里
+单列一行提示采样偏差, 可用 `--exclude-manual` 对照。
+
+历史报告在 droplet 上 (本地 `reports/` 只有少数几份)。把它的 `reports/` 同步
+过来再跑一次 `--backfill` 即可, 或者直接在 droplet 上跑。
+
 ## 已知限制
 
 - 尾盘扫描在 15:45 ET 跑, 当日 K 线还差 15 分钟收盘 — 信号口径视为

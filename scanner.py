@@ -64,6 +64,8 @@ REPORTS = BASE / "reports"
 DATA = BASE / "data"
 STATE_FILE = DATA / "state.json"
 IV_HISTORY = DATA / "iv_history.csv"
+# 推荐流水账 (复盘用): 只增不改, 每行一张真票。选 JSONL 的理由见 journal_rows
+JOURNAL = DATA / "recommendations.jsonl"
 CONFIG_FILE = BASE / "watchlist.toml"
 
 RATE = 0.04                      # risk-free for BS delta/IV inversion
@@ -313,6 +315,112 @@ def save_state(state: dict) -> None:
     DATA.mkdir(exist_ok=True)
     STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False),
                           encoding="utf-8")
+
+
+def journal_rows(results, d: str, mode: str, regime: dict) -> list[dict]:
+    """把一次收盘扫描出的 CSP / LEAP 真票摊平成可复盘的记录 (纯函数).
+
+    **为什么用 JSONL 而不是 JSON 数组或 CSV** (data/recommendations.jsonl):
+      - 追加写: 每次扫描只 append 几行, 不需要读-改-写整个文件。中断/并发时
+        最坏是少一行, 不会把整份历史写坏 —— state.json 那种整文件覆盖的写法
+        对"只增不改"的流水账是错的风险取舍。
+      - 每行独立可解析: 一行写坏不影响其余行, 手工 tail/grep/jq 都直接可用。
+      - 嵌套字段: 票据带 notes 列表, CSV 得拍平成字符串 (仓库里 iv_history.csv
+        存的是纯标量, 那里 CSV 合适, 这里不合适)。
+      - pandas 一行读: pd.read_json(path, lines=True)。
+
+    只记**真票** (skip_reason 的不记): 复盘要问的是"系统让我开的仓表现如何",
+    没开的仓没有表现。skip 的理由本来就在当日报告里。
+
+    spot/zone/stage 一起快照: 事后重建"当时的现价和接货带"既贵又容易错, 而且
+    zone 是手工维护、会被重锚的 —— 不快照就永远对不回当时的判断。
+    """
+    rows = []
+    stage = (regime or {}).get("stage")
+    vix = (regime or {}).get("vix")
+    for r in results:
+        if r.get("error") or r.get("tech") is None or r.get("stale_data"):
+            continue
+        spot = r["tech"]["close"]
+        cfg = r.get("cfg") or {}
+        for kind in ("csp", "leap"):
+            t = r.get(kind)
+            if not t or "skip_reason" in t:
+                continue
+            rows.append({
+                "date": d, "mode": mode, "symbol": r["symbol"], "kind": kind,
+                "action": "SELL_PUT" if kind == "csp" else "BUY_CALL",
+                "exp": t.get("exp"), "strike": t.get("strike"),
+                "mid": t.get("mid"), "delta": t.get("delta"), "dte": t.get("dte"),
+                "oi": t.get("oi"), "spread_pct": t.get("spread_pct"),
+                "iv": t.get("iv"), "src": t.get("src"),
+                "spot_at_rec": spot,
+                "annualized_pct": t.get("annualized_pct"),
+                "cushion_pct": t.get("cushion_pct"),
+                "breakeven": t.get("breakeven"),
+                "panic_mode": t.get("panic_mode"),
+                "zone": cfg.get("value_zone"), "zone_asof": cfg.get("zone_asof"),
+                "high_beta": cfg.get("high_beta"),
+                "ticker_state": r.get("state"), "stage": stage, "vix": vix,
+                "earnings": r.get("earnings"), "iv30": r.get("iv30"),
+                "notes": t.get("notes") or [],
+                "source": "scan",
+            })
+    return rows
+
+
+def journal_key(row: dict) -> str:
+    """去重键: 同一天同一标的同一腿同一合约只记一次。
+
+    重跑 (DST 双发、看门狗补发、手工重算同一天) 不该把同一张票记成两笔 ——
+    胜率的分母会被悄悄灌水, 而且只在**重跑过的那些天**灌水, 等于给历史加了
+    一个与行情无关的偏差。
+    """
+    return "|".join(str(row.get(k)) for k in
+                    ("date", "symbol", "kind", "exp", "strike"))
+
+
+def append_journal(rows: list[dict], path=None) -> int:
+    """追加去重后的记录 -> 实际写入行数。已存在的键静默跳过。"""
+    if not rows:
+        return 0
+    path = path or JOURNAL
+    path.parent.mkdir(exist_ok=True)
+    seen = set()
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                seen.add(journal_key(json.loads(line)))
+            except json.JSONDecodeError:
+                # 坏行不阻断写入 —— JSONL 选型的理由之一就是一行坏不影响其余
+                continue
+    fresh = [r for r in rows if journal_key(r) not in seen]
+    if not fresh:
+        return 0
+    with path.open("a", encoding="utf-8") as f:
+        for r in fresh:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    return len(fresh)
+
+
+def load_journal(path=None) -> list[dict]:
+    """读回流水账, 坏行跳过 (不抛)。"""
+    path = path or JOURNAL
+    if not path.exists():
+        return []
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
 
 
 def next_persisted_state(prev: dict, r: dict, today: str) -> dict:
@@ -3311,6 +3419,12 @@ def main() -> int:
                 state[r["symbol"]] = next_persisted_state(prev, r, d)
                 r["state_since"] = state[r["symbol"]]["since"]
             save_state(state)
+            # 推荐流水账与 iv_history/state 共用同一个 manual 闸: --force /
+            # --tickers 的手工重算是为了看一眼, 不是真发生的推荐, 记进去会给
+            # 胜率的分母灌水 (且只灌在被手工跑过的那些天上)
+            _n = append_journal(journal_rows(results, d, mode, regime))
+            if _n:
+                print(f"  journal: +{_n} 条推荐记录 -> {JOURNAL.name}")
         report = render_close(results, regime, ivdf, now_et)
     else:
         report = render_open(results, regime, now_et, settings)

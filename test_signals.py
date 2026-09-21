@@ -2525,5 +2525,143 @@ class TestWatchdogExpectation(unittest.TestCase):
                 sc.last_session_bar("2026-09-04")
 
 
+
+class TestRecommendationJournal(unittest.TestCase):
+    """推荐流水账 (复盘用): 摊平 / 去重 / 回写。"""
+
+    def _res(self, **over):
+        r = {"symbol": "NVDA", "error": None, "state": "WATCH",
+             "tech": {"close": 200.0}, "earnings": "2026-11-19", "iv30": 0.45,
+             "cfg": {"value_zone": [185.0, 205.0], "zone_asof": "2026-09-05",
+                     "high_beta": True},
+             "csp": {"exp": "2026-10-16", "strike": 190.0, "mid": 2.4,
+                     "delta": 0.12, "dte": 25, "oi": 900, "spread_pct": 3.0,
+                     "iv": 0.44, "src": "mid", "annualized_pct": 18.4,
+                     "cushion_pct": 5.0, "breakeven": 187.6,
+                     "panic_mode": False, "notes": ["n1"]},
+             "leap": {"exp": "2028-01-21", "strike": 170.0, "mid": 79.55,
+                      "delta": 0.80, "oi": 3567, "iv": 0.52, "notes": []}}
+        r.update(over)
+        return r
+
+    def test_flattens_both_legs(self):
+        rows = sc.journal_rows([self._res()], "2026-09-21", "close",
+                               {"stage": "NORMAL", "vix": 14.3})
+        self.assertEqual([x["kind"] for x in rows], ["csp", "leap"])
+        c = rows[0]
+        self.assertEqual((c["symbol"], c["action"], c["strike"]),
+                         ("NVDA", "SELL_PUT", 190.0))
+        # 快照当时的现价与接货带 —— 事后 zone 会被重锚, 不存就对不回去了
+        self.assertEqual(c["spot_at_rec"], 200.0)
+        self.assertEqual(c["zone"], [185.0, 205.0])
+        self.assertEqual((c["stage"], c["vix"]), ("NORMAL", 14.3))
+
+    def test_skips_non_tickets(self):
+        """skip_reason 的不是推荐, 没开的仓没有表现。"""
+        r = self._res(csp={"skip_reason": "权利金太薄"}, leap=None)
+        self.assertEqual(sc.journal_rows([r], "2026-09-21", "close", {}), [])
+
+    def test_skips_error_and_stale(self):
+        for over in ({"error": "boom"}, {"tech": None}, {"stale_data": True}):
+            self.assertEqual(
+                sc.journal_rows([self._res(**over)], "2026-09-21", "close", {}),
+                [], over)
+
+    def test_dedup_key_same_contract_same_day(self):
+        a = {"date": "2026-09-21", "symbol": "NVDA", "kind": "csp",
+             "exp": "2026-10-16", "strike": 190.0}
+        b = dict(a, mid=9.9)                       # 报价变了仍是同一张票
+        self.assertEqual(sc.journal_key(a), sc.journal_key(b))
+        self.assertNotEqual(sc.journal_key(a), sc.journal_key(dict(a, strike=185.0)))
+        self.assertNotEqual(sc.journal_key(a), sc.journal_key(dict(a, kind="leap")))
+
+    def test_append_is_idempotent(self):
+        """DST 双发 / 看门狗补发重跑同一天, 分母不该被灌水。"""
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "j.jsonl"
+            rows = sc.journal_rows([self._res()], "2026-09-21", "close", {})
+            self.assertEqual(sc.append_journal(rows, f), 2)
+            self.assertEqual(sc.append_journal(rows, f), 0)
+            self.assertEqual(len(sc.load_journal(f)), 2)
+
+    def test_bad_line_does_not_block_append_or_load(self):
+        """JSONL 选型的理由: 一行坏不影响其余行。"""
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "j.jsonl"
+            f.write_text("\n".join(['{"date":"x"}', "NOT JSON", "", ""]),
+                         encoding="utf-8")
+            self.assertEqual(len(sc.load_journal(f)), 1)
+            rows = sc.journal_rows([self._res()], "2026-09-21", "close", {})
+            self.assertEqual(sc.append_journal(rows, f), 2)
+            self.assertEqual(len(sc.load_journal(f)), 3)
+
+    def test_append_empty_is_noop(self):
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "j.jsonl"
+            self.assertEqual(sc.append_journal([], f), 0)
+            self.assertFalse(f.exists())
+            self.assertEqual(sc.load_journal(f), [])
+
+
+class TestReviewBackfill(unittest.TestCase):
+    """从历史 .md 报告反解推荐 —— 有损但能把 droplet 上的历史捞回来。"""
+
+    REPORT = """# 左右侧 watchlist 扫描 — 2026-08-09 尾盘
+
+- **CSP (常规)**: SELL NVDA 2026-09-18 185P @ ~2.35 — delta 0.12, 26DTE, 年化 ~18%, 缓冲 7.5%, BE 182.65, OI 1200, 价差 2%
+- **LEAP**: BUY NVDA 2028-01-21 170C @ ~79.55 — delta 0.80, 外在 32%, λ 2.3x, BE 249.55 (+11.4%), 保险费率 ~7.9%/年, 合约 IV 52%, OI 3567, 价差 2.3%
+- **CSP (恐慌档)**: SELL GLD 2026-08-21 300P @ ~1.10 — delta 0.09, 12DTE, 年化 ~11%, 缓冲 9.0%, BE 298.90, OI 400
+"""
+
+    def _dir(self, td, name="2026-08-09-close.md"):
+        import review
+        (Path(td) / name).write_text(self.REPORT, encoding="utf-8")
+        return review.backfill_rows(Path(td))
+
+    def test_parses_csp_and_leap(self):
+        with tempfile.TemporaryDirectory() as td:
+            rows = self._dir(td)
+        self.assertEqual(len(rows), 3)
+        csp = [r for r in rows if r["kind"] == "csp"]
+        leap = [r for r in rows if r["kind"] == "leap"][0]
+        self.assertEqual({r["symbol"] for r in csp}, {"NVDA", "GLD"})
+        self.assertEqual((leap["strike"], leap["mid"], leap["delta"]),
+                         (170.0, 79.55, 0.80))
+        self.assertEqual((leap["oi"], leap["iv"]), (3567, 0.52))
+        n = [r for r in csp if r["symbol"] == "NVDA"][0]
+        self.assertEqual((n["strike"], n["dte"], n["breakeven"]), (185.0, 26, 182.65))
+        self.assertFalse(n["panic_mode"])
+        self.assertTrue([r for r in csp if r["symbol"] == "GLD"][0]["panic_mode"])
+
+    def test_backfill_is_marked_lossy(self):
+        """回填缺 zone/stage/现价 —— 必须可与 scan 分开, 别混成同一种数据。"""
+        with tempfile.TemporaryDirectory() as td:
+            rows = self._dir(td)
+        for r in rows:
+            self.assertEqual(r["source"], "backfill")
+            self.assertIsNone(r["spot_at_rec"])
+
+    def test_manual_reports_tagged_not_dropped(self):
+        """手工跑的票当时真推荐过, 收进来但打标签 —— 采样偏差要可分离。"""
+        with tempfile.TemporaryDirectory() as td:
+            auto = self._dir(td, "2026-08-09-close.md")
+        with tempfile.TemporaryDirectory() as td:
+            man = self._dir(td, "2026-08-09-close-manual.md")
+        self.assertEqual({r["run_type"] for r in auto}, {"auto"})
+        self.assertEqual({r["run_type"] for r in man}, {"manual"})
+
+    def test_open_reports_ignored(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(self._dir(td, "2026-08-09-open.md"), [])
+
+    def test_settle_falls_back_to_prior_session(self):
+        """到期日逢假/半日市取之前最近一个交易日。"""
+        import review
+        ser = pd.Series([10.0, 11.0], index=[date(2026, 8, 20), date(2026, 8, 21)])
+        self.assertEqual(review._on_or_before(ser, date(2026, 8, 22)),
+                         (date(2026, 8, 21), 11.0))
+        self.assertEqual(review._on_or_before(ser, date(2026, 8, 19)), (None, None))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
