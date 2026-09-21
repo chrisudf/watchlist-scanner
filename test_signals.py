@@ -2703,5 +2703,55 @@ class TestDeltaBaseline(unittest.TestCase):
             [{"status": "expired_otm", "delta": None}]))
 
 
+
+class TestMockDemo(unittest.TestCase):
+    """mock 数据的免责声明必须跟着**数据**走, 不跟着命令走。"""
+
+    def test_caveats_print_whenever_mock_rows_present(self):
+        """报表会被截图、复制、隔几周再翻出来 —— 那时命令行上下文早没了。"""
+        import review
+        res = [{"kind": "csp", "symbol": "X", "status": "open",
+                "source": "mock", "strike": 10.0}]
+        out = review.summarize(res)
+        for line in review.MOCK_CAVEATS:
+            self.assertIn(line, out)
+
+    def test_caveats_absent_for_real_data(self):
+        import review
+        res = [{"kind": "csp", "symbol": "X", "status": "open",
+                "source": "scan", "strike": 10.0}]
+        self.assertNotIn(review.MOCK_CAVEATS[0], review.summarize(res))
+
+    def test_caveats_survive_one_mock_row_among_real(self):
+        """混进一行 mock 就得整块出声 —— 宁可吵, 不可静默混算。"""
+        import review
+        res = [{"kind": "csp", "symbol": "A", "status": "open",
+                "source": "scan", "strike": 10.0},
+               {"kind": "csp", "symbol": "B", "status": "open",
+                "source": "mock", "strike": 10.0}]
+        self.assertIn(review.MOCK_CAVEATS[0], review.summarize(res))
+
+    def test_caveats_name_the_worst_bias_first(self):
+        """前视偏差是这份 mock 最严重的问题, 不能埋在第四条。"""
+        import review
+        self.assertIn("前视偏差", review.MOCK_CAVEATS[1])
+        self.assertIn("最严重", review.MOCK_CAVEATS[1])
+
+    def test_strike_rounding_steps(self):
+        import review
+        self.assertEqual(review._round_strike(47.3), 47.0)
+        self.assertEqual(review._round_strike(123.4), 122.5)
+        self.assertEqual(review._round_strike(647.0), 645.0)
+
+    def test_strike_for_delta_uses_production_bs(self):
+        """反解出的行权价代回 scanner.bs_delta 必须落在目标 delta 上。"""
+        import review
+        for target in (0.10, 0.12, 0.30):
+            k = review._strike_for_delta(200.0, 0.45, 21 / 365, target, sc.RATE)
+            got = abs(sc.bs_delta(200.0, k, 21 / 365, sc.RATE, 0.45, False))
+            self.assertAlmostEqual(got, target, places=3)
+            self.assertLess(k, 200.0)      # OTM put
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

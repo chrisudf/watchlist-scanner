@@ -311,7 +311,18 @@ zone 建议同时填 `zone_asof = 2026-09-05` (校准日期); 收盘扫描会盯
 .venv/Scripts/python.exe review.py --symbol NVDA,GLD  # 只看某几只
 .venv/Scripts/python.exe review.py --exclude-manual   # 剔掉手工跑的采样偏差
 .venv/Scripts/python.exe review.py --json out.json    # 结算明细另存
+.venv/Scripts/python.exe review.py --demo             # 造 mock 数据看报表长什么样
 ```
+
+`--demo` 用**真实日线** + scanner 自己的 `bs_delta`/`bs_price` 造一份合成流水账
+(写 `data/demo_journal.jsonl`, **不碰**真实账本; 显式 `--journal` 指向真账本会被
+拒绝并 exit 2)。它解决的是"还没有数据时看不到报表长什么样"。
+
+**免责声明跟着数据走, 不跟着命令走**: 任何一行 `source="mock"` 都会让
+`summarize()` 无条件在报表顶部打印整块 `MOCK_CAVEATS`。理由很实际 —— 报表会被
+截图、复制、隔几周再翻出来, 那时"这是 --demo 跑的"这个上下文早没了, 只剩一个
+95% 的作废率。四条警告 (前视偏差 / IV 用 RV 代理 / 无盘口 / 固定周期入场) 必须
+和数字绑在一起。
 
 **为什么是 JSONL 不是 JSON 数组 / CSV**: 追加写不需要读-改-写整份文件 (中断
 或并发时最坏少一行, 不会写坏历史); 每行独立可解析, 坏一行不影响其余,

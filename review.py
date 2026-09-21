@@ -6,6 +6,7 @@
   .venv/Scripts/python.exe review.py --backfill      # 从 reports/*.md 补历史
   .venv/Scripts/python.exe review.py --symbol NVDA   # 只看某标的
   .venv/Scripts/python.exe review.py --json out.json # 结算结果另存
+  .venv/Scripts/python.exe review.py --demo          # 造 mock 数据看报表长什么样
 
 —— CSP 和 LEAP 不能合成一个胜率 ——
 CSP 有自然的二元结局 (到期日那天要么在行权价上方作废、要么被行权), 到期即可
@@ -24,7 +25,7 @@ import argparse
 import json
 import re
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -33,6 +34,21 @@ import yfinance as yf
 import scanner as sc
 
 BASE = Path(__file__).resolve().parent
+DEMO_JOURNAL = sc.DATA / "demo_journal.jsonl"
+
+# mock 数据的免责声明。**跟着数据走, 不跟着命令走** —— summarize() 只要在行里
+# 看见 source="mock" 就无条件打印这一整块。理由: 报表会被截图、复制、隔几周
+# 再翻出来看, 那时"这是 --demo 跑的"这个上下文早没了, 只剩下一个 95% 的作废率。
+# 警告必须和数字绑在一起, 分不开。
+MOCK_CAVEATS = [
+    "⚠️  以下含 MOCK 数据 —— 这不是策略业绩, 是为了看报表长什么样造的。四处与真实系统不同:",
+    "   ① 前视偏差 (最严重): value_zone 是 2026-09 手工定的, 拿它筛更早的入场 = 用未来信息挑历史仓位。",
+    "   ② IV 用滚动已实现波动率代理: 真 IV 通常高于 RV (方差风险溢价) → 权利金被低估;",
+    "      同一 delta 下行权价也被摆得更近 → 被行权率被高估。两个方向都偏。",
+    "   ③ 无盘口: 没有 bid/ask/OI, 不过流动性门。",
+    "   ④ 入场是固定周期, 不是真的状态机 / regime 闸 / 财报排除。",
+    "   另: 卖 put 在任何非崩盘期都会显示高作废率 —— 务必对着下面的 delta 基准线读, 别看绝对值。",
+]
 
 
 # ---------------------------------------------------------------- 回填
@@ -186,6 +202,128 @@ def dict_rows(rows):
         yield dict(r)
 
 
+# ---------------------------------------------------------------- demo
+def _round_strike(k: float) -> float:
+    """按标的价位取常见行权价档距 (纯函数)。"""
+    step = 1.0 if k < 50 else (2.5 if k < 200 else 5.0)
+    return round(k / step) * step
+
+
+def _strike_for_delta(spot, sigma, T, target, rate):
+    """二分找 |delta|≈target 的 put 行权价。
+
+    用 scanner 自己的 bs_delta, 不重写 —— 平行实现会漏掉所有你不知道自己
+    依赖的东西 (这个教训在 sec-filing-downloader 上刚吃过一次)。
+    """
+    lo, hi = spot * 0.30, spot * 0.999
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        if abs(sc.bs_delta(spot, mid, T, rate, sigma, False)) > target:
+            hi = mid
+        else:
+            lo = mid
+    return (lo + hi) / 2
+
+
+def generate_demo(out_path: Path, start="2025-06-01", end="2026-09-18",
+                  every_days=21, seed=7) -> list[dict]:
+    """造一份 MOCK 流水账 —— 只为了看统计报表长什么样, 不是业绩估计。
+
+    用**真实日线** + scanner 自己的 bs_delta/bs_price 选行权价与定价, 所以
+    结算结果是真实市场走出来的; 但入场规则只是对扫描器逻辑的粗略近似, 且带
+    前视偏差 (见 MOCK_CAVEATS)。每行打 source="mock", summarize() 见到就会
+    无条件把整块免责声明打在报表顶部。
+
+    **不写进真实流水账**: 调用方必须给一个不同于 sc.JOURNAL 的路径, main()
+    里有硬拦。mock 行一旦混进 data/recommendations.jsonl, 以后每份复盘都得
+    先分辨哪些是真的 —— 而 source 字段是唯一的区分手段, 太脆。
+    """
+    import math
+    import numpy as np
+    S, TICK = sc.load_config()
+    uni = {k: v for k, v in TICK.items() if v["value_zone"] and v["options"]}
+    px = yf.download(sorted(uni), start=start, end="2026-09-20", progress=False,
+                     auto_adjust=False, group_by="ticker", threads=True)
+    d_start, d_end = date.fromisoformat(start), date.fromisoformat(end)
+    rows = []
+    for sym, cfg in uni.items():
+        try:
+            c = px[sym]["Close"].dropna()
+            c.index = [i.date() for i in c.index]
+        except (KeyError, TypeError):
+            continue
+        zlo, zhi = cfg["value_zone"]
+        idx = [d for d in c.index if d_start <= d <= d_end]
+        ret = np.log(c / c.shift(1))
+        for i in range(0, len(idx), every_days):
+            d0 = idx[i]
+            spot = float(c[d0])
+            # 近似真扫描器的 zone 闸: 带内或带上沿 near_zone_pct 以内才出 CSP
+            if spot > zhi * (1 + S["near_zone_pct"] / 100):
+                continue
+            win = ret[[x for x in ret.index if x <= d0]][-60:]
+            if len(win) < 30:
+                continue
+            sigma = float(win.std() * math.sqrt(252))
+            if not (0.05 < sigma < 3):
+                continue
+            dte = 21
+            T = dte / 365
+            k = _round_strike(_strike_for_delta(
+                spot, sigma, T, S["csp_delta_target"], sc.RATE))
+            if k > zhi:                       # 行权价 <= 接货带上沿 (硬约束)
+                k = _round_strike(min(k, zhi))
+            if k <= 0:
+                continue
+            mid = round(sc.bs_price(spot, k, T, sc.RATE, sigma, False), 2)
+            ann = sc.csp_annualized(mid, k, dte)
+            # 与真扫描器同一道薄权利金闸
+            if mid < S["csp_min_mid"] or ann < S["csp_min_annualized"]:
+                continue
+            rows.append({
+                "date": d0.isoformat(), "mode": "close", "symbol": sym,
+                "kind": "csp", "action": "SELL_PUT",
+                "exp": (d0 + timedelta(days=dte)).isoformat(),
+                "strike": float(k), "mid": mid,
+                "delta": round(abs(sc.bs_delta(spot, k, T, sc.RATE, sigma, False)), 3),
+                "dte": dte, "iv": round(sigma, 4), "spot_at_rec": round(spot, 2),
+                "annualized_pct": round(ann, 1),
+                "cushion_pct": round((spot - k) / spot * 100, 2),
+                "breakeven": round(k - mid, 2), "panic_mode": False,
+                "zone": [zlo, zhi], "zone_asof": cfg["zone_asof"],
+                "high_beta": cfg["high_beta"], "ticker_state": "MOCK",
+                "stage": "NORMAL", "source": "mock", "run_type": "auto",
+                "notes": []})
+        for i in range(0, len(idx), every_days * 6):        # LEAP 稀疏得多
+            d0 = idx[i]
+            spot = float(c[d0])
+            win = ret[[x for x in ret.index if x <= d0]][-120:]
+            if len(win) < 60:
+                continue
+            sigma = float(win.std() * math.sqrt(252))
+            if not (0.05 < sigma < 3):
+                continue
+            T = 500 / 365
+            k = _round_strike(_strike_for_delta(spot, sigma, T, 0.80, sc.RATE))
+            rows.append({
+                "date": d0.isoformat(), "mode": "close", "symbol": sym,
+                "kind": "leap", "action": "BUY_CALL",
+                "exp": (d0 + timedelta(days=500)).isoformat(),
+                "strike": float(k),
+                "mid": round(sc.bs_price(spot, k, T, sc.RATE, sigma, False)
+                             + spot - k, 2),
+                "delta": 0.80, "iv": round(sigma, 4),
+                "spot_at_rec": round(spot, 2), "zone": [zlo, zhi],
+                "high_beta": cfg["high_beta"], "ticker_state": "MOCK",
+                "stage": "NORMAL", "source": "mock", "run_type": "auto",
+                "notes": []})
+    out_path.parent.mkdir(exist_ok=True)
+    out_path.write_text(
+        "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows),
+        encoding="utf-8")
+    return rows
+
+
 # ---------------------------------------------------------------- 汇总
 def delta_baseline(done: list[dict]) -> dict | None:
     """卖方作废率 vs delta 隐含的理论作废率 (纯函数) -> dict|None。
@@ -220,6 +358,9 @@ def summarize(res: list[dict]) -> str:
     openc = [r for r in csp if r["status"] == "open"]
     bad = [r for r in csp if r["status"] == "unresolved_no_price"]
 
+    if any(r.get("source") == "mock" for r in res):
+        L.append("=" * 68)
+        L += MOCK_CAVEATS
     L.append("=" * 68)
     L.append(f"推荐复盘  共 {len(res)} 条 (CSP {len(csp)} / LEAP {len(leap)})")
     src = {}
@@ -228,8 +369,7 @@ def summarize(res: list[dict]) -> str:
     L.append(f"来源: " + " / ".join(f"{k} {v}" for k, v in sorted(src.items()))
              + ("   (backfill 缺 zone/stage/现价, 数据质量低于 scan)"
                 if src.get("backfill") else ""))
-    if src.get("mock"):
-        L.append("⚠️ 含 mock 数据 —— 那是为了看报表长什么样造的, 不是业绩估计")
+
     rt = {}
     for r in res:
         rt[r.get("run_type") or "auto"] = rt.get(r.get("run_type") or "auto", 0) + 1
@@ -334,8 +474,27 @@ def main() -> int:
     ap.add_argument("--exclude-manual", action="store_true",
                     help="只看自动跑的推荐 (剔除 --force/--tickers 手工跑的采样偏差)")
     ap.add_argument("--json", dest="json_out", help="结算明细另存为 JSON")
+    ap.add_argument("--demo", action="store_true",
+                    help="造 MOCK 数据看报表长什么样 (写 data/demo_journal.jsonl, "
+                         "**不碰**真实流水账; 报表顶部会打死免责声明)")
     a = ap.parse_args()
     path = Path(a.journal) if a.journal else sc.JOURNAL
+
+    if a.demo:
+        # 硬拦: mock 行一旦混进真实流水账, source 字段就是唯一的区分手段 —— 太脆。
+        # 没给 --journal 就落到 demo 专用文件; 显式指向真账本则直接拒绝。
+        if a.journal is None:
+            path = DEMO_JOURNAL
+        elif path.resolve() == sc.JOURNAL.resolve():
+            print(f"拒绝: --demo 不能写进真实流水账 {sc.JOURNAL}"
+                  f"\n  (要看 mock 就用默认路径 {DEMO_JOURNAL.name}, "
+                  "或 --journal 指到别处)")
+            return 2
+        rows = generate_demo(path)
+        print(f"MOCK: 生成 {len(rows)} 条 "
+              f"(CSP {sum(1 for r in rows if r['kind'] == 'csp')} / "
+              f"LEAP {sum(1 for r in rows if r['kind'] == 'leap')}) -> {path}")
+        print("  这份数据不是业绩估计 —— 报表顶部有完整免责声明\n")
 
     if a.backfill:
         rd = Path(a.reports)
