@@ -25,6 +25,7 @@ import argparse
 import json
 import re
 import sys
+import unicodedata
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -325,6 +326,69 @@ def generate_demo(out_path: Path, start="2025-06-01", end="2026-09-18",
 
 
 # ---------------------------------------------------------------- 汇总
+def _dw(t: str) -> int:
+    """显示宽度: CJK 全角算 2 —— 中文表头与 ASCII 数据混排时用 len() 会错位。"""
+    return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in str(t))
+
+
+def _pad(t, w: int, right=False) -> str:
+    """按显示宽度补空格。"""
+    t = str(t)
+    gap = " " * max(0, w - _dw(t))
+    return (gap + t) if right else (t + gap)
+
+
+def leap_table(leap: list[dict]) -> list[str]:
+    """LEAP 逐笔明细 (纯函数) -> 报表行。
+
+    只给"当前 ITM 17/30"这类聚合数读不出任何可操作信息 —— 是哪几张、什么时候
+    进的、离到期还有多久, 全看不见。LEAP 是要长期持有并择机 roll 的仓位, 明细
+    才是这一段的用处。
+
+    **ITM 不等于赚钱**: 多头 call 的盈亏平衡是 行权价 + 权利金, 不是行权价。
+    深度 ITM 的 LEAP 权利金本来就厚 (实测 mock 里 NVDA 150C 付了 45+),
+    现价越过行权价只说明有内在价值, 越过盈亏平衡才是真的不亏。所以两列都给,
+    并且汇总里两个计数并排 —— 只报 ITM 会系统性高估这条腿的表现。
+
+    入手时现价取自 spot_at_rec: scan/mock 行有, 回填行没有 (报告正文里没写),
+    那几行显示 "—" 而不是留空或补 0。
+    """
+    if not leap:
+        return []
+    hdr = [("标的", 6, False), ("入手", 11, False), ("到期", 11, False),
+           ("行权价", 8, True), ("入手价", 8, True), ("权利金", 8, True),
+           ("盈亏平衡", 9, True), ("最新价", 8, True), ("正股涨跌", 9, True),
+           ("状态", 12, False), ("剩余", 7, True)]
+    # 列间留一格: 右对齐的数字列与紧随其后的列会贴死 (实测 "+18.7%✓ 越过平衡")
+    out = ["  " + " ".join(_pad(h, w, r) for h, w, r in hdr)]
+    out.append("  " + "-" * (sum(w for _, w, _ in hdr) + len(hdr) - 1))
+    for r in sorted(leap, key=lambda x: (x["symbol"], x["date"])):
+        k, mid, last = r.get("strike"), r.get("mid"), r.get("last_px")
+        be = (k + mid) if (k is not None and mid is not None) else None
+        sp = r.get("spot_at_rec")
+        ret = r.get("underlying_ret")
+        if last is None:
+            st = "无价格"
+        elif be is not None and last > be:
+            st = "✓ 越过平衡"
+        elif r.get("itm_now"):
+            st = "ITM 未回本"
+        else:
+            st = "✗ OTM"
+        cells = [r["symbol"], r["date"], r.get("exp") or "—",
+                 f"{k:g}" if k is not None else "—",
+                 f"{sp:.2f}" if sp is not None else "—",
+                 f"{mid:.2f}" if mid is not None else "—",
+                 f"{be:.2f}" if be is not None else "—",
+                 f"{last:.2f}" if last is not None else "—",
+                 f"{ret:+.1%}" if ret is not None else "—",
+                 st,
+                 f"{r['dte_left']}天" if r.get("dte_left") is not None else "—"]
+        out.append("  " + " ".join(_pad(c, w, rt)
+                                   for c, (_, w, rt) in zip(cells, hdr)))
+    return out
+
+
 def delta_baseline(done: list[dict]) -> dict | None:
     """卖方作废率 vs delta 隐含的理论作废率 (纯函数) -> dict|None。
 
@@ -441,14 +505,25 @@ def summarize(res: list[dict]) -> str:
     L.append("  你何时平仓, 那是持仓决策不是推荐决策。这里只给未实现状态。")
     if leap:
         itm = [r for r in leap if r.get("itm_now")]
+        # 多头 call 的盈亏平衡是 行权价 + 权利金。只报 ITM 会系统性高估这条腿:
+        # 深 ITM 的 LEAP 权利金本来就厚, 有内在价值 != 回本
+        be_ok = [r for r in leap
+                 if r.get("last_px") is not None and r.get("strike") is not None
+                 and r.get("mid") is not None
+                 and r["last_px"] > r["strike"] + r["mid"]]
         rets = [r["underlying_ret"] for r in leap if r.get("underlying_ret") is not None]
-        L.append(f"  当前 ITM: {len(itm)}/{len(leap)}")
+        L.append(f"  当前 ITM: {len(itm)}/{len(leap)}   "
+                 f"越过盈亏平衡 (行权价+权利金): {len(be_ok)}/{len(leap)}")
+        L.append("    —— ITM 只说明有内在价值; 越过盈亏平衡才是真的不亏。"
+                 "两个数差得远说明权利金付贵了")
         if rets:
             L.append(f"  正股自推荐日涨跌: 中位 {pd.Series(rets).median():+.1%} / "
                      f"均值 {sum(rets) / len(rets):+.1%} / "
                      f"上涨 {sum(1 for x in rets if x > 0)}/{len(rets)}")
         else:
             L.append("  (无法算正股涨跌 —— 回填记录没有推荐日现价)")
+        L.append("")
+        L += leap_table(leap)
 
     by = {}
     for r in done:

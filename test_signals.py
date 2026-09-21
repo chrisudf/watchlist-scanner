@@ -2753,5 +2753,74 @@ class TestMockDemo(unittest.TestCase):
             self.assertLess(k, 200.0)      # OTM put
 
 
+
+class TestLeapTable(unittest.TestCase):
+    """LEAP 逐笔明细: 聚合数读不出可操作信息, 明细才是这段的用处。"""
+
+    def _row(self, **o):
+        r = {"symbol": "NVDA", "date": "2025-12-01", "exp": "2027-04-15",
+             "kind": "leap", "strike": 180.0, "mid": 21.92, "spot_at_rec": 179.92,
+             "last_px": 222.27, "underlying_ret": 0.2354, "itm_now": True,
+             "dte_left": 206, "source": "scan"}
+        r.update(o)
+        return r
+
+    def test_lists_the_fields_asked_for(self):
+        import review
+        out = chr(10).join(review.leap_table([self._row()]))
+        for want in ("NVDA", "2025-12-01", "2027-04-15", "180", "179.92"):
+            self.assertIn(want, out)
+
+    def test_breakeven_is_strike_plus_premium(self):
+        """多头 call 的盈亏平衡 = 行权价 + 权利金, 不是行权价。"""
+        import review
+        out = chr(10).join(review.leap_table([self._row()]))
+        self.assertIn("201.92", out)                      # 180 + 21.92
+
+    def test_itm_but_not_recovered_is_its_own_state(self):
+        """ITM 不等于赚钱 —— 深 ITM 的 LEAP 权利金厚, 有内在价值 != 回本。"""
+        import review
+        r = self._row(strike=235.0, mid=27.04, last_px=253.71, itm_now=True)
+        out = chr(10).join(review.leap_table([r]))
+        self.assertIn("ITM 未回本", out)
+        self.assertNotIn("✓ 越过平衡", out)
+
+    def test_above_breakeven_marked(self):
+        import review
+        out = chr(10).join(review.leap_table([self._row()]))
+        self.assertIn("✓ 越过平衡", out)
+
+    def test_missing_spot_shows_dash_not_zero(self):
+        """回填行没有推荐日现价 —— 显示 — 而不是补 0 或留空。"""
+        import review
+        out = chr(10).join(review.leap_table(
+            [self._row(spot_at_rec=None, underlying_ret=None)]))
+        self.assertIn("—", out)
+        self.assertNotIn("0.00", out)
+
+    def test_sorted_by_symbol_then_date(self):
+        import review
+        rows = [self._row(symbol="TSLA", date="2026-01-01"),
+                self._row(symbol="AAPL", date="2026-06-01"),
+                self._row(symbol="AAPL", date="2025-12-01")]
+        body = review.leap_table(rows)[2:]
+        self.assertEqual([l.split()[0] for l in body], ["AAPL", "AAPL", "TSLA"])
+        self.assertEqual(body[0].split()[1], "2025-12-01")
+
+    def test_empty_is_empty(self):
+        import review
+        self.assertEqual(review.leap_table([]), [])
+
+    def test_columns_do_not_collide(self):
+        """中文表头 + ASCII 数据混排要按显示宽度补齐, 否则数字列会贴死。"""
+        import review
+        rows = review.leap_table([self._row()])
+        self.assertEqual(review._dw("正股涨跌"), 8)       # CJK 全角算 2
+        self.assertEqual(review._dw("NVDA"), 4)
+        # 表头与数据行显示宽度一致 = 列没错位
+        self.assertEqual(review._dw(rows[0]), review._dw(rows[2]))
+        self.assertNotIn("%✓", rows[2])                   # 修掉的那个贴死形态
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
