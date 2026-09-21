@@ -7,6 +7,7 @@
   .venv/Scripts/python.exe review.py --symbol NVDA   # 只看某标的
   .venv/Scripts/python.exe review.py --json out.json # 结算结果另存
   .venv/Scripts/python.exe review.py --demo          # 造 mock 数据看报表长什么样
+  .venv/Scripts/python.exe review.py --md out.md     # 输出 markdown (可邮寄/手机读)
 
 —— CSP 和 LEAP 不能合成一个胜率 ——
 CSP 有自然的二元结局 (到期日那天要么在行权价上方作废、要么被行权), 到期即可
@@ -414,129 +415,281 @@ def delta_baseline(done: list[dict]) -> dict | None:
 
 
 
-def summarize(res: list[dict]) -> str:
-    L = []
+def compute_stats(res: list[dict]) -> dict:
+    """所有口径**只在这里算一次** -> dict。文本与 markdown 两个渲染器共用。
+
+    让两个渲染器各自算一遍 = 必然漂移: 改了一处忘另一处, 两份报表给出不同的
+    胜率, 而且没人会同时看两份所以不会被发现。仓库 lesson 里记过同型问题
+    (同源文案会同步扩散错误)。这里把"算"和"排版"彻底分开。
+    """
     csp = [r for r in res if r["kind"] == "csp"]
     leap = [r for r in res if r["kind"] == "leap"]
     done = [r for r in csp if r["status"] in ("expired_otm", "assigned")]
     openc = [r for r in csp if r["status"] == "open"]
     bad = [r for r in csp if r["status"] == "unresolved_no_price"]
+    src, rt = {}, {}
+    for r in res:
+        src[r.get("source", "?")] = src.get(r.get("source", "?"), 0) + 1
+        rt[r.get("run_type") or "auto"] = rt.get(r.get("run_type") or "auto", 0) + 1
 
-    if any(r.get("source") == "mock" for r in res):
+    st = {"n": len(res), "csp": csp, "leap": leap, "done": done, "open": openc,
+          "bad": bad, "src": src, "run_type": rt,
+          "has_mock": any(r.get("source") == "mock" for r in res),
+          "baseline": delta_baseline(done) if done else None}
+
+    if done:
+        st["otm"] = sum(1 for r in done if r["status"] == "expired_otm")
+        st["above_be"] = sum(1 for r in done if r.get("above_breakeven"))
+        st["breached"] = sum(1 for r in done if r.get("breached"))
+        pnl = [r["pnl_per_share"] for r in done if r.get("pnl_per_share") is not None]
+        st["pnl_sum"] = sum(pnl) if pnl else None
+        st["pnl_avg"] = (sum(pnl) / len(pnl)) if pnl else None
+        pairs = [(r["pnl_per_share"] / r["strike"], r.get("dte") or 21)
+                 for r in done
+                 if r.get("pnl_per_share") is not None and r.get("strike")]
+        if pairs:
+            roc = [x for x, _ in pairs]
+            avg_d = sum(d for _, d in pairs) / len(pairs)
+            st["roc_sum"] = sum(roc)
+            st["roc_avg"] = sum(roc) / len(roc)
+            st["roc_days"] = avg_d
+            st["roc_ann"] = (sum(roc) / len(roc)) * 365 / avg_d
+    if openc:
+        st["open_itm"] = sum(1 for r in openc if r.get("itm_now"))
+    if leap:
+        st["leap_itm"] = sum(1 for r in leap if r.get("itm_now"))
+        # 多头 call 的盈亏平衡是 行权价 + 权利金。只报 ITM 会系统性高估这条腿:
+        # 深 ITM 的 LEAP 权利金本来就厚, 有内在价值 != 回本
+        st["leap_be"] = sum(
+            1 for r in leap
+            if r.get("last_px") is not None and r.get("strike") is not None
+            and r.get("mid") is not None and r["last_px"] > r["strike"] + r["mid"])
+        rets = [r["underlying_ret"] for r in leap
+                if r.get("underlying_ret") is not None]
+        if rets:
+            st["leap_ret_med"] = float(pd.Series(rets).median())
+            st["leap_ret_avg"] = sum(rets) / len(rets)
+            st["leap_ret_up"] = sum(1 for x in rets if x > 0)
+            st["leap_ret_n"] = len(rets)
+    by = {}
+    for r in done:
+        by.setdefault(r["symbol"], []).append(r)
+    st["by_symbol"] = [
+        (sym, sum(1 for r in g if r["status"] == "expired_otm"), len(g),
+         sum(r.get("pnl_per_share") or 0 for r in g))
+        for sym, g in sorted(by.items(), key=lambda kv: -len(kv[1]))]
+    return st
+
+
+def _src_line(st) -> str:
+    return ("来源: " + " / ".join(f"{k} {v}" for k, v in sorted(st["src"].items()))
+            + ("   (backfill 缺 zone/stage/现价, 数据质量低于 scan)"
+               if st["src"].get("backfill") else ""))
+
+
+def _rt_line(st):
+    if not st["run_type"].get("manual"):
+        return None
+    return ("运行类型: "
+            + " / ".join(f"{k} {v}" for k, v in sorted(st["run_type"].items()))
+            + "   ⚠️ manual 来自手工跑, 时点与标的是人挑的, 采样非等间隔 ——"
+              " 胜率里含选择性偏差, 量大时用 --exclude-manual 对照")
+
+
+def _sigma_verdict(bl) -> str:
+    return ("—— 在噪声范围内, **还不能说系统有 edge**"
+            if abs(bl["sigma"]) < 2 else "—— 超出 2σ, 值得继续观察")
+
+
+def summarize(res: list[dict]) -> str:
+    """纯文本报表 (终端用)。数字全部来自 compute_stats, 这里只排版。"""
+    st = compute_stats(res)
+    done, openc, leap = st["done"], st["open"], st["leap"]
+    L = []
+    if st["has_mock"]:
         L.append("=" * 68)
         L += MOCK_CAVEATS
     L.append("=" * 68)
-    L.append(f"推荐复盘  共 {len(res)} 条 (CSP {len(csp)} / LEAP {len(leap)})")
-    src = {}
-    for r in res:
-        src[r.get("source", "?")] = src.get(r.get("source", "?"), 0) + 1
-    L.append(f"来源: " + " / ".join(f"{k} {v}" for k, v in sorted(src.items()))
-             + ("   (backfill 缺 zone/stage/现价, 数据质量低于 scan)"
-                if src.get("backfill") else ""))
-
-    rt = {}
-    for r in res:
-        rt[r.get("run_type") or "auto"] = rt.get(r.get("run_type") or "auto", 0) + 1
-    if rt.get("manual"):
-        L.append(f"运行类型: " + " / ".join(f"{k} {v}" for k, v in sorted(rt.items()))
-                 + "   ⚠️ manual 来自手工跑, 时点与标的是人挑的, 采样非等间隔 ——"
-                 " 胜率里含选择性偏差, 量大时用 --exclude-manual 对照")
+    L.append(f"推荐复盘  共 {st['n']} 条 (CSP {len(st['csp'])} / LEAP {len(leap)})")
+    L.append(_src_line(st))
+    if _rt_line(st):
+        L.append(_rt_line(st))
     L.append("=" * 68)
-
     L.append("")
     L.append(f"【CSP】已结算 {len(done)} / 未到期 {len(openc)}"
-             + (f" / 无价格无法结算 {len(bad)}" if bad else ""))
+             + (f" / 无价格无法结算 {len(st['bad'])}" if st["bad"] else ""))
     if done:
-        otm = [r for r in done if r["status"] == "expired_otm"]
-        abv = [r for r in done if r.get("above_breakeven")]
-        brc = [r for r in done if r.get("breached")]
-        pnl = [r["pnl_per_share"] for r in done if r.get("pnl_per_share") is not None]
+        n = len(done)
         L.append(f"  ① 作废率 (到期 > 行权价, 权利金全收): "
-                 f"{len(otm)}/{len(done)} = {len(otm) / len(done):.0%}")
+                 f"{st['otm']}/{n} = {st['otm'] / n:.0%}")
         L.append(f"  ② 越过盈亏平衡率 (到期 > 行权价 − 权利金): "
-                 f"{len(abv)}/{len(done)} = {len(abv) / len(done):.0%}")
-        L.append(f"     —— ② 比 ① 高的部分 = 被行权但仍不亏的单子; 这套剧本的"
+                 f"{st['above_be']}/{n} = {st['above_be'] / n:.0%}")
+        L.append("     —— ② 比 ① 高的部分 = 被行权但仍不亏的单子; 这套剧本的"
                  "行权价压在愿意接货的价值区里, 接货是预期内结果不是失败")
-        L.append(f"  持有期内曾跌破行权价: {len(brc)}/{len(done)} = "
-                 f"{len(brc) / len(done):.0%}  (曾破位 ≠ 到期被行权)")
-        # —— delta 基准线 ——
-        # 卖 0.12 delta 的 put, 本来就"应该"有约 88% 到期作废: delta 近似
-        # 到期 ITM 概率。不给基准线, 一个 95% 的作废率会被读成"系统很准",
-        # 而它可能只是"按定义就该这么高"。要看的是**超出基准多少**, 以及
-        # 样本量够不够支撑那个差。
-        bl = delta_baseline(done)
+        L.append(f"  持有期内曾跌破行权价: {st['breached']}/{n} = "
+                 f"{st['breached'] / n:.0%}  (曾破位 ≠ 到期被行权)")
+        bl = st["baseline"]
         if bl:
             L.append(f"  ★ delta 基准: 均 delta {bl['avg_delta']:.3f} → 理论作废率 "
                      f"{bl['expected_otm']:.0%}; 实际 {bl['realized_otm']:.0%}, "
                      f"差 {bl['excess']:+.1%}")
             L.append(f"    n={bl['n']}, 标准误 {bl['se']:.1%} → {abs(bl['sigma']):.1f}σ "
-                     + ("—— 在噪声范围内, **还不能说系统有 edge**"
-                        if abs(bl["sigma"]) < 2 else "—— 超出 2σ, 值得继续观察")
+                     + _sigma_verdict(bl)
                      + f"; 要把 ±{bl['se'] * 100:.0f}pp 的误差压到一半"
                        f"需要约 {bl['n_for_half_se']} 笔")
             L.append("    (作废率高本身不是本事: delta 越低越容易作废, 代价是"
                      "权利金越薄。真正要看的是下面按抵押金归一的收益率)")
-        # —— 按抵押金归一 ——
-        # 每股金额跨标的不可加: NVDA 200 的票和 RKLB 50 的票占用的保证金差 4 倍。
-        # CSP 抵押 ≈ 行权价 × 100, 所以 pnl/行权价 才是可比的资金回报率。
-        roc = [(r["pnl_per_share"] / r["strike"]) for r in done
-               if r.get("pnl_per_share") is not None and r.get("strike")]
-        if roc:
-            days = [r.get("dte") or 21 for r in done
-                    if r.get("pnl_per_share") is not None and r.get("strike")]
-            avg_d = sum(days) / len(days)
-            tot = sum(roc)
-            L.append(f"  抵押金回报率 (pnl/行权价, 每笔独立占用): 合计 {tot:+.2%} / "
-                     f"单均 {tot / len(roc):+.3%} / 平均持有 {avg_d:.0f} 天")
-            L.append(f"    单笔年化当量 ~{(tot / len(roc)) * 365 / avg_d:+.1%} "
+        if st.get("roc_sum") is not None:
+            L.append(f"  抵押金回报率 (pnl/行权价, 每笔独立占用): "
+                     f"合计 {st['roc_sum']:+.2%} / 单均 {st['roc_avg']:+.3%} / "
+                     f"平均持有 {st['roc_days']:.0f} 天")
+            L.append(f"    单笔年化当量 ~{st['roc_ann']:+.1%} "
                      "(假设资金连续复用且始终有票可卖 —— 实际有空窗, 别当真实年化)")
-        if pnl:
-            L.append(f"  每股账面合计 {sum(pnl):+.2f} / 单均 {sum(pnl) / len(pnl):+.2f} "
+        if st.get("pnl_sum") is not None:
+            L.append(f"  每股账面合计 {st['pnl_sum']:+.2f} / 单均 {st['pnl_avg']:+.2f} "
                      "(跨标的每股金额**不可加**, 仅供对账; 归一口径看上面一行)")
     else:
         L.append("  (还没有到期的 CSP —— 胜率要等第一批到期后才有意义)")
     if openc:
-        itm = [r for r in openc if r.get("itm_now")]
-        L.append(f"  未到期 {len(openc)} 笔, 其中当前已在行权价下方 {len(itm)} 笔")
+        L.append(f"  未到期 {len(openc)} 笔, 其中当前已在行权价下方 "
+                 f"{st['open_itm']} 笔")
 
     L.append("")
     L.append(f"【LEAP】{len(leap)} 笔 —— **不计入胜率**")
     L.append("  LEAP 是 450-1100 DTE 的多头仓, 复盘窗口内没有结局; 它的胜负取决于")
     L.append("  你何时平仓, 那是持仓决策不是推荐决策。这里只给未实现状态。")
     if leap:
-        itm = [r for r in leap if r.get("itm_now")]
-        # 多头 call 的盈亏平衡是 行权价 + 权利金。只报 ITM 会系统性高估这条腿:
-        # 深 ITM 的 LEAP 权利金本来就厚, 有内在价值 != 回本
-        be_ok = [r for r in leap
-                 if r.get("last_px") is not None and r.get("strike") is not None
-                 and r.get("mid") is not None
-                 and r["last_px"] > r["strike"] + r["mid"]]
-        rets = [r["underlying_ret"] for r in leap if r.get("underlying_ret") is not None]
-        L.append(f"  当前 ITM: {len(itm)}/{len(leap)}   "
-                 f"越过盈亏平衡 (行权价+权利金): {len(be_ok)}/{len(leap)}")
+        L.append(f"  当前 ITM: {st['leap_itm']}/{len(leap)}   "
+                 f"越过盈亏平衡 (行权价+权利金): {st['leap_be']}/{len(leap)}")
         L.append("    —— ITM 只说明有内在价值; 越过盈亏平衡才是真的不亏。"
                  "两个数差得远说明权利金付贵了")
-        if rets:
-            L.append(f"  正股自推荐日涨跌: 中位 {pd.Series(rets).median():+.1%} / "
-                     f"均值 {sum(rets) / len(rets):+.1%} / "
-                     f"上涨 {sum(1 for x in rets if x > 0)}/{len(rets)}")
+        if st.get("leap_ret_n"):
+            L.append(f"  正股自推荐日涨跌: 中位 {st['leap_ret_med']:+.1%} / "
+                     f"均值 {st['leap_ret_avg']:+.1%} / "
+                     f"上涨 {st['leap_ret_up']}/{st['leap_ret_n']}")
         else:
             L.append("  (无法算正股涨跌 —— 回填记录没有推荐日现价)")
         L.append("")
         L += leap_table(leap)
 
-    by = {}
-    for r in done:
-        by.setdefault(r["symbol"], []).append(r)
-    if by:
+    if st["by_symbol"]:
         L.append("")
         L.append("【按标的 (仅已结算 CSP)】")
-        for sym in sorted(by, key=lambda x: -len(by[x])):
-            g = by[sym]
-            o = sum(1 for r in g if r["status"] == "expired_otm")
-            L.append(f"  {sym:<6} {o}/{len(g)} 作废  "
-                     f"每股合计 {sum(r.get('pnl_per_share') or 0 for r in g):+.2f}")
+        for sym, o, tot, pnl in st["by_symbol"]:
+            L.append(f"  {sym:<6} {o}/{tot} 作废  每股合计 {pnl:+.2f}")
     return "\n".join(L)
+
+
+def summarize_md(res: list[dict], title="推荐复盘") -> str:
+    """Markdown 报表。数字与 summarize() 同源 (compute_stats), 这里只排版。
+
+    为什么值得单出一份 md: 扫描器本身的日报就是 markdown (邮件推送 + 手机阅读),
+    这份复盘同一条路就能发出去; 而且明细表在 md 下是真表格, GitHub/邮件客户端
+    /预览器都能渲染, 不依赖等宽字体 —— 纯文本那版在手机上一定会折行错位。
+    """
+    st = compute_stats(res)
+    done, openc, leap = st["done"], st["open"], st["leap"]
+    M = [f"# {title}", ""]
+    if st["has_mock"]:
+        # 免责声明在 md 里用引用块 —— 视觉上和数字分开, 但仍在同一份文件里,
+        # 截图也带得走 (这是 MOCK_CAVEATS 绑在数据上的同一条理由)
+        M += ["> " + line.strip() for line in MOCK_CAVEATS]
+        M.append("")
+    M.append(f"共 **{st['n']}** 条（CSP {len(st['csp'])} / LEAP {len(leap)}）。"
+             + _src_line(st))
+    if _rt_line(st):
+        M += ["", _rt_line(st)]
+    M += ["", "## CSP", "",
+          f"已结算 **{len(done)}** / 未到期 {len(openc)}"
+          + (f" / 无价格无法结算 {len(st['bad'])}" if st["bad"] else "")]
+    if done:
+        n = len(done)
+        M += ["", "| 口径 | 值 | 说明 |", "|---|---|---|",
+              f"| ① 作废率 | **{st['otm']}/{n} = {st['otm'] / n:.0%}** "
+              f"| 到期 > 行权价, 权利金全收 |",
+              f"| ② 越过盈亏平衡率 | **{st['above_be']}/{n} = "
+              f"{st['above_be'] / n:.0%}** | 到期 > 行权价 − 权利金 |",
+              f"| 持有期内曾跌破行权价 | {st['breached']}/{n} = "
+              f"{st['breached'] / n:.0%} | 曾破位 ≠ 到期被行权 |", ""]
+        M.append("② 比 ① 高的部分 = 被行权但仍不亏的单子。这套剧本的行权价压在"
+                 "愿意接货的价值区里，**接货是预期内结果不是失败**。")
+        bl = st["baseline"]
+        if bl:
+            M += ["", "### ★ delta 基准线", "",
+                  f"均 delta {bl['avg_delta']:.3f} → 理论作废率 "
+                  f"**{bl['expected_otm']:.0%}**；实际 **{bl['realized_otm']:.0%}**，"
+                  f"差 **{bl['excess']:+.1%}**。",
+                  "",
+                  f"n={bl['n']}，标准误 {bl['se']:.1%} → **{abs(bl['sigma']):.1f}σ** "
+                  + _sigma_verdict(bl)
+                  + f"。要把 ±{bl['se'] * 100:.0f}pp 的误差压到一半需要约 "
+                    f"**{bl['n_for_half_se']}** 笔。",
+                  "",
+                  "> 作废率高本身不是本事：delta 越低越容易作废，代价是权利金越薄。"
+                  "真正要看的是下面按抵押金归一的收益率。"]
+        if st.get("roc_sum") is not None:
+            M += ["", "### 抵押金回报率", "",
+                  f"`pnl / 行权价`（每笔独立占用）：合计 **{st['roc_sum']:+.2%}** / "
+                  f"单均 **{st['roc_avg']:+.3%}** / 平均持有 {st['roc_days']:.0f} 天。",
+                  "",
+                  f"单笔年化当量 ~**{st['roc_ann']:+.1%}** —— 假设资金连续复用且"
+                  "始终有票可卖，实际有空窗，别当真实年化。"]
+        if st.get("pnl_sum") is not None:
+            M += ["", f"每股账面合计 {st['pnl_sum']:+.2f} / 单均 "
+                      f"{st['pnl_avg']:+.2f}（跨标的每股金额**不可加**，仅供对账）。"]
+    else:
+        M += ["", "_还没有到期的 CSP —— 胜率要等第一批到期后才有意义。_"]
+    if openc:
+        M += ["", f"未到期 {len(openc)} 笔，其中当前已在行权价下方 "
+                  f"{st['open_itm']} 笔。"]
+
+    M += ["", "## LEAP", "",
+          f"**{len(leap)} 笔 —— 不计入胜率。** LEAP 是 450-1100 DTE 的多头仓，"
+          "复盘窗口内没有结局；胜负取决于何时平仓，那是持仓决策不是推荐决策。"]
+    if leap:
+        M += ["",
+              f"当前 ITM **{st['leap_itm']}/{len(leap)}**，"
+              f"越过盈亏平衡（行权价+权利金）**{st['leap_be']}/{len(leap)}**。",
+              "",
+              "> ITM 只说明有内在价值；越过盈亏平衡才是真的不亏。"
+              "两个数差得远说明权利金付贵了。"]
+        if st.get("leap_ret_n"):
+            M += ["", f"正股自推荐日涨跌：中位 {st['leap_ret_med']:+.1%} / "
+                      f"均值 {st['leap_ret_avg']:+.1%} / "
+                      f"上涨 {st['leap_ret_up']}/{st['leap_ret_n']}。"]
+        M += ["", "| 标的 | 入手 | 到期 | 行权价 | 入手价 | 权利金 | 盈亏平衡 "
+                  "| 最新价 | 正股涨跌 | 状态 | 剩余 |",
+              "|---|---|---|--:|--:|--:|--:|--:|--:|---|--:|"]
+        for r in sorted(leap, key=lambda x: (x["symbol"], x["date"])):
+            k, mid, last = r.get("strike"), r.get("mid"), r.get("last_px")
+            be = (k + mid) if (k is not None and mid is not None) else None
+            sp, ret = r.get("spot_at_rec"), r.get("underlying_ret")
+            if last is None:
+                stt = "无价格"
+            elif be is not None and last > be:
+                stt = "✓ 越过平衡"
+            elif r.get("itm_now"):
+                stt = "ITM 未回本"
+            else:
+                stt = "✗ OTM"
+            M.append("| " + " | ".join([
+                r["symbol"], r["date"], r.get("exp") or "—",
+                f"{k:g}" if k is not None else "—",
+                f"{sp:.2f}" if sp is not None else "—",
+                f"{mid:.2f}" if mid is not None else "—",
+                f"{be:.2f}" if be is not None else "—",
+                f"{last:.2f}" if last is not None else "—",
+                f"{ret:+.1%}" if ret is not None else "—", stt,
+                f"{r['dte_left']}天" if r.get("dte_left") is not None else "—",
+            ]) + " |")
+
+    if st["by_symbol"]:
+        M += ["", "## 按标的（仅已结算 CSP）", "",
+              "| 标的 | 作废 | 每股合计 |", "|---|---|--:|"]
+        for sym, o, tot, pnl in st["by_symbol"]:
+            M.append(f"| {sym} | {o}/{tot} | {pnl:+.2f} |")
+    M += ["", "---", "", "_分析工具输出，不构成投资建议。_"]
+    return "\n".join(M)
 
 
 def main() -> int:
@@ -549,6 +702,10 @@ def main() -> int:
     ap.add_argument("--exclude-manual", action="store_true",
                     help="只看自动跑的推荐 (剔除 --force/--tickers 手工跑的采样偏差)")
     ap.add_argument("--json", dest="json_out", help="结算明细另存为 JSON")
+    ap.add_argument("--md", dest="md_out", nargs="?", const="AUTO",
+                    help="输出 markdown 报表 (给路径, 或不给参数则写 "
+                         "reports/review-<日期>.md)。表格在 md 下是真表格, "
+                         "手机与邮件客户端不会错位")
     ap.add_argument("--demo", action="store_true",
                     help="造 MOCK 数据看报表长什么样 (写 data/demo_journal.jsonl, "
                          "**不碰**真实流水账; 报表顶部会打死免责声明)")
@@ -595,6 +752,12 @@ def main() -> int:
         return 0
     res = resolve(rows, datetime.now(sc.ET).date())
     print(summarize(res))
+    if a.md_out:
+        mp = (BASE / "reports" / f"review-{date.today().isoformat()}.md"
+              if a.md_out == "AUTO" else Path(a.md_out))
+        mp.parent.mkdir(exist_ok=True)
+        mp.write_text(summarize_md(res) + chr(10), encoding="utf-8")
+        print(chr(10) + f"markdown -> {mp}")
     if a.json_out:
         Path(a.json_out).write_text(
             json.dumps(res, ensure_ascii=False, indent=1, default=str),

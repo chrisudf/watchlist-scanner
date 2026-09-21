@@ -312,6 +312,8 @@ zone 建议同时填 `zone_asof = 2026-09-05` (校准日期); 收盘扫描会盯
 .venv/Scripts/python.exe review.py --exclude-manual   # 剔掉手工跑的采样偏差
 .venv/Scripts/python.exe review.py --json out.json    # 结算明细另存
 .venv/Scripts/python.exe review.py --demo             # 造 mock 数据看报表长什么样
+.venv/Scripts/python.exe review.py --md              # markdown 报表 -> reports/review-<日期>.md
+.venv/Scripts/python.exe review.py --md out.md      # 指定路径
 ```
 
 `--demo` 用**真实日线** + scanner 自己的 `bs_delta`/`bs_price` 造一份合成流水账
@@ -349,6 +351,18 @@ zone 建议同时填 `zone_asof = 2026-09-05` (校准日期); 收盘扫描会盯
 里, 接到货是预期内结果。只报 ① 会把"按计划接货"记成失败; 只报 ② 会掩盖接货
 频率。另给"持有期内曾跌破行权价"的比例 (曾破位 ≠ 到期被行权) 和每股账面
 结果 (= 权利金 + min(0, 到期收盘 − 行权价), 未计手续费与资金占用)。
+
+### 两种输出
+
+默认打纯文本到终端。`--md` 另出一份 markdown —— 扫描器的日报本来就是 markdown
+(邮件推送 + 手机阅读), 这份复盘同一条路就能发出去; 而且明细表在 md 下是**真
+表格**, GitHub / 邮件客户端 / 预览器都能渲染, 不依赖等宽字体。纯文本那版在手机
+上一定会折行错位。
+
+两个渲染器**同源**: 所有口径只在 `compute_stats()` 里算一次, `summarize()` 与
+`summarize_md()` 只负责排版。让两个渲染器各自算一遍 = 必然漂移 (改了一处忘另
+一处, 两份报表给出不同的胜率, 而且没人会同时看两份所以不会被发现)。有一条测试
+断言同一批数据在两份报表里的关键计数逐字一致。
 
 ### 怎么读这些数字
 

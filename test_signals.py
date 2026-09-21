@@ -2822,5 +2822,75 @@ class TestLeapTable(unittest.TestCase):
         self.assertNotIn("%✓", rows[2])                   # 修掉的那个贴死形态
 
 
+
+class TestMarkdownRenderer(unittest.TestCase):
+    """md 与纯文本必须同源 —— 两个渲染器各自算一遍就一定漂移。"""
+
+    def _res(self):
+        return [
+            {"kind": "csp", "symbol": "NVDA", "date": "2026-07-21",
+             "exp": "2026-08-21", "strike": 170.0, "mid": 2.5, "delta": 0.12,
+             "dte": 31, "status": "expired_otm", "above_breakeven": True,
+             "breached": False, "pnl_per_share": 2.5, "source": "scan"},
+            {"kind": "csp", "symbol": "GLD", "date": "2026-07-21",
+             "exp": "2026-08-21", "strike": 300.0, "mid": 1.1, "delta": 0.09,
+             "dte": 31, "status": "assigned", "above_breakeven": False,
+             "breached": True, "pnl_per_share": -2.0, "source": "scan"},
+            {"kind": "leap", "symbol": "NVDA", "date": "2025-12-01",
+             "exp": "2027-04-15", "strike": 180.0, "mid": 21.92,
+             "spot_at_rec": 179.92, "last_px": 222.27, "underlying_ret": 0.2354,
+             "itm_now": True, "dte_left": 206, "status": "open_unrealized",
+             "source": "scan"},
+        ]
+
+    def test_same_numbers_in_both_renderers(self):
+        """同一批数据, 两份报表的关键计数必须逐字一致。"""
+        import review
+        res = self._res()
+        t, m = review.summarize(res), review.summarize_md(res)
+        st = review.compute_stats(res)
+        for frag in (f"{st['otm']}/{len(st['done'])}",
+                     f"{st['leap_itm']}/{len(st['leap'])}",
+                     f"{st['leap_be']}/{len(st['leap'])}"):
+            self.assertIn(frag, t, frag)
+            self.assertIn(frag, m, frag)
+
+    def test_stats_computed_once(self):
+        """compute_stats 是唯一的算数入口 —— 渲染器只排版。"""
+        import review
+        st = review.compute_stats(self._res())
+        self.assertEqual(st["otm"], 1)
+        self.assertEqual(st["above_be"], 1)
+        self.assertEqual(st["breached"], 1)
+        self.assertEqual(len(st["done"]), 2)
+        self.assertEqual(st["leap_itm"], 1)
+        self.assertEqual(st["leap_be"], 1)        # 222.27 > 180 + 21.92
+
+    def test_md_tables_are_real_markdown(self):
+        import review
+        m = review.summarize_md(self._res())
+        self.assertIn("| 标的 | 入手 | 到期 |", m)
+        self.assertIn("|---|", m)
+        self.assertTrue(m.startswith("# "))
+
+    def test_mock_caveats_become_blockquote_not_dropped(self):
+        """md 里免责声明改成引用块, 但一个字都不能少。"""
+        import review
+        res = [dict(r, source="mock") for r in self._res()]
+        m = review.summarize_md(res)
+        for line in review.MOCK_CAVEATS:
+            self.assertIn(line.strip(), m)
+        self.assertIn("> ⚠️", m)
+
+    def test_md_has_no_caveats_for_real_data(self):
+        import review
+        self.assertNotIn("MOCK", review.summarize_md(self._res()))
+
+    def test_empty_input_does_not_crash_either_renderer(self):
+        import review
+        self.assertIn("CSP", review.summarize([]))
+        self.assertIn("# ", review.summarize_md([]))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
