@@ -15,3 +15,15 @@
 45 19 * * 1-5 /opt/watchlist-scanner/deploy/run_scan.sh   # 15:45 EDT close (US summer)
 45 20 * * 1-5 /opt/watchlist-scanner/deploy/run_scan.sh   # 15:45 EST close (US winter; EDT=16:45, skip)
 30 22 * * 1-5 /opt/watchlist-scanner/deploy/run_scan.sh watchdog   # 报告缺失 -> 邮件报警
+
+# ---- 推荐复盘 (月度) ----
+# 每月 1 号跑一次, 出 markdown 并邮寄。为什么是月度不是周度: CSP 是 12-31 DTE,
+# 一笔要三周左右才结算; 按当前出票节奏一周只多出一两笔已结算样本, 而 delta 基准
+# 线的标准误要 ~156 笔才减半 —— 周度报表的数字变化基本是噪声, 读它只会养成
+# 盯短期胜率的习惯。月度既够积累又不至于忘记。
+0 9 1 * * /opt/watchlist-scanner/deploy/run_scan.sh review
+#
+# ⚠️ 上面这行按 **服务器本地时钟** 写。本文件其余时点是 UTC 口径, 而实际那台
+# droplet 的时钟是 Australia/Brisbane —— 照抄 UTC 会全错 (见 lesson.md)。
+# 挂之前先 `timedatectl` 确认, 复盘这行对时点不敏感 (不依赖市场开闭), 落在
+# 任何一天的白天都行。

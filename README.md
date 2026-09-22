@@ -352,6 +352,31 @@ zone 建议同时填 `zone_asof = 2026-09-05` (校准日期); 收盘扫描会盯
 频率。另给"持有期内曾跌破行权价"的比例 (曾破位 ≠ 到期被行权) 和每股账面
 结果 (= 权利金 + min(0, 到期收盘 − 行权价), 未计手续费与资金占用)。
 
+### 在哪跑 / 多久跑一次
+
+**流水账只在 droplet 上长。** 收盘扫描自动记录, 而 `--force`/`--tickers` 的
+手工跑按纪律不记 —— 本机跑的全是手工跑, 所以本机的 `data/recommendations.jsonl`
+基本是空的 (且 `data/` 已 gitignore, 不会同步)。
+
+| | 命令 | 说明 |
+|---|---|---|
+| droplet (数据在这) | `/opt/watchlist-scanner/.venv/bin/python review.py --md` | 写 `reports/review-<日期>.md` |
+| droplet (自动邮寄) | `deploy/run_scan.sh review` | 出 md 并推到邮箱, 失败也发信 |
+| 本机 (看历史) | 先 `rsync droplet:/opt/watchlist-scanner/data/recommendations.jsonl data/` 再 `.venv/Scripts/python.exe review.py --md` | 不 rsync 的话只能看 `--demo` |
+| 本机 (看报表长什么样) | `.venv/Scripts/python.exe review.py --demo --md out.md` | mock 数据, 顶部有免责声明 |
+
+**月度, 不是周度。** CSP 是 12-31 DTE, 一笔要三周左右才结算; 按当前出票节奏
+一周只多出一两笔已结算样本, 而 delta 基准线的标准误要约 156 笔才减半 ——
+周度报表的数字变化基本是噪声, 读它只会养成盯短期胜率的习惯。
+`deploy/crontab.example` 里有现成的月度行 (每月 1 号)。
+
+⚠️ 那行按**服务器本地时钟**写。文件其余时点是 UTC 口径, 而实际那台 droplet
+的时钟是 `Australia/Brisbane` —— 照抄 UTC 会全错 (见 lesson.md)。复盘这行对
+时点不敏感 (不依赖市场开闭), 但挂之前还是先 `timedatectl` 确认。
+
+**注意流水账记的是"系统推荐了什么", 不是"你实际做了什么"。** 胜率衡量的是
+扫描器, 不是你的账户 —— 你没开的仓、提前平掉的仓、加减过仓的, 它都不知道。
+
 ### 两种输出
 
 默认打纯文本到终端。`--md` 另出一份 markdown —— 扫描器的日报本来就是 markdown
