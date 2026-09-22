@@ -2635,12 +2635,42 @@ class TestReviewBackfill(unittest.TestCase):
         self.assertTrue([r for r in csp if r["symbol"] == "GLD"][0]["panic_mode"])
 
     def test_backfill_is_marked_lossy(self):
-        """回填缺 zone/stage/现价 —— 必须可与 scan 分开, 别混成同一种数据。"""
+        """回填缺 zone/stage —— 必须可与 scan 分开, 别混成同一种数据。"""
         with tempfile.TemporaryDirectory() as td:
             rows = self._dir(td)
         for r in rows:
             self.assertEqual(r["source"], "backfill")
-            self.assertIsNone(r["spot_at_rec"])
+            self.assertNotIn("zone", r)
+            self.assertNotIn("stage", r)
+
+    def test_leap_entry_spot_recovered_from_breakeven_pct(self):
+        """报告行里有 "BE 249.55 (+11.4%)" -> spot = BE/(1+pct)。
+
+        到盈亏平衡点的百分比正是筛选器的门槛 (moomoo: 0~12%), 缺了它复盘时
+        看不出票当初合不合规 —— 而且入手价一并救回来, "正股涨跌"不再是 —。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            rows = self._dir(td)
+        leap = [r for r in rows if r["kind"] == "leap"][0]
+        self.assertAlmostEqual(leap["be_pct_at_rec"], 0.114, places=4)
+        self.assertAlmostEqual(leap["spot_at_rec"], 249.55 / 1.114, places=1)
+        # CSP 行的 BE 没有百分比, 仍然反解不出
+        csp = [r for r in rows if r["kind"] == "csp"][0]
+        self.assertIsNone(csp["spot_at_rec"])
+
+    def test_gate_violations_flagged(self):
+        """扫描器在没有合约全过滤时回落到 clean or rows 并只加一条 note,
+        而那条 note 进不了表格 —— 复盘必须能看出票当初踩了哪些线。"""
+        import review
+        self.assertEqual(review.leap_flags(
+            {"oi": 3567, "extrinsic_pct": 32.0, "be_pct_at_rec": 0.114}), "—")
+        f = review.leap_flags(
+            {"oi": 2, "extrinsic_pct": 62.0, "be_pct_at_rec": 0.214})
+        self.assertIn("OI2", f)
+        self.assertIn("外在62%", f)
+        self.assertIn("BE+21%", f)
+        # 缺字段不该凭空报警
+        self.assertEqual(review.leap_flags({}), "—")
 
     def test_manual_reports_tagged_not_dropped(self):
         """手工跑的票当时真推荐过, 收进来但打标签 —— 采样偏差要可分离。"""
@@ -3024,10 +3054,12 @@ class TestEmailRendering(unittest.TestCase):
         import review
         res = self._leaps(30, be_ok=True) + self._leaps(3, be_ok=False)
         cells = review.leap_cells(res)
-        self.assertIn("✗ OTM", [c[9] for c in cells[:3]])
+        # 按表头定位列, 不写死序号 —— 上一版写死 c[9], 插两列后整条假红
+        i = [h for h, _, _ in review.LEAP_HDR].index("状态")
+        self.assertIn("✗ OTM", [c[i] for c in cells[:3]])
         shown, more = review._capped(cells)
         self.assertEqual(more, 33 - review.MAX_TABLE_ROWS)
-        self.assertTrue(any(c[9] == "✗ OTM" for c in shown))
+        self.assertTrue(any(c[i] == "✗ OTM" for c in shown))
 
     def test_email_html_renders_the_syntax_we_use(self):
         """h1/h2/h3、表格、粗体、引用块、行内代码 —— 复盘 md 用到的都要能渲染。"""

@@ -78,6 +78,12 @@ DATE_RE = re.compile(r"(\d{4}-\d\d-\d\d)")
 # 行尾的可选字段: 有就取, 没有就算了 (格式随版本演进过, 老报告可能缺)
 OI_RE = re.compile(r"OI (\d+)")
 CIV_RE = re.compile(r"合约 IV (\d+)%")
+# LEAP 行尾的 "BE 249.55 (+11.4%)" —— 有了它就能反解当时的现价:
+# spot = BE / (1 + pct)。此前回填的 LEAP 一律没有 spot_at_rec, 于是报表里
+# "入手价"和"正股涨跌"全是 —, 而**到盈亏平衡点的百分比正是筛选器的门槛**
+# (moomoo 的 LEAP 筛选器: 到盈亏平衡点 0~12%), 缺了它看不出票合不合规。
+BE_RE = re.compile(r"BE ([\d.]+) \(([+-][\d.]+)%\)")
+EXT_RE = re.compile(r"外在 (\d+)%")
 
 
 def backfill_rows(reports_dir: Path) -> list[dict]:
@@ -117,6 +123,11 @@ def backfill_rows(reports_dir: Path) -> list[dict]:
         for mm in LEAP_RE.finditer(txt):
             tail = txt[mm.end():mm.end() + 220]
             oi, civ = OI_RE.search(tail), CIV_RE.search(tail)
+            be, ext = BE_RE.search(tail), EXT_RE.search(tail)
+            be_pct = float(be.group(2)) / 100 if be else None
+            # BE = spot × (1 + pct) => spot = BE / (1 + pct)
+            spot = (float(be.group(1)) / (1 + be_pct)
+                    if be and be_pct is not None and be_pct > -1 else None)
             rows.append({
                 "date": d, "mode": "close", "symbol": mm["sym"], "kind": "leap",
                 "action": "BUY_CALL", "exp": mm["exp"],
@@ -124,7 +135,10 @@ def backfill_rows(reports_dir: Path) -> list[dict]:
                 "delta": float(mm["delta"]),
                 "oi": int(oi.group(1)) if oi else None,
                 "iv": (int(civ.group(1)) / 100) if civ else None,
-                "spot_at_rec": None, "source": "backfill",
+                "extrinsic_pct": float(ext.group(1)) if ext else None,
+                "be_pct_at_rec": be_pct,
+                "spot_at_rec": round(spot, 2) if spot else None,
+                "source": "backfill",
                 "run_type": run_type, "source_file": f.name, "notes": [],
             })
     return rows
@@ -393,8 +407,30 @@ def _num(v, fmt="{:.2f}"):
 # 两处各写一遍列定义就会漂移, 这是 compute_stats 同源化的同一条理由。
 LEAP_HDR = [("标的", 6, False), ("入手", 11, False), ("到期", 11, False),
             ("行权价", 8, True), ("入手价", 8, True), ("权利金", 8, True),
-            ("盈亏平衡", 9, True), ("最新价", 8, True), ("正股涨跌", 9, True),
-            ("状态", 12, False), ("剩余", 7, True)]
+            ("盈亏平衡", 9, True), ("BE%入手", 8, True), ("最新价", 8, True),
+            ("正股涨跌", 9, True), ("状态", 12, False), ("旗标", 16, False),
+            ("剩余", 7, True)]
+
+# 开仓门槛 (与 watchlist.toml [settings] 的 leap_* 同源; 到盈亏平衡点那条
+# 是 moomoo 筛选器的口径, 扫描器的 passes() 里**没有**这一项)。
+# 复盘要能看出"这张票当初是不是踩线发的" —— 扫描器在没有合约全过滤时会
+# 回落到 clean or rows 并只加一条 note, 而那条 note 没进流水账的表格。
+LEAP_GATES = {"oi": 500, "extrinsic_pct": 40.0, "be_pct": 0.12}
+
+
+def leap_flags(r: dict) -> str:
+    """开仓时踩了哪些门槛 -> 短标记串 (空 = 干净)。"""
+    f = []
+    oi = r.get("oi")
+    if oi is not None and oi < LEAP_GATES["oi"]:
+        f.append(f"OI{oi}")
+    ex = r.get("extrinsic_pct")
+    if ex is not None and ex > LEAP_GATES["extrinsic_pct"]:
+        f.append(f"外在{ex:.0f}%")
+    be = r.get("be_pct_at_rec")
+    if be is not None and be > LEAP_GATES["be_pct"]:
+        f.append(f"BE{be:+.0%}")
+    return "⚠ " + " ".join(f) if f else "—"
 
 ASSIGNED_HDR = [("标的", 6, False), ("入手", 11, False), ("到期", 11, False),
                 ("行权价", 8, True), ("权利金", 8, True), ("盈亏平衡", 9, True),
@@ -486,7 +522,8 @@ def leap_cells(leap: list[dict]) -> list[list[str]]:
         out.append([
             r["symbol"], r["date"], r.get("exp") or "—",
             _num(k, "{:g}"), _num(r.get("spot_at_rec")), _num(mid), _num(be),
-            _num(last), _num(ret, "{:+.1%}"), st,
+            _num(r.get("be_pct_at_rec"), "{:+.1%}"),
+            _num(last), _num(ret, "{:+.1%}"), st, leap_flags(r),
             f"{r['dte_left']}天" if r.get("dte_left") is not None else "—"])
     return out
 
