@@ -132,11 +132,19 @@ SETTINGS_DEFAULTS = {
     "leap_delta_index": [0.70, 0.80],
     "leap_delta_stock": [0.75, 0.85],
     "leap_min_oi": 500, "leap_max_spread_pct": 5.0,
-    # 可成交地板 (硬拦, 与上面的 500 是两回事): 500 是"流动性弱"的质量线,
-    # 低于它的票照出、带旗标由人判断; 50 以下是"这张根本没有市场" —— 2026-09-21
-    # 的 TSM 340C 是 OI=1 的真事, 却作为 🟢 动作项发了出去。买不到的票不该
-    # 出现在动作项里, 所以这一条在挑票之前就把候选剔掉, 软回落也救不回来。
-    "leap_hard_min_oi": 50,
+    # OI 低到这个数以下时, note 的措辞升级成"几乎无二级市场" —— 只改措辞,
+    # 不改去留。**OI 不是可成交性的证据**: 2026-09-21 的 TSM 2029-01-19 340C
+    # 是 OI=1, 但双边价差只有 2.0% (当天八张 LEAP 里最窄的), 做市商在真报价;
+    # 同一天 OI=97 的 COHR 价差反而 5.7%。OI 量的是已累积持仓, 价差量的才是
+    # 当下能不能成交 —— 别拿前者当后者用 (一版写成硬拦, 被这组数据证伪)。
+    "leap_thin_oi": 50,
+    # 到期周期的成熟度权衡: 最接近 730 DTE 的那个到期若比 slack 窗口内的
+    # 另一个"生"上 ratio 倍 (OI 总量), 就让给成熟的那条链。LEAP 周期刚上市
+    # 时整条链 OI 接近 0, 而 |851-730| < |487-730| 会让扫描器在上市当天就
+    # 跳过去 —— 2026-09-21 的 TSM/ISRG 就是这么落到 2029 新链上的, 而 2028
+    # 的成熟链 (TSM OI 2816 / 价差 2.2%) 就在旁边。
+    "leap_exp_dte_slack": 250, "leap_exp_depth_ratio": 10.0,
+    "leap_exp_max_probe": 3,     # 最多多取 N 条链, 限住额外的行情请求
     "leap_max_extrinsic_pct": 40.0,
     # 到盈亏平衡 <= 12% (moomoo「Buy LEAP Call」筛选器同款, 0~12%)。ITM call
     # 有恒等式 BE = 现价 + 外在价值, 所以这条等价于"外在价值 <= 现价的 12%" ——
@@ -1833,6 +1841,52 @@ def csp_ticket(cc: ChainCache, spot: float, iv30: float | None,
     return ticket
 
 
+def _chain_depth(cc: ChainCache, exp: str) -> int:
+    """这条链上 call 的 OI 总量 = 到期周期的成熟度 (不是某一档的质量)。
+
+    刚上市的 LEAP 周期整条链接近 0; 挂了一年的周期是几万起。用总量而不是
+    单档, 是因为要判断的是"这个周期开张了没有", 与选哪个行权价无关。"""
+    ch = cc.chain(exp)
+    calls = getattr(ch, "calls", None)
+    if calls is None or calls.empty or "openInterest" not in calls:
+        return 0
+    return int(pd.to_numeric(calls["openInterest"], errors="coerce")
+               .fillna(0).sum())
+
+
+def _pick_leap_expiry(cc: ChainCache, pool: list[tuple[str, int]],
+                      s: dict) -> tuple[str, int, str | None]:
+    """在 pool 里选到期: 最接近 730 DTE, 但**避开刚上市的空链**。
+
+    2026-09-21 的 TSM: 2028-01-21 是 487 天、2029-01-19 是 851 天, 而
+    |851-730| = 121 < |487-730| = 243 —— 于是扫描器在 2029 周期上市的当天
+    就跳了过去, 选中一张 OI=1 的合约; 成熟的 2028 链 (OI 2816、价差 2.2%)
+    就在旁边。这不是"合约不好", 是"周期还没开张"。
+
+    规则: 从最近的那个到期起, 在 slack 窗口内按距离顺序看; 只要有一条链比
+    它厚 ratio 倍, 就让给那条。两条都成熟时厚度差不到一个量级, 730 的偏好
+    照旧生效 —— 这条规则只在"一条几乎是空的"时才咬合。
+
+    返回 (exp, dte, note): note 非空表示发生了让位, 要写进票据的 notes。
+    """
+    ranked = sorted(pool, key=lambda x: abs(x[1] - 730))
+    best_dist = abs(ranked[0][1] - 730)
+    near = [x for x in ranked
+            if abs(x[1] - 730) <= best_dist + s["leap_exp_dte_slack"]
+            ][:s["leap_exp_max_probe"]]
+    exp, dte = near[0]
+    if len(near) == 1:
+        return exp, dte, None
+    depth = _chain_depth(cc, exp)
+    for alt_exp, alt_dte in near[1:]:
+        alt_depth = _chain_depth(cc, alt_exp)
+        if alt_depth > 0 and alt_depth >= max(depth, 1) * s["leap_exp_depth_ratio"]:
+            return alt_exp, alt_dte, (
+                f"{exp} ({dte}DTE) 更接近 730 但整条链 OI 仅 {depth} — "
+                f"周期新上市, 改用 {alt_exp} ({alt_dte}DTE, 链 OI {alt_depth})")
+    return exp, dte, None
+
+
 def leap_ticket(cc: ChainCache, spot: float, cfg: dict,
                 earnings_iso: str | None, s: dict) -> dict | None:
     """Deep-ITM LEAP call per the playbook: 450-1100 DTE (Jan cycle
@@ -1841,10 +1895,12 @@ def leap_ticket(cc: ChainCache, spot: float, cfg: dict,
     spot. Earnings inside the buffer is a hard gate (剧本: 默认财报后入场),
     not a footnote.
 
-    **两级 OI, 别混**: `leap_hard_min_oi` (50) 是可成交地板, 在挑票之前剔除
-    候选, 软回落救不回来 —— 买不到的合约不该出现在动作项里。`leap_min_oi`
-    (500) 是流动性质量线, 属于下面 passes() 的软门: 不过就带旗标照出, 由人
-    判断。BE% 同为软门。"""
+    **全部是软门**: 不过滤就带旗标照出, 由人判断 —— 没有哪一条会替人拒单。
+    唯一的硬门是财报缓冲。低 OI 的代价在平仓端 (无二级市场深度), 能不能成交
+    看的是价差; 两者别混。
+
+    到期的选法不只是"最接近 730 DTE": 新上市的 LEAP 周期整条链 OI 接近 0,
+    而它可能恰好更接近 730 —— 见 `_pick_leap_expiry`。"""
     days_to_earnings = None
     if earnings_iso:
         days_to_earnings = (date.fromisoformat(earnings_iso)
@@ -1860,7 +1916,7 @@ def leap_ticket(cc: ChainCache, spot: float, cfg: dict,
         return {"skip_reason": f"无 {lo}-{hi} DTE 到期日 (标的可能没有 LEAP)"}
     jan = [(e, d) for e, d in cands_exp if e[5:7] == "01"]
     pool = jan or cands_exp
-    exp, dte = min(pool, key=lambda x: abs(x[1] - 730))
+    exp, dte, exp_note = _pick_leap_expiry(cc, pool, s)
 
     dlo, dhi = (s["leap_delta_index"] if cfg["kind"] == "index"
                 else s["leap_delta_stock"])
@@ -1902,17 +1958,6 @@ def leap_ticket(cc: ChainCache, spot: float, cfg: dict,
     if not rows:
         return {"skip_reason": f"{exp} 无可用 ITM call 报价"}
 
-    # 可成交地板: 在挑票之前剔除, 不是挑完再加 note —— 下面的 `clean or rows`
-    # 软回落会把"全都不过滤"的情况拉回全体候选, 只有在这里先剔干净, OI=1 这种
-    # 买不到的合约才不可能被选中 (2026-09-21 TSM 340C 就是这么发出去的)。
-    tradable = [c for c in rows if c["oi"] >= s["leap_hard_min_oi"]]
-    if not tradable:
-        best = max(rows, key=lambda c: c["oi"])
-        return {"skip_reason": (
-            f"{exp} 无可成交合约 — 最厚的一档 OI 也只有 {best['oi']} < "
-            f"{s['leap_hard_min_oi']} (买不到的票不出动作项)")}
-    rows = tradable
-
     def passes(c):
         return (dlo <= c["delta"] <= dhi and c["oi"] >= s["leap_min_oi"]
                 and (c["extrinsic_pct"] is None
@@ -1924,10 +1969,17 @@ def leap_ticket(cc: ChainCache, spot: float, cfg: dict,
     clean = [c for c in rows if passes(c)]
     pick = min(clean or rows, key=lambda c: abs(c["delta"] - target))
     notes = []
+    if exp_note:
+        notes.append(exp_note)
     if not clean:
         notes.append("无合约同时满足 delta带/OI/价差/外在价值/BE% 全部过滤 — 取最接近目标 delta 的, 自查旗标")
     if pick["oi"] < s["leap_min_oi"]:
-        notes.append(f"OI {pick['oi']} < {s['leap_min_oi']}")
+        # 低 OI 的后果是**平仓端**的, 不是开仓端: 价差 (上面那条) 才说明现在
+        # 能不能成交。所以这里只说清楚代价, 不替人拒单。
+        notes.append(
+            f"OI {pick['oi']} < {s['leap_min_oi']} — "
+            + ("几乎无二级市场, 早期平仓大概率只能对做市商, 成本按 ask 估不是 mid"
+               if pick["oi"] < s["leap_thin_oi"] else "流动性弱, 挂 mid 磨"))
     if pick["be_pct"] > s["leap_max_be_pct"]:
         notes.append(
             f"到盈亏平衡 {pick['be_pct']:+.1f}% > {s['leap_max_be_pct']:g}% — "

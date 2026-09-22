@@ -2672,6 +2672,22 @@ class TestReviewBackfill(unittest.TestCase):
         # 缺字段不该凭空报警
         self.assertEqual(review.leap_flags({}), "—")
 
+    def test_spread_flagged_and_read_apart_from_oi(self):
+        """价差才是"当下能不能成交"的直接证据, OI 量的是已累积持仓。
+
+        2026-09-21 的真实数据: TSM OI=1 但价差 2.0% (做市商在真报价),
+        同日 COHR OI=97 价差 5.7%。把 OI 当可成交性读会把这两张判反 ——
+        这正是第一版 OI 硬拦被证伪的那组数。"""
+        import review
+        tsm = review.leap_flags({"oi": 1, "spread_pct": 2.0,
+                                 "extrinsic_pct": 40.0, "be_pct_at_rec": 0.161})
+        cohr = review.leap_flags({"oi": 97, "spread_pct": 5.7,
+                                  "extrinsic_pct": 47.0, "be_pct_at_rec": 0.210})
+        self.assertIn("OI1", tsm)
+        self.assertNotIn("价差", tsm)        # 2.0% 没踩线
+        self.assertIn("价差5.7%", cohr)      # 报价更松的是它
+        self.assertEqual(review.leap_flags({"oi": 3567, "spread_pct": 2.3}), "—")
+
     def test_manual_reports_tagged_not_dropped(self):
         """手工跑的票当时真推荐过, 收进来但打标签 —— 采样偏差要可分离。"""
         with tempfile.TemporaryDirectory() as td:
@@ -3286,22 +3302,22 @@ class TestOpenCspDelta(unittest.TestCase):
         self.assertNotIn("入手", [h for h, _, _ in review.OPEN_CSP_HDR])
 
 
-class TestLeapTradabilityFloor(unittest.TestCase):
-    """OI 硬拦 + BE% 软门 (2026-09-22)。
+class TestLeapExpiryMaturity(unittest.TestCase):
+    """到期周期成熟度 + OI/BE% 软门 (2026-09-22, 09-23 改正)。
 
-    起因是 2026-09-21 的 TSM 340C: OI=1 —— 字面上买不到, 却作为 🟢 动作项
-    发了出去。根因是 `pick = min(clean or rows, ...)` 的软回落会在没有合约
-    全过时退回全体候选, 只追加一条 note。
+    起因是 2026-09-21 的 TSM 2029-01-19 340C: OI=1, 作为 🟢 动作项发了出去。
+    第一版据此设了"OI 可成交地板"硬拦 —— **被同一天的数据证伪**: 那张的双边
+    价差只有 2.0% (当天八张 LEAP 里最窄), 做市商在真报价; 而 OI=97 放行的
+    COHR 价差反而 5.7%。OI 量的是已累积持仓, 不是当下能不能成交。
 
-    所以这里的断言分两类, 别混:
-    - `leap_hard_min_oi` 在**挑票之前**剔候选 -> 软回落救不回来 (硬)
-    - `leap_min_oi` / BE% 只在 passes() 里 -> 不过就带旗标照出 (软)
+    真正的根因是**到期选错了**: |851-730| < |487-730|, 扫描器在 2029 周期
+    上市当天就跳了过去, 而成熟的 2028 链就在旁边。所以改成按链的成熟度让位,
+    OI/价差/BE% 一律留在 passes() 里做软门 + 旗标。
     """
 
     EXP, DTE = "2028-01-21", 486
 
-    def _cc(self, spot=100.0, sigma=0.35, oi=3000, exp=None, dte=None):
-        exp, dte = exp or self.EXP, dte or self.DTE
+    def _calls(self, spot, sigma, oi, dte):
         T = dte / 365.0
         traded = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=1)
         rows = []
@@ -3311,58 +3327,79 @@ class TestLeapTradabilityFloor(unittest.TestCase):
             half = max(px * 0.005, 0.005)
             rows.append({"strike": k, "lastPrice": px, "lastTradeDate": traded,
                          "openInterest": oi, "bid": px - half, "ask": px + half})
-        calls = pd.DataFrame(rows)
-        return _FakeCC(_FakeChain(calls, pd.DataFrame([])),
+        return pd.DataFrame(rows)
+
+    def _cc(self, spot=100.0, sigma=0.35, oi=3000, exp=None, dte=None):
+        exp, dte = exp or self.EXP, dte or self.DTE
+        return _FakeCC(_FakeChain(self._calls(spot, sigma, oi, dte),
+                                  pd.DataFrame([])),
                        expiries=[(exp, dte)])
+
+    def _multi_cc(self, chains, spot=100.0, sigma=0.35):
+        """chains: [(exp, dte, 每档 OI)] —— 每个到期一条独立的链。"""
+        by_exp = {e: _FakeChain(self._calls(spot, sigma, oi, d), pd.DataFrame([]))
+                  for e, d, oi in chains}
+
+        class _MultiCC:
+            def expiries(_self):
+                return [(e, d) for e, d, _ in chains]
+
+            def chain(_self, exp):
+                return by_exp[exp]
+
+        return _MultiCC()
 
     def _cfg(self):
         return {"kind": "stock", "high_beta": False}
 
-    def test_unfillable_chain_skips_instead_of_picking(self):
-        # 全链 OI=1: 软回落原本会照样挑一张发出去 (TSM 340C 就是这么来的)
-        t = sc.leap_ticket(self._cc(oi=1), 100.0, self._cfg(), None,
-                           sc.SETTINGS_DEFAULTS)
-        self.assertIn("skip_reason", t)
-        self.assertIn("无可成交合约", t["skip_reason"])
-        self.assertIn("OI 也只有 1", t["skip_reason"])
+    def test_fresh_cycle_yields_to_the_mature_one(self):
+        """TSM 2026-09-21 的复现: 851 天那条更接近 730, 但整条链几乎是空的。"""
+        cc = self._multi_cc([("2029-01-19", 851, 1),      # 刚上市
+                             ("2028-01-21", 487, 3000)])  # 成熟
+        t = sc.leap_ticket(cc, 100.0, self._cfg(), None, sc.SETTINGS_DEFAULTS)
+        self.assertNotIn("skip_reason", t)
+        self.assertEqual(t["exp"], "2028-01-21")          # 让位给成熟的
+        self.assertTrue(any("周期新上市" in n for n in t["notes"]))
 
-    def _oi_of(self, cc, strike):
-        calls = cc.chain(self.EXP).calls
-        return int(calls.loc[calls["strike"] == strike, "openInterest"].iloc[0])
+    def test_two_mature_cycles_keep_the_730_preference(self):
+        """两条都成熟时厚度差不到一个量级 —— 这条规则不该咬合, 730 偏好照旧。
 
-    def _thin(self, cc, strike, oi=1):
-        calls = cc.chain(self.EXP).calls
-        calls.loc[calls["strike"] == strike, "openInterest"] = oi
-        return cc
+        (少了这条断言, 把 ratio 设成 1 也是绿的, 等于按 OI 总量选到期。)"""
+        cc = self._multi_cc([("2029-01-19", 851, 3000),
+                             ("2028-01-21", 487, 9000)])   # 厚 3 倍, 不到 10
+        t = sc.leap_ticket(cc, 100.0, self._cfg(), None, sc.SETTINGS_DEFAULTS)
+        self.assertEqual(t["exp"], "2029-01-19")           # 仍按距离 730 选
+        self.assertFalse(any("周期新上市" in n for n in t["notes"]))
 
-    def test_floor_survives_the_soft_fallback(self):
-        """本次改动的要害, 分三步自证 (不是断言"选中的那张 OI 够" —— 那条
-        在软门下也成立, 会绿得毫无信息)。
+    def test_far_mature_cycle_outside_slack_is_not_considered(self):
+        """让位只在 slack 窗口内发生 —— 否则会为了链厚跑到 DTE 带的另一头。"""
+        s = dict(sc.SETTINGS_DEFAULTS, leap_exp_dte_slack=50)
+        cc = self._multi_cc([("2029-01-19", 851, 1),
+                             ("2028-01-21", 487, 3000)])   # 距离差 122 > 50
+        t = sc.leap_ticket(cc, 100.0, self._cfg(), None, s)
+        self.assertEqual(t["exp"], "2029-01-19")
+        self.assertEqual(t["oi"], 1)                       # 空链照出, 只带旗标
 
-        把 leap_min_oi 顶到没有合约能过, 强制走 `clean or rows` 回落;
-        再把回落会选中的那一档打成 OI=1。地板关掉 = 照样选它 (旧行为,
-        TSM 340C 的复现); 地板打开 = 换一张且 OI 够。"""
-        no_floor = dict(sc.SETTINGS_DEFAULTS, leap_min_oi=99999,
-                        leap_hard_min_oi=0)
-        with_floor = dict(no_floor, leap_hard_min_oi=50)
+    def test_low_oi_is_a_note_about_exit_not_a_reject(self):
+        """OI 低不再拒单 —— 第一版的硬拦被 2.0% 价差那组数据证伪。
 
-        # ① 回落会选中哪一档
-        picked = sc.leap_ticket(self._cc(), 100.0, self._cfg(), None,
-                                no_floor)["strike"]
+        措辞也要对: 代价在**平仓端**, 不是"买不到"。"""
+        cc = self._multi_cc([("2029-01-19", 851, 1)])
+        t = sc.leap_ticket(cc, 100.0, self._cfg(), None, sc.SETTINGS_DEFAULTS)
+        self.assertNotIn("skip_reason", t)                 # 照出票
+        self.assertEqual(t["oi"], 1)
+        note = next(n for n in t["notes"] if n.startswith("OI "))
+        self.assertIn("平仓", note)
+        self.assertIn("ask", note)                         # 成本按 ask 估
+        self.assertNotIn("买不到", note)
 
-        # ② 地板关掉: 把它打成 OI=1, 回落照样把它捞回来 = 旧行为复现
-        old = sc.leap_ticket(self._thin(self._cc(), picked), 100.0,
-                             self._cfg(), None, no_floor)
-        self.assertEqual(old["strike"], picked)
-        self.assertEqual(old["oi"], 1)          # 买不到的票进了动作项
-
-        # ③ 地板打开: 同一条链, 换一张, 且真的可成交
-        cc = self._thin(self._cc(), picked)
-        new = sc.leap_ticket(cc, 100.0, self._cfg(), None, with_floor)
-        self.assertNotIn("skip_reason", new)
-        self.assertNotEqual(new["strike"], picked)
-        self.assertGreaterEqual(new["oi"], with_floor["leap_hard_min_oi"])
-        self.assertTrue(any("OI" in n for n in new["notes"]))  # 软门仍发旗标
+    def test_thin_wording_only_below_the_thin_line(self):
+        # OI 300 < 500 但远高于 50: 是"流动性弱", 不是"几乎无二级市场"
+        cc = self._multi_cc([("2029-01-19", 851, 300)])
+        t = sc.leap_ticket(cc, 100.0, self._cfg(), None, sc.SETTINGS_DEFAULTS)
+        note = next(n for n in t["notes"] if n.startswith("OI "))
+        self.assertIn("流动性弱", note)
+        self.assertNotIn("无二级市场", note)
 
     def test_be_gate_shifts_the_pick_deeper(self):
         """BE% 进 passes() 的**行为**证据 (光断言旗标存在测不到这条 ——

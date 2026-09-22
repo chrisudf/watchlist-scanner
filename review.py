@@ -88,6 +88,10 @@ BE_RE = re.compile(r"BE ([\d.]+) \(([+-][\d.]+)%\)")
 # 进而算今天的 delta —— 那才是"该不该 roll"的判据。
 CUSH_RE = re.compile(r"缓冲 ([\d.]+)%")
 EXT_RE = re.compile(r"外在 (\d+)%")
+# 价差才是"当下能不能成交"的直接证据 —— OI 量的是已累积持仓。2026-09-21
+# 的 TSM 2029 340C 是 OI=1 但价差 2.0% (做市商在真报价), 同日 OI=97 的
+# COHR 价差 5.7%。两列都摆出来, 免得把 OI 当成可成交性读。
+SPREAD_RE = re.compile(r"价差 ([\d.]+)%")
 
 
 def backfill_rows(reports_dir: Path) -> list[dict]:
@@ -133,6 +137,7 @@ def backfill_rows(reports_dir: Path) -> list[dict]:
             tail = txt[mm.end():mm.end() + 220]
             oi, civ = OI_RE.search(tail), CIV_RE.search(tail)
             be, ext = BE_RE.search(tail), EXT_RE.search(tail)
+            spr = SPREAD_RE.search(tail)
             be_pct = float(be.group(2)) / 100 if be else None
             # BE = spot × (1 + pct) => spot = BE / (1 + pct)
             spot = (float(be.group(1)) / (1 + be_pct)
@@ -145,6 +150,7 @@ def backfill_rows(reports_dir: Path) -> list[dict]:
                 "oi": int(oi.group(1)) if oi else None,
                 "iv": (int(civ.group(1)) / 100) if civ else None,
                 "extrinsic_pct": float(ext.group(1)) if ext else None,
+                "spread_pct": float(spr.group(1)) if spr else None,
                 "be_pct_at_rec": be_pct,
                 "spot_at_rec": round(spot, 2) if spot else None,
                 "source": "backfill",
@@ -483,7 +489,8 @@ LEAP_HDR = [("标的", 6, False), ("入手", 11, False), ("到期", 11, False),
 # 是 moomoo 筛选器的口径, 扫描器的 passes() 里**没有**这一项)。
 # 复盘要能看出"这张票当初是不是踩线发的" —— 扫描器在没有合约全过滤时会
 # 回落到 clean or rows 并只加一条 note, 而那条 note 没进流水账的表格。
-LEAP_GATES = {"oi": 500, "extrinsic_pct": 40.0, "be_pct": 0.12}
+LEAP_GATES = {"oi": 500, "extrinsic_pct": 40.0, "be_pct": 0.12,
+              "spread_pct": 5.0}
 
 
 def leap_flags(r: dict) -> str:
@@ -498,6 +505,9 @@ def leap_flags(r: dict) -> str:
     be = r.get("be_pct_at_rec")
     if be is not None and be > LEAP_GATES["be_pct"]:
         f.append(f"BE{be:+.0%}")
+    sp = r.get("spread_pct")
+    if sp is not None and sp > LEAP_GATES["spread_pct"]:
+        f.append(f"价差{sp:.1f}%")
     return "⚠ " + " ".join(f) if f else "—"
 
 ASSIGNED_HDR = [("标的", 6, False), ("入手", 11, False), ("到期", 11, False),
