@@ -78,6 +78,16 @@ DATE_RE = re.compile(r"(\d{4}-\d\d-\d\d)")
 # 行尾的可选字段: 有就取, 没有就算了 (格式随版本演进过, 老报告可能缺)
 OI_RE = re.compile(r"OI (\d+)")
 CIV_RE = re.compile(r"合约 IV (\d+)%")
+# LEAP 行尾的 "BE 249.55 (+11.4%)" —— 有了它就能反解当时的现价:
+# spot = BE / (1 + pct)。此前回填的 LEAP 一律没有 spot_at_rec, 于是报表里
+# "入手价"和"正股涨跌"全是 —, 而**到盈亏平衡点的百分比正是筛选器的门槛**
+# (moomoo 的 LEAP 筛选器: 到盈亏平衡点 0~12%), 缺了它看不出票合不合规。
+BE_RE = re.compile(r"BE ([\d.]+) \(([+-][\d.]+)%\)")
+# CSP 行的 "缓冲 17.7%" = (现价 − 行权价)/现价 => 现价 = 行权价/(1−缓冲)。
+# CSP 行不带 IV, 但有了入手现价就能从入手 delta 反推当时的 σ (见 iv_from_delta),
+# 进而算今天的 delta —— 那才是"该不该 roll"的判据。
+CUSH_RE = re.compile(r"缓冲 ([\d.]+)%")
+EXT_RE = re.compile(r"外在 (\d+)%")
 
 
 def backfill_rows(reports_dir: Path) -> list[dict]:
@@ -104,6 +114,10 @@ def backfill_rows(reports_dir: Path) -> list[dict]:
         run_type = "manual" if "-manual" in f.name else "auto"
         txt = f.read_text(encoding="utf-8", errors="ignore")
         for mm in CSP_RE.finditer(txt):
+            _cm = CUSH_RE.search(txt[mm.end():mm.end() + 180])
+            _cush = float(_cm.group(1)) if _cm else None
+            _spot = (round(float(mm["strike"]) / (1 - _cush / 100), 2)
+                     if _cush is not None and _cush < 100 else None)
             rows.append({
                 "date": d, "mode": "close", "symbol": mm["sym"], "kind": "csp",
                 "action": "SELL_PUT", "exp": mm["exp"],
@@ -111,12 +125,18 @@ def backfill_rows(reports_dir: Path) -> list[dict]:
                 "delta": float(mm["delta"]), "dte": int(mm["dte"]),
                 "panic_mode": mm["tag"].startswith("恐慌"),
                 "breakeven": round(float(mm["strike"]) - float(mm["mid"]), 4),
-                "spot_at_rec": None, "source": "backfill",
+                "cushion_pct": _cush,
+                "spot_at_rec": _spot, "source": "backfill",
                 "run_type": run_type, "source_file": f.name, "notes": [],
             })
         for mm in LEAP_RE.finditer(txt):
             tail = txt[mm.end():mm.end() + 220]
             oi, civ = OI_RE.search(tail), CIV_RE.search(tail)
+            be, ext = BE_RE.search(tail), EXT_RE.search(tail)
+            be_pct = float(be.group(2)) / 100 if be else None
+            # BE = spot × (1 + pct) => spot = BE / (1 + pct)
+            spot = (float(be.group(1)) / (1 + be_pct)
+                    if be and be_pct is not None and be_pct > -1 else None)
             rows.append({
                 "date": d, "mode": "close", "symbol": mm["sym"], "kind": "leap",
                 "action": "BUY_CALL", "exp": mm["exp"],
@@ -124,10 +144,70 @@ def backfill_rows(reports_dir: Path) -> list[dict]:
                 "delta": float(mm["delta"]),
                 "oi": int(oi.group(1)) if oi else None,
                 "iv": (int(civ.group(1)) / 100) if civ else None,
-                "spot_at_rec": None, "source": "backfill",
+                "extrinsic_pct": float(ext.group(1)) if ext else None,
+                "be_pct_at_rec": be_pct,
+                "spot_at_rec": round(spot, 2) if spot else None,
+                "source": "backfill",
                 "run_type": run_type, "source_file": f.name, "notes": [],
             })
     return rows
+
+
+def iv_from_delta(spot, strike, T, target_delta, is_call=False):
+    """由已知的 delta 反推当时的隐含波动率 (对 σ 二分)。
+
+    CSP 的报告行不记 IV, 只记 delta/DTE/缓冲。缓冲能还原入手现价, 于是
+    (现价, 行权价, 期限, delta) 四个已知量足以反解 σ。用 scanner 自己的
+    bs_delta, 不重写。
+
+    ⚠️ **|delta| 对 σ 并不单调** (最初的注释把这句写反了, 被测试抓出来):
+    σ→∞ 时 d1 → σ√T/2 → ∞, N(d1) → 1, 于是 OTM put 的 |delta| = 1−N(d1) → 0。
+    它先升后降, 有个峰。实测 103.23/85P/23天 的峰只到 ~0.26 (σ≈2.5-3)。
+
+    这对本函数有两个后果, 都是想要的:
+      - 二分从 lo=1e-3 出发, 收敛到**较低**那个根 —— 也就是现实那一支
+        (股票 σ 通常 <1.5, 那段确实单调递增)。
+      - 目标高于峰值时 (那个 moneyness/期限下物理上到不了), 每次都 d<target,
+        lo 一路推到上界, 被 0.01<iv<4.9 的护栏挡下返回 None。**宁可返回
+        算不出, 不要返回一个假的 σ。**
+    """
+    if not all(x and x > 0 for x in (spot, strike, T)) or not target_delta:
+        return None
+    lo, hi = 1e-3, 5.0
+    for _ in range(80):
+        mid = (lo + hi) / 2
+        d = abs(sc.bs_delta(spot, strike, T, sc.RATE, mid, is_call))
+        if d < target_delta:
+            lo = mid
+        else:
+            hi = mid
+    iv = (lo + hi) / 2
+    return iv if 0.01 < iv < 4.9 else None
+
+
+def current_put_delta(r: dict, last_px, dte_left):
+    """在途空头 put 的**当前** |delta| -> float|None。
+
+    为什么要它: 缓冲不含时间与波动率。5% 缓冲剩 2 天 ≈ delta 0.05 (没事),
+    5% 缓冲剩 30 天的高波动票 ≈ delta 0.35 (该管理)。delta ≈ 到期 ITM 概率,
+    而剧本的入场是 delta 0.10-0.15 —— 翻到 0.30 就是"这笔明显走反了"的
+    尺度无关信号, 也是通行的 roll/管理触发线。
+
+    σ 的来源按可得性退化: 流水账里的合约 IV (scan 行有) > 从入手 delta 反解
+    (回填行, 靠缓冲还原的入手现价) > 算不出。
+    **假设 IV 不变** —— 而空头 put 走反时 IV 通常上行, 所以这个模型 delta
+    偏低、触发偏晚。宁可晚报不要早报, 但读的时候要知道方向。
+    """
+    k, T = r.get("strike"), (dte_left / 365 if dte_left else None)
+    if not (k and T and T > 0 and last_px):
+        return None
+    iv = r.get("iv")
+    if iv is None:
+        iv = iv_from_delta(r.get("spot_at_rec"), k,
+                           (r.get("dte") or 0) / 365, r.get("delta"))
+    if not iv:
+        return None
+    return abs(sc.bs_delta(last_px, k, T, sc.RATE, iv, False))
 
 
 # ---------------------------------------------------------------- 结算
@@ -175,6 +255,19 @@ def resolve(rows: list[dict], today: date) -> list[dict]:
                 # 未到期也给一个"此刻在不在行权价上方", 方便看盘中风险
                 if r["last_px"] is not None and r.get("strike"):
                     r["itm_now"] = r["last_px"] <= r["strike"]
+                    # 缓冲 = 现价还要跌多少才碰行权价。这是在途空头 put 唯一
+                    # 真正要盯的数 —— delta/年化都是开仓时的事, 开完就不变了
+                    r["cushion_now"] = r["last_px"] / r["strike"] - 1
+                    r["delta_now"] = current_put_delta(
+                        r, r["last_px"], r["dte_left"])
+                # 已走过的路径 (已结算那支 min_close_in_window 的在途版本)
+                if ser is not None:
+                    win = ser[[i for i in ser.index
+                               if date.fromisoformat(r["date"]) <= i <= today]]
+                    if len(win):
+                        r["min_close_so_far"] = round(float(win.min()), 4)
+                        if r.get("strike"):
+                            r["breached"] = bool(float(win.min()) <= r["strike"])
             elif ser is None:
                 r["status"] = "unresolved_no_price"
             else:
@@ -382,13 +475,102 @@ def _num(v, fmt="{:.2f}"):
 # 两处各写一遍列定义就会漂移, 这是 compute_stats 同源化的同一条理由。
 LEAP_HDR = [("标的", 6, False), ("入手", 11, False), ("到期", 11, False),
             ("行权价", 8, True), ("入手价", 8, True), ("权利金", 8, True),
-            ("盈亏平衡", 9, True), ("最新价", 8, True), ("正股涨跌", 9, True),
-            ("状态", 12, False), ("剩余", 7, True)]
+            ("盈亏平衡", 9, True), ("BE%入手", 8, True), ("最新价", 8, True),
+            ("正股涨跌", 9, True), ("状态", 12, False), ("旗标", 16, False),
+            ("剩余", 7, True)]
+
+# 开仓门槛 (与 watchlist.toml [settings] 的 leap_* 同源; 到盈亏平衡点那条
+# 是 moomoo 筛选器的口径, 扫描器的 passes() 里**没有**这一项)。
+# 复盘要能看出"这张票当初是不是踩线发的" —— 扫描器在没有合约全过滤时会
+# 回落到 clean or rows 并只加一条 note, 而那条 note 没进流水账的表格。
+LEAP_GATES = {"oi": 500, "extrinsic_pct": 40.0, "be_pct": 0.12}
+
+
+def leap_flags(r: dict) -> str:
+    """开仓时踩了哪些门槛 -> 短标记串 (空 = 干净)。"""
+    f = []
+    oi = r.get("oi")
+    if oi is not None and oi < LEAP_GATES["oi"]:
+        f.append(f"OI{oi}")
+    ex = r.get("extrinsic_pct")
+    if ex is not None and ex > LEAP_GATES["extrinsic_pct"]:
+        f.append(f"外在{ex:.0f}%")
+    be = r.get("be_pct_at_rec")
+    if be is not None and be > LEAP_GATES["be_pct"]:
+        f.append(f"BE{be:+.0%}")
+    return "⚠ " + " ".join(f) if f else "—"
 
 ASSIGNED_HDR = [("标的", 6, False), ("入手", 11, False), ("到期", 11, False),
                 ("行权价", 8, True), ("权利金", 8, True), ("盈亏平衡", 9, True),
                 ("到期收盘", 9, True), ("落价幅度", 9, True),
                 ("持有期最低", 11, True), ("每股结果", 9, True)]
+
+
+OPEN_CSP_HDR = [("标的", 6, False), ("开仓日期", 11, False), ("到期", 11, False),
+                ("剩余", 6, True), ("行权价", 8, True), ("权利金", 8, True),
+                ("盈亏平衡", 9, True), ("最新价", 8, True), ("缓冲", 8, True),
+                ("Δ开仓", 7, True), ("Δ当前", 7, True),
+                ("持有期最低", 11, True), ("状态", 14, False)]
+
+# 在途空头 put 的管理线。**用 delta 不用缓冲**: 缓冲不含时间与波动率 ——
+# 5% 缓冲剩 2 天 ≈ delta 0.05 (没事), 5% 缓冲剩 30 天的高波动票 ≈ delta 0.35
+# (该管理)。delta ≈ 到期 ITM 概率, 而剧本入场是 0.10-0.15, 翻到 0.30 就是
+# 尺度无关的"明显走反了", 也是通行的 roll 触发线。
+# 算不出 delta 时 (缺 IV 且反解不出) 退回缓冲 5%, 状态里标 "?" 说明是降级判据。
+DELTA_MANAGE = 0.30
+DELTA_WATCH = 0.20
+CUSHION_FALLBACK = 0.05
+
+
+def open_csp_cells(openc: list[dict]) -> list[list[str]]:
+    """在途 CSP 明细 (纯函数)。
+
+    此前这些只汇总成一行"当前已在行权价下方 N 笔" —— 看不到是哪几笔、离到期
+    还有多久、离行权价还有多远。而在途空头 put 真正要盯的就是**缓冲**
+    (现价还要跌多少才碰行权价): delta 与年化都是开仓那一刻的事, 开完就不再变,
+    缓冲是每天都在动的那个。
+
+    按缓冲升序 = 最危险的排最前 (与 LEAP/被行权表同一条截断策略: 排序决定
+    截断时留下谁)。"曾破位"与"当前已破"分开 —— 中途探过行权价又拉回来的,
+    和现在正压在下面的, 是两种处境。
+    """
+    def _rank(r):
+        """最该管的排最前: 有 delta 用 delta 降序, 没有退回缓冲升序。"""
+        dn = r.get("delta_now")
+        if dn is not None:
+            return (0, -dn)
+        c = r.get("cushion_now")
+        return (1, c) if c is not None else (2, 0.0)
+
+    out = []
+    for r in sorted(openc, key=lambda x: (_rank(x), x.get("symbol") or "",
+                                          x.get("date") or "")):
+        k, mid, last = r.get("strike"), r.get("mid"), r.get("last_px")
+        be = r.get("breakeven")
+        if be is None and k is not None:
+            be = k - (mid or 0)
+        c, dn = r.get("cushion_now"), r.get("delta_now")
+        if last is None:
+            st = "无价格"
+        elif r.get("itm_now"):
+            st = "⚠ 已破行权价"
+        elif dn is not None and dn >= DELTA_MANAGE:
+            st = f"⚠ Δ{dn:.2f} 该管理"
+        elif dn is not None and dn >= DELTA_WATCH:
+            st = f"注意 Δ{dn:.2f}"
+        elif dn is None and c is not None and c < CUSHION_FALLBACK:
+            st = "接近 (<5%)?"          # ? = 算不出 delta, 用缓冲降级判的
+        elif r.get("breached"):
+            st = "曾破位"
+        else:
+            st = "安全"
+        out.append([
+            r.get("symbol") or "—", r.get("date") or "—", r.get("exp") or "—",
+            f"{r['dte_left']}天" if r.get("dte_left") is not None else "—",
+            _num(k, "{:g}"), _num(mid), _num(be), _num(last),
+            _num(c, "{:+.1%}"), _num(r.get("delta"), "{:.2f}"),
+            _num(dn, "{:.2f}"), _num(r.get("min_close_so_far")), st])
+    return out
 
 
 def leap_cells(leap: list[dict]) -> list[list[str]]:
@@ -427,7 +609,8 @@ def leap_cells(leap: list[dict]) -> list[list[str]]:
         out.append([
             r["symbol"], r["date"], r.get("exp") or "—",
             _num(k, "{:g}"), _num(r.get("spot_at_rec")), _num(mid), _num(be),
-            _num(last), _num(ret, "{:+.1%}"), st,
+            _num(r.get("be_pct_at_rec"), "{:+.1%}"),
+            _num(last), _num(ret, "{:+.1%}"), st, leap_flags(r),
             f"{r['dte_left']}天" if r.get("dte_left") is not None else "—"])
     return out
 
@@ -475,6 +658,15 @@ def _capped(cells, limit=MAX_TABLE_ROWS):
     if limit is None or len(cells) <= limit:
         return cells, 0
     return cells[:limit], len(cells) - limit
+
+
+def open_csp_table(openc: list[dict], limit=MAX_TABLE_ROWS) -> list[str]:
+    """在途 CSP 明细 (纯文本)。"""
+    cells, more = _capped(open_csp_cells(openc), limit)
+    out = _table_text(OPEN_CSP_HDR, cells)
+    if more:
+        out.append(f"  (另有 {more} 笔缓冲更厚的未列出)")
+    return out
 
 
 def leap_table(leap: list[dict], limit=MAX_TABLE_ROWS) -> list[str]:
@@ -660,6 +852,8 @@ def summarize(res: list[dict]) -> str:
     if openc:
         L.append(f"  未到期 {len(openc)} 笔, 其中当前已在行权价下方 "
                  f"{st['open_itm']} 笔")
+        L.append("")
+        L += open_csp_table(openc)
     if st["assigned_cells"]:
         L.append("")
         L.append(f"  被行权明细 ({len(st['assigned_cells'])} 笔) —— "
@@ -751,8 +945,20 @@ def summarize_md(res: list[dict], title="推荐复盘") -> str:
     else:
         M += ["", "**还没有到期的 CSP —— 胜率要等第一批到期后才有意义。**"]
     if openc:
-        M += ["", f"未到期 {len(openc)} 笔，其中当前已在行权价下方 "
-                  f"{st['open_itm']} 笔。"]
+        M += ["", f"### 在途 {len(openc)} 笔", "",
+              f"当前已在行权价下方 **{st['open_itm']}** 笔。按**当前 delta** 降序 "
+              f"—— 最该管的排最前。管理线 Δ≥{DELTA_MANAGE:.2f}（≈到期 ITM 概率；"
+              f"剧本入场是 0.10-0.15，翻到 {DELTA_MANAGE:.2f} 就是明显走反了，"
+              "也是通行的 roll 触发线），关注线 "
+              f"Δ≥{DELTA_WATCH:.2f}。", "",
+              "> Δ当前是**模型值**：σ 取流水账里的合约 IV，回填行则由开仓 delta "
+              "反解（缓冲%还原开仓现价）。**假设 IV 不变** —— 空头 put 走反时 IV "
+              "通常上行，所以这个 delta 偏低、触发偏晚。算不出 delta 的行退回"
+              "缓冲 5%，状态带 `?` 标注。", ""]
+        _c, _more = _capped(open_csp_cells(openc))
+        M += _table_md(OPEN_CSP_HDR, _c)
+        if _more:
+            M += ["", f"另有 **{_more}** 笔缓冲更厚的未列出。"]
     if st["assigned_cells"]:
         M += ["", f"### 被行权明细（{len(st['assigned_cells'])} 笔）", "",
               "作废的单子没什么可看 —— 权利金全收，按设计发生。**被行权的才带"
