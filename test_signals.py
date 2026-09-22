@@ -8,6 +8,7 @@ No network access needed — everything here is synthetic data.
 import io
 import json
 import math
+import re
 import tempfile
 import unittest
 from datetime import date, datetime, timedelta
@@ -2523,6 +2524,520 @@ class TestWatchdogExpectation(unittest.TestCase):
         with self._tape(pd.DataFrame()):
             with self.assertRaises(RuntimeError):
                 sc.last_session_bar("2026-09-04")
+
+
+
+class TestRecommendationJournal(unittest.TestCase):
+    """推荐流水账 (复盘用): 摊平 / 去重 / 回写。"""
+
+    def _res(self, **over):
+        r = {"symbol": "NVDA", "error": None, "state": "WATCH",
+             "tech": {"close": 200.0}, "earnings": "2026-11-19", "iv30": 0.45,
+             "cfg": {"value_zone": [185.0, 205.0], "zone_asof": "2026-09-05",
+                     "high_beta": True},
+             "csp": {"exp": "2026-10-16", "strike": 190.0, "mid": 2.4,
+                     "delta": 0.12, "dte": 25, "oi": 900, "spread_pct": 3.0,
+                     "iv": 0.44, "src": "mid", "annualized_pct": 18.4,
+                     "cushion_pct": 5.0, "breakeven": 187.6,
+                     "panic_mode": False, "notes": ["n1"]},
+             "leap": {"exp": "2028-01-21", "strike": 170.0, "mid": 79.55,
+                      "delta": 0.80, "oi": 3567, "iv": 0.52, "notes": []}}
+        r.update(over)
+        return r
+
+    def test_flattens_both_legs(self):
+        rows = sc.journal_rows([self._res()], "2026-09-21", "close",
+                               {"stage": "NORMAL", "vix": 14.3})
+        self.assertEqual([x["kind"] for x in rows], ["csp", "leap"])
+        c = rows[0]
+        self.assertEqual((c["symbol"], c["action"], c["strike"]),
+                         ("NVDA", "SELL_PUT", 190.0))
+        # 快照当时的现价与接货带 —— 事后 zone 会被重锚, 不存就对不回去了
+        self.assertEqual(c["spot_at_rec"], 200.0)
+        self.assertEqual(c["zone"], [185.0, 205.0])
+        self.assertEqual((c["stage"], c["vix"]), ("NORMAL", 14.3))
+
+    def test_skips_non_tickets(self):
+        """skip_reason 的不是推荐, 没开的仓没有表现。"""
+        r = self._res(csp={"skip_reason": "权利金太薄"}, leap=None)
+        self.assertEqual(sc.journal_rows([r], "2026-09-21", "close", {}), [])
+
+    def test_skips_error_and_stale(self):
+        for over in ({"error": "boom"}, {"tech": None}, {"stale_data": True}):
+            self.assertEqual(
+                sc.journal_rows([self._res(**over)], "2026-09-21", "close", {}),
+                [], over)
+
+    def test_dedup_key_same_contract_same_day(self):
+        a = {"date": "2026-09-21", "symbol": "NVDA", "kind": "csp",
+             "exp": "2026-10-16", "strike": 190.0}
+        b = dict(a, mid=9.9)                       # 报价变了仍是同一张票
+        self.assertEqual(sc.journal_key(a), sc.journal_key(b))
+        self.assertNotEqual(sc.journal_key(a), sc.journal_key(dict(a, strike=185.0)))
+        self.assertNotEqual(sc.journal_key(a), sc.journal_key(dict(a, kind="leap")))
+
+    def test_append_is_idempotent(self):
+        """DST 双发 / 看门狗补发重跑同一天, 分母不该被灌水。"""
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "j.jsonl"
+            rows = sc.journal_rows([self._res()], "2026-09-21", "close", {})
+            self.assertEqual(sc.append_journal(rows, f), 2)
+            self.assertEqual(sc.append_journal(rows, f), 0)
+            self.assertEqual(len(sc.load_journal(f)), 2)
+
+    def test_bad_line_does_not_block_append_or_load(self):
+        """JSONL 选型的理由: 一行坏不影响其余行。"""
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "j.jsonl"
+            f.write_text("\n".join(['{"date":"x"}', "NOT JSON", "", ""]),
+                         encoding="utf-8")
+            self.assertEqual(len(sc.load_journal(f)), 1)
+            rows = sc.journal_rows([self._res()], "2026-09-21", "close", {})
+            self.assertEqual(sc.append_journal(rows, f), 2)
+            self.assertEqual(len(sc.load_journal(f)), 3)
+
+    def test_append_empty_is_noop(self):
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "j.jsonl"
+            self.assertEqual(sc.append_journal([], f), 0)
+            self.assertFalse(f.exists())
+            self.assertEqual(sc.load_journal(f), [])
+
+
+class TestReviewBackfill(unittest.TestCase):
+    """从历史 .md 报告反解推荐 —— 有损但能把 droplet 上的历史捞回来。"""
+
+    REPORT = """# 左右侧 watchlist 扫描 — 2026-08-09 尾盘
+
+- **CSP (常规)**: SELL NVDA 2026-09-18 185P @ ~2.35 — delta 0.12, 26DTE, 年化 ~18%, 缓冲 7.5%, BE 182.65, OI 1200, 价差 2%
+- **LEAP**: BUY NVDA 2028-01-21 170C @ ~79.55 — delta 0.80, 外在 32%, λ 2.3x, BE 249.55 (+11.4%), 保险费率 ~7.9%/年, 合约 IV 52%, OI 3567, 价差 2.3%
+- **CSP (恐慌档)**: SELL GLD 2026-08-21 300P @ ~1.10 — delta 0.09, 12DTE, 年化 ~11%, 缓冲 9.0%, BE 298.90, OI 400
+"""
+
+    def _dir(self, td, name="2026-08-09-close.md"):
+        import review
+        (Path(td) / name).write_text(self.REPORT, encoding="utf-8")
+        return review.backfill_rows(Path(td))
+
+    def test_parses_csp_and_leap(self):
+        with tempfile.TemporaryDirectory() as td:
+            rows = self._dir(td)
+        self.assertEqual(len(rows), 3)
+        csp = [r for r in rows if r["kind"] == "csp"]
+        leap = [r for r in rows if r["kind"] == "leap"][0]
+        self.assertEqual({r["symbol"] for r in csp}, {"NVDA", "GLD"})
+        self.assertEqual((leap["strike"], leap["mid"], leap["delta"]),
+                         (170.0, 79.55, 0.80))
+        self.assertEqual((leap["oi"], leap["iv"]), (3567, 0.52))
+        n = [r for r in csp if r["symbol"] == "NVDA"][0]
+        self.assertEqual((n["strike"], n["dte"], n["breakeven"]), (185.0, 26, 182.65))
+        self.assertFalse(n["panic_mode"])
+        self.assertTrue([r for r in csp if r["symbol"] == "GLD"][0]["panic_mode"])
+
+    def test_backfill_is_marked_lossy(self):
+        """回填缺 zone/stage/现价 —— 必须可与 scan 分开, 别混成同一种数据。"""
+        with tempfile.TemporaryDirectory() as td:
+            rows = self._dir(td)
+        for r in rows:
+            self.assertEqual(r["source"], "backfill")
+            self.assertIsNone(r["spot_at_rec"])
+
+    def test_manual_reports_tagged_not_dropped(self):
+        """手工跑的票当时真推荐过, 收进来但打标签 —— 采样偏差要可分离。"""
+        with tempfile.TemporaryDirectory() as td:
+            auto = self._dir(td, "2026-08-09-close.md")
+        with tempfile.TemporaryDirectory() as td:
+            man = self._dir(td, "2026-08-09-close-manual.md")
+        self.assertEqual({r["run_type"] for r in auto}, {"auto"})
+        self.assertEqual({r["run_type"] for r in man}, {"manual"})
+
+    def test_open_reports_ignored(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(self._dir(td, "2026-08-09-open.md"), [])
+
+    def test_settle_falls_back_to_prior_session(self):
+        """到期日逢假/半日市取之前最近一个交易日。"""
+        import review
+        ser = pd.Series([10.0, 11.0], index=[date(2026, 8, 20), date(2026, 8, 21)])
+        self.assertEqual(review._on_or_before(ser, date(2026, 8, 22)),
+                         (date(2026, 8, 21), 11.0))
+        self.assertEqual(review._on_or_before(ser, date(2026, 8, 19)), (None, None))
+
+
+
+class TestDeltaBaseline(unittest.TestCase):
+    """作废率必须对着 delta 隐含的理论值读, 否则高胜率会被误读成 edge。"""
+
+    def _done(self, n_otm, n_assigned, delta=0.12):
+        return ([{"status": "expired_otm", "delta": delta}] * n_otm
+                + [{"status": "assigned", "delta": delta}] * n_assigned)
+
+    def test_realized_equals_expected_is_zero_edge(self):
+        """88 作废 / 12 被行权 @ delta 0.12 = 正好等于理论值, 超额应为 0。"""
+        import review
+        b = review.delta_baseline(self._done(88, 12))
+        self.assertAlmostEqual(b["expected_otm"], 0.88, places=6)
+        self.assertAlmostEqual(b["realized_otm"], 0.88, places=6)
+        self.assertAlmostEqual(b["excess"], 0.0, places=6)
+        self.assertAlmostEqual(b["sigma"], 0.0, places=6)
+
+    def test_high_win_rate_can_still_be_noise(self):
+        """mock 实测形态: 95% 作废看着很强, n=39 时只有 ~1.4σ。"""
+        import review
+        b = review.delta_baseline(self._done(37, 2))
+        self.assertEqual(b["n"], 39)
+        self.assertGreater(b["excess"], 0.05)          # 超额 +7pp
+        self.assertLess(abs(b["sigma"]), 2.0)          # 但不显著
+        self.assertEqual(b["n_for_half_se"], 156)
+
+    def test_low_delta_makes_high_otm_rate_unremarkable(self):
+        """同样 95% 的作废率, 卖 0.05 delta 时反而是**跑输**基准。"""
+        import review
+        b = review.delta_baseline(self._done(37, 2, delta=0.05))
+        self.assertAlmostEqual(b["expected_otm"], 0.95, places=6)
+        self.assertLess(b["excess"], 0.01)
+
+    def test_guards(self):
+        import review
+        self.assertIsNone(review.delta_baseline([]))
+        self.assertIsNone(review.delta_baseline(
+            [{"status": "expired_otm", "delta": None}]))
+
+
+
+class TestMockDemo(unittest.TestCase):
+    """mock 数据的免责声明必须跟着**数据**走, 不跟着命令走。"""
+
+    def test_caveats_print_whenever_mock_rows_present(self):
+        """报表会被截图、复制、隔几周再翻出来 —— 那时命令行上下文早没了。"""
+        import review
+        res = [{"kind": "csp", "symbol": "X", "status": "open",
+                "source": "mock", "strike": 10.0}]
+        out = review.summarize(res)
+        for line in review.MOCK_CAVEATS:
+            self.assertIn(line, out)
+
+    def test_caveats_absent_for_real_data(self):
+        import review
+        res = [{"kind": "csp", "symbol": "X", "status": "open",
+                "source": "scan", "strike": 10.0}]
+        self.assertNotIn(review.MOCK_CAVEATS[0], review.summarize(res))
+
+    def test_caveats_survive_one_mock_row_among_real(self):
+        """混进一行 mock 就得整块出声 —— 宁可吵, 不可静默混算。"""
+        import review
+        res = [{"kind": "csp", "symbol": "A", "status": "open",
+                "source": "scan", "strike": 10.0},
+               {"kind": "csp", "symbol": "B", "status": "open",
+                "source": "mock", "strike": 10.0}]
+        self.assertIn(review.MOCK_CAVEATS[0], review.summarize(res))
+
+    def test_caveats_name_the_worst_bias_first(self):
+        """前视偏差是这份 mock 最严重的问题, 不能埋在第四条。"""
+        import review
+        self.assertIn("前视偏差", review.MOCK_CAVEATS[1])
+        self.assertIn("最严重", review.MOCK_CAVEATS[1])
+
+    def test_strike_rounding_steps(self):
+        import review
+        self.assertEqual(review._round_strike(47.3), 47.0)
+        self.assertEqual(review._round_strike(123.4), 122.5)
+        self.assertEqual(review._round_strike(647.0), 645.0)
+
+    def test_strike_for_delta_uses_production_bs(self):
+        """反解出的行权价代回 scanner.bs_delta 必须落在目标 delta 上。"""
+        import review
+        for target in (0.10, 0.12, 0.30):
+            k = review._strike_for_delta(200.0, 0.45, 21 / 365, target, sc.RATE)
+            got = abs(sc.bs_delta(200.0, k, 21 / 365, sc.RATE, 0.45, False))
+            self.assertAlmostEqual(got, target, places=3)
+            self.assertLess(k, 200.0)      # OTM put
+
+
+
+class TestLeapTable(unittest.TestCase):
+    """LEAP 逐笔明细: 聚合数读不出可操作信息, 明细才是这段的用处。"""
+
+    def _row(self, **o):
+        r = {"symbol": "NVDA", "date": "2025-12-01", "exp": "2027-04-15",
+             "kind": "leap", "strike": 180.0, "mid": 21.92, "spot_at_rec": 179.92,
+             "last_px": 222.27, "underlying_ret": 0.2354, "itm_now": True,
+             "dte_left": 206, "source": "scan"}
+        r.update(o)
+        return r
+
+    def test_lists_the_fields_asked_for(self):
+        import review
+        out = chr(10).join(review.leap_table([self._row()]))
+        for want in ("NVDA", "2025-12-01", "2027-04-15", "180", "179.92"):
+            self.assertIn(want, out)
+
+    def test_breakeven_is_strike_plus_premium(self):
+        """多头 call 的盈亏平衡 = 行权价 + 权利金, 不是行权价。"""
+        import review
+        out = chr(10).join(review.leap_table([self._row()]))
+        self.assertIn("201.92", out)                      # 180 + 21.92
+
+    def test_itm_but_not_recovered_is_its_own_state(self):
+        """ITM 不等于赚钱 —— 深 ITM 的 LEAP 权利金厚, 有内在价值 != 回本。"""
+        import review
+        r = self._row(strike=235.0, mid=27.04, last_px=253.71, itm_now=True)
+        out = chr(10).join(review.leap_table([r]))
+        self.assertIn("ITM 未回本", out)
+        self.assertNotIn("✓ 越过平衡", out)
+
+    def test_above_breakeven_marked(self):
+        import review
+        out = chr(10).join(review.leap_table([self._row()]))
+        self.assertIn("✓ 越过平衡", out)
+
+    def test_missing_spot_shows_dash_not_zero(self):
+        """回填行没有推荐日现价 —— 显示 — 而不是补 0 或留空。"""
+        import review
+        out = chr(10).join(review.leap_table(
+            [self._row(spot_at_rec=None, underlying_ret=None)]))
+        self.assertIn("—", out)
+        self.assertNotIn("0.00", out)
+
+    def test_sorted_by_symbol_then_date(self):
+        import review
+        rows = [self._row(symbol="TSLA", date="2026-01-01"),
+                self._row(symbol="AAPL", date="2026-06-01"),
+                self._row(symbol="AAPL", date="2025-12-01")]
+        body = review.leap_table(rows)[2:]
+        self.assertEqual([l.split()[0] for l in body], ["AAPL", "AAPL", "TSLA"])
+        self.assertEqual(body[0].split()[1], "2025-12-01")
+
+    def test_empty_is_empty(self):
+        import review
+        self.assertEqual(review.leap_table([]), [])
+
+    def test_columns_do_not_collide(self):
+        """中文表头 + ASCII 数据混排要按显示宽度补齐, 否则数字列会贴死。"""
+        import review
+        rows = review.leap_table([self._row()])
+        self.assertEqual(review._dw("正股涨跌"), 8)       # CJK 全角算 2
+        self.assertEqual(review._dw("NVDA"), 4)
+        # 表头与数据行显示宽度一致 = 列没错位
+        self.assertEqual(review._dw(rows[0]), review._dw(rows[2]))
+        self.assertNotIn("%✓", rows[2])                   # 修掉的那个贴死形态
+
+
+
+class TestMarkdownRenderer(unittest.TestCase):
+    """md 与纯文本必须同源 —— 两个渲染器各自算一遍就一定漂移。"""
+
+    def _res(self):
+        return [
+            {"kind": "csp", "symbol": "NVDA", "date": "2026-07-21",
+             "exp": "2026-08-21", "strike": 170.0, "mid": 2.5, "delta": 0.12,
+             "dte": 31, "status": "expired_otm", "above_breakeven": True,
+             "breached": False, "pnl_per_share": 2.5, "source": "scan"},
+            {"kind": "csp", "symbol": "GLD", "date": "2026-07-21",
+             "exp": "2026-08-21", "strike": 300.0, "mid": 1.1, "delta": 0.09,
+             "dte": 31, "status": "assigned", "above_breakeven": False,
+             "breached": True, "pnl_per_share": -2.0, "source": "scan"},
+            {"kind": "leap", "symbol": "NVDA", "date": "2025-12-01",
+             "exp": "2027-04-15", "strike": 180.0, "mid": 21.92,
+             "spot_at_rec": 179.92, "last_px": 222.27, "underlying_ret": 0.2354,
+             "itm_now": True, "dte_left": 206, "status": "open_unrealized",
+             "source": "scan"},
+        ]
+
+    def test_same_numbers_in_both_renderers(self):
+        """同一批数据, 两份报表的关键计数必须逐字一致。"""
+        import review
+        res = self._res()
+        t, m = review.summarize(res), review.summarize_md(res)
+        st = review.compute_stats(res)
+        for frag in (f"{st['otm']}/{len(st['done'])}",
+                     f"{st['leap_itm']}/{len(st['leap'])}",
+                     f"{st['leap_be']}/{len(st['leap'])}"):
+            self.assertIn(frag, t, frag)
+            self.assertIn(frag, m, frag)
+
+    def test_stats_computed_once(self):
+        """compute_stats 是唯一的算数入口 —— 渲染器只排版。"""
+        import review
+        st = review.compute_stats(self._res())
+        self.assertEqual(st["otm"], 1)
+        self.assertEqual(st["above_be"], 1)
+        self.assertEqual(st["breached"], 1)
+        self.assertEqual(len(st["done"]), 2)
+        self.assertEqual(st["leap_itm"], 1)
+        self.assertEqual(st["leap_be"], 1)        # 222.27 > 180 + 21.92
+
+    def test_md_tables_are_real_markdown(self):
+        import review
+        m = review.summarize_md(self._res())
+        self.assertIn("| 标的 | 入手 | 到期 |", m)
+        self.assertIn("|---|", m)
+        self.assertTrue(m.startswith("# "))
+
+    def test_mock_caveats_become_blockquote_not_dropped(self):
+        """md 里免责声明改成引用块, 但一个字都不能少。"""
+        import review
+        res = [dict(r, source="mock") for r in self._res()]
+        m = review.summarize_md(res)
+        for line in review.MOCK_CAVEATS:
+            self.assertIn(line.strip(), m)
+        self.assertIn("> ⚠️", m)
+
+    def test_md_has_no_caveats_for_real_data(self):
+        import review
+        self.assertNotIn("MOCK", review.summarize_md(self._res()))
+
+    def test_empty_input_does_not_crash_either_renderer(self):
+        import review
+        self.assertIn("CSP", review.summarize([]))
+        self.assertIn("# ", review.summarize_md([]))
+
+
+
+class TestAssignedTable(unittest.TestCase):
+    """被行权明细: 作废的单子没什么可看, 被行权的才带信息。"""
+
+    def _done(self):
+        return [
+            {"kind": "csp", "symbol": "HOOD", "date": "2026-02-02",
+             "exp": "2026-02-23", "strike": 75.0, "mid": 0.85,
+             "breakeven": 74.15, "status": "assigned", "settle_close": 71.78,
+             "min_close_in_window": 71.12, "pnl_per_share": -2.37,
+             "above_breakeven": False, "breached": True},
+            {"kind": "csp", "symbol": "NVDA", "date": "2026-07-21",
+             "exp": "2026-08-21", "strike": 170.0, "mid": 2.5,
+             "breakeven": 167.5, "status": "expired_otm", "settle_close": 185.0,
+             "pnl_per_share": 2.5, "above_breakeven": True, "breached": False},
+            # 被行权但仍不亏: 到期收盘落在行权价与盈亏平衡之间
+            {"kind": "csp", "symbol": "GLD", "date": "2026-03-01",
+             "exp": "2026-03-20", "strike": 300.0, "mid": 5.0,
+             "breakeven": 295.0, "status": "assigned", "settle_close": 297.0,
+             "min_close_in_window": 296.0, "pnl_per_share": 2.0,
+             "above_breakeven": True, "breached": True},
+        ]
+
+    def test_only_assigned_rows(self):
+        """作废的不进这张表。"""
+        import review
+        cells = review.assigned_cells(self._done())
+        self.assertEqual({c[0] for c in cells}, {"HOOD", "GLD"})
+
+    def test_sorted_worst_first(self):
+        """最该复盘的排最前 —— 每股结果升序。"""
+        import review
+        cells = review.assigned_cells(self._done())
+        self.assertEqual([c[0] for c in cells], ["HOOD", "GLD"])
+
+    def test_assigned_can_still_be_profitable(self):
+        """被行权 != 亏。GLD 到期 297 落在行权价 300 与盈亏平衡 295 之间。"""
+        import review
+        row = [c for c in review.assigned_cells(self._done()) if c[0] == "GLD"][0]
+        self.assertEqual(row[-1], "+2.00")
+
+    def test_drop_depth_and_path_low_both_shown(self):
+        """落价幅度说明擦边还是砸穿, 持有期最低说明路径有多难受。"""
+        import review
+        row = [c for c in review.assigned_cells(self._done()) if c[0] == "HOOD"][0]
+        self.assertIn("-4.3%", row)      # 71.78/75 - 1
+        self.assertIn("71.12", row)      # 持有期最低
+
+    def test_appears_in_both_renderers(self):
+        """两个渲染器共用同一份 cells —— 加一张表不该写两遍。"""
+        import review
+        res = self._done() + []
+        for r in res:
+            r.setdefault("source", "scan")
+        t, m = review.summarize(res), review.summarize_md(res)
+        for frag in ("被行权明细", "HOOD", "71.12", "-2.37"):
+            self.assertIn(frag, t, frag)
+            self.assertIn(frag, m, frag)
+
+    def test_absent_when_nothing_assigned(self):
+        import review
+        clean = [r for r in self._done() if r["status"] == "expired_otm"]
+        for r in clean:
+            r.setdefault("source", "scan")
+        self.assertNotIn("被行权明细", review.summarize(clean))
+        self.assertNotIn("被行权明细", review.summarize_md(clean))
+
+    def test_leap_table_shares_one_column_spec(self):
+        """LEAP 表的列定义只有一份 —— 文本与 md 用同一个 LEAP_HDR。"""
+        import review
+        leap = [{"kind": "leap", "symbol": "NVDA", "date": "2025-12-01",
+                 "exp": "2027-04-15", "strike": 180.0, "mid": 21.92,
+                 "spot_at_rec": 179.92, "last_px": 222.27,
+                 "underlying_ret": 0.2354, "itm_now": True, "dte_left": 206}]
+        cells = review.leap_cells(leap)
+        txt = chr(10).join(review._table_text(review.LEAP_HDR, cells))
+        md = chr(10).join(review._table_md(review.LEAP_HDR, cells))
+        for c in cells[0]:
+            self.assertIn(str(c), txt)
+            self.assertIn(str(c), md)
+        self.assertEqual(len(review.LEAP_HDR), len(cells[0]))
+        self.assertEqual(len(review.ASSIGNED_HDR),
+                         len(review.assigned_cells(self._done())[0]))
+
+
+
+class TestEmailRendering(unittest.TestCase):
+    """复盘 md 走 scanner.md_to_email_html 进 Gmail —— 语法子集与体积都有硬约束。"""
+
+    def _leaps(self, n, be_ok=True):
+        out = []
+        for i in range(n):
+            out.append({"kind": "leap", "symbol": f"S{i:02d}",
+                        "date": "2026-01-01", "exp": "2027-06-18",
+                        "strike": 100.0, "mid": 20.0, "spot_at_rec": 100.0,
+                        "last_px": 130.0 if be_ok else 90.0,
+                        "underlying_ret": 0.30 if be_ok else -0.10,
+                        "itm_now": be_ok, "dte_left": 400,
+                        "status": "open_unrealized", "source": "scan"})
+        return out
+
+    def test_no_markdown_italics_anywhere(self):
+        """scanner.md_to_email_html 不支持 _斜体_ —— 下划线会原样漏进邮件正文。"""
+        import review
+        for res in ([], self._leaps(2),
+                    [{"kind": "csp", "symbol": "X", "date": "2026-01-01",
+                      "exp": "2026-02-01", "strike": 10.0, "mid": 1.0,
+                      "status": "open", "source": "mock"}]):
+            md = review.summarize_md(res)
+            html = sc.md_to_email_html(md)
+            bad = re.findall(r"[^\w`]_[^_\s][^_\n]{0,60}_[^\w`]", html)
+            self.assertEqual(bad, [], f"斜体漏进 HTML: {bad}")
+
+    def test_table_rows_capped_for_gmail(self):
+        """Gmail 在 102,400 字节截断; md_to_email_html 每行约 2.2KB。"""
+        import review
+        md = review.summarize_md(self._leaps(60))
+        body = [l for l in md.split(chr(10)) if l.startswith("| S")]
+        self.assertEqual(len(body), review.MAX_TABLE_ROWS)
+        self.assertIn("另有 **40** 笔", md)
+
+    def test_capped_html_stays_under_gmail_limit(self):
+        import review
+        html = sc.md_to_email_html(review.summarize_md(self._leaps(60)))
+        self.assertLess(len(html.encode("utf-8")), 102_400)
+
+    def test_cap_keeps_the_ones_needing_attention(self):
+        """截断策略 = 排序。OTM 的必须留下, 越过盈亏平衡的先被省略。"""
+        import review
+        res = self._leaps(30, be_ok=True) + self._leaps(3, be_ok=False)
+        cells = review.leap_cells(res)
+        self.assertIn("✗ OTM", [c[9] for c in cells[:3]])
+        shown, more = review._capped(cells)
+        self.assertEqual(more, 33 - review.MAX_TABLE_ROWS)
+        self.assertTrue(any(c[9] == "✗ OTM" for c in shown))
+
+    def test_email_html_renders_the_syntax_we_use(self):
+        """h1/h2/h3、表格、粗体、引用块、行内代码 —— 复盘 md 用到的都要能渲染。"""
+        import review
+        res = [dict(r, source="mock") for r in self._leaps(2)]
+        html = sc.md_to_email_html(review.summarize_md(res))
+        self.assertIn("<table", html)          # 表格
+        self.assertIn("wl-narrow", html)       # 窄屏卡片降级
+        self.assertIn("⚠️", html)              # 引用块里的免责声明
+        self.assertNotIn("| 标的 |", html)     # md 管道符不该原样漏出
 
 
 if __name__ == "__main__":

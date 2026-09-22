@@ -16,6 +16,24 @@ send_email_report(Path(sys.argv[2]), sys.argv[1])" "$1" "$2" \
     >> "$log" 2>&1 || true
 }
 
+# 推荐复盘 (月度): 结算流水账里的 CSP/LEAP, 出 markdown 并邮寄。
+# 与扫描互不相干 —— 它只读 data/recommendations.jsonl 与历史日线, 不碰
+# state/iv history, 也不受扫描窗口门约束, 任何时候跑都安全。
+if [ "${1:-}" = "review" ]; then
+  out="reports/review-$(date +%Y-%m).md"
+  .venv/bin/python review.py --md "$out" >> "$log" 2>&1
+  status=$?
+  if [ "$status" -eq 0 ] && [ -s "$out" ]; then
+    notify "[watchlist] 推荐复盘 $(date +%Y-%m)" "$out"
+  else
+    # 复盘失败不静默: 它一个月才跑一次, 挂了没人会注意到
+    body=$(mktemp); tail -50 "$log" > "$body"
+    notify "[watchlist] 复盘 FAILED $(date +%Y-%m) (exit $status)" "$body"
+    rm -f "$body"
+  fi
+  exit "$status"
+fi
+
 if [ "${1:-}" = "watchdog" ]; then
   et_date=$(TZ=America/New_York date +%F)   # the US trading day just ended
   # 该交易日到底该不该有报告 —— 问盘面, 不查假日日历 (和扫描器的

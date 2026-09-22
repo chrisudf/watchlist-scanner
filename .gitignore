@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 .env
+# 运行时产物: state.json / iv_history.csv / recommendations.jsonl
+# —— 都是只增不改的本地历史, 每台机器各自一份, 不进版本库
+data/
