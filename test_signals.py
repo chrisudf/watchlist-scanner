@@ -3040,5 +3040,40 @@ class TestEmailRendering(unittest.TestCase):
         self.assertNotIn("| 标的 |", html)     # md 管道符不该原样漏出
 
 
+
+class TestLeapBreakevenWording(unittest.TestCase):
+    """LEAP 的盈亏平衡是**到期**口径, 不是当前浮盈浮亏。
+
+    2026-09-22 droplet 首跑的回归: 7 张 LEAP 全是 ITM 未回本、平均还剩 486 天,
+    而原文案写的是"越过盈亏平衡才是真的不亏" —— 照那句读会把 0/7 当成全线亏损。
+    深度 ITM 的 LEAP 此刻带着大量时间价值, 市值 = 内在 + 时间价值。
+    """
+
+    def _leap(self):
+        return [{"kind": "leap", "symbol": "NVDA", "date": "2026-08-09",
+                 "exp": "2028-01-21", "strike": 170.0, "mid": 79.55,
+                 "last_px": 227.38, "itm_now": True, "dte_left": 486,
+                 "status": "open_unrealized", "source": "scan"}]
+
+    def test_says_expiry_basis_not_current_pnl(self):
+        import review
+        for out in (review.summarize(self._leap()),
+                    review.summarize_md(self._leap())):
+            self.assertIn("到期", out)
+            self.assertIn("不代表现在亏", out)
+
+    def test_wording_is_one_constant_not_two_copies(self):
+        import review
+        t, m = review.summarize(self._leap()), review.summarize_md(self._leap())
+        core = "这是到期口径，不是当前浮盈浮亏"
+        self.assertIn(core, t)
+        self.assertIn(core, m)
+
+    def test_does_not_claim_below_breakeven_means_losing(self):
+        import review
+        for out in (review.summarize(self._leap()), review.summarize_md(self._leap())):
+            self.assertNotIn("才是真的不亏。两个数差得远", out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

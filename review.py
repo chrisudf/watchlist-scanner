@@ -42,6 +42,16 @@ DEMO_JOURNAL = sc.DATA / "demo_journal.jsonl"
 # 看见 source="mock" 就无条件打印这一整块。理由: 报表会被截图、复制、隔几周
 # 再翻出来看, 那时"这是 --demo 跑的"这个上下文早没了, 只剩下一个 95% 的作废率。
 # 警告必须和数字绑在一起, 分不开。
+# LEAP 盈亏平衡的口径说明。同一句话两个渲染器都要说 —— 抽出来, 别写两遍。
+# 2026-09-22 droplet 首跑发现原文案有错: 写的是"越过盈亏平衡才是真的不亏",
+# 而 7 张 LEAP 全是 ITM 未回本、平均还剩 486 天。深度 ITM 的 LEAP 此刻带着
+# 大量时间价值, 市值 = 内在 + 时间价值, 现价没到「行权价+权利金」**完全不代表
+# 当前浮亏** —— 那是**到期**口径。照原文案读会把 0/7 当成全线亏损。
+LEAP_BE_NOTE = (
+    "ITM 只说明有内在价值；越过盈亏平衡 = **若持有到期**才不亏。"
+    "这是到期口径，不是当前浮盈浮亏：LEAP 还剩几百天时仍有可观时间价值，"
+    "没到这条线不代表现在亏。本工具只用日线收盘、不取期权链，算不了当前市值。")
+
 MOCK_CAVEATS = [
     "⚠️  以下含 MOCK 数据 —— 这不是策略业绩, 是为了看报表长什么样造的。四处与真实系统不同:",
     "   ① 前视偏差 (最严重): value_zone 是 2026-09 手工定的, 拿它筛更早的入场 = 用未来信息挑历史仓位。",
@@ -663,8 +673,7 @@ def summarize(res: list[dict]) -> str:
     if leap:
         L.append(f"  当前 ITM: {st['leap_itm']}/{len(leap)}   "
                  f"越过盈亏平衡 (行权价+权利金): {st['leap_be']}/{len(leap)}")
-        L.append("    —— ITM 只说明有内在价值; 越过盈亏平衡才是真的不亏。"
-                 "两个数差得远说明权利金付贵了")
+        L.append("    —— " + LEAP_BE_NOTE.replace("**", ""))
         if st.get("leap_ret_n"):
             L.append(f"  正股自推荐日涨跌: 中位 {st['leap_ret_med']:+.1%} / "
                      f"均值 {st['leap_ret_avg']:+.1%} / "
@@ -764,8 +773,7 @@ def summarize_md(res: list[dict], title="推荐复盘") -> str:
               f"当前 ITM **{st['leap_itm']}/{len(leap)}**，"
               f"越过盈亏平衡（行权价+权利金）**{st['leap_be']}/{len(leap)}**。",
               "",
-              "> ITM 只说明有内在价值；越过盈亏平衡才是真的不亏。"
-              "两个数差得远说明权利金付贵了。"]
+              "> " + LEAP_BE_NOTE]
         if st.get("leap_ret_n"):
             M += ["", f"正股自推荐日涨跌：中位 {st['leap_ret_med']:+.1%} / "
                       f"均值 {st['leap_ret_avg']:+.1%} / "
