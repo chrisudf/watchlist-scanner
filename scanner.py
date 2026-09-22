@@ -132,7 +132,17 @@ SETTINGS_DEFAULTS = {
     "leap_delta_index": [0.70, 0.80],
     "leap_delta_stock": [0.75, 0.85],
     "leap_min_oi": 500, "leap_max_spread_pct": 5.0,
+    # 可成交地板 (硬拦, 与上面的 500 是两回事): 500 是"流动性弱"的质量线,
+    # 低于它的票照出、带旗标由人判断; 50 以下是"这张根本没有市场" —— 2026-09-21
+    # 的 TSM 340C 是 OI=1 的真事, 却作为 🟢 动作项发了出去。买不到的票不该
+    # 出现在动作项里, 所以这一条在挑票之前就把候选剔掉, 软回落也救不回来。
+    "leap_hard_min_oi": 50,
     "leap_max_extrinsic_pct": 40.0,
+    # 到盈亏平衡 <= 12% (moomoo「Buy LEAP Call」筛选器同款, 0~12%)。ITM call
+    # 有恒等式 BE = 现价 + 外在价值, 所以这条等价于"外在价值 <= 现价的 12%" ——
+    # 和上面 leap_max_extrinsic_pct 量的是同一件事, 分母不同 (那条按权利金,
+    # 这条按现价)。**软门**: 超了照出, 只在 notes 里挂旗标。
+    "leap_max_be_pct": 12.0,
     "leap_earnings_buffer_days": 14,  # 财报前 <=2 周不进 LEAP (2026-08-09 校准)
     "leap_earnings_note_days": 30,    # 财报 15-30 天内出票但带提示
     # regime
@@ -358,6 +368,13 @@ def journal_rows(results, d: str, mode: str, regime: dict) -> list[dict]:
                 "annualized_pct": t.get("annualized_pct"),
                 "cushion_pct": t.get("cushion_pct"),
                 "breakeven": t.get("breakeven"),
+                # LEAP 的两个旗标依据。**字段名与单位对齐 review.py 的回填**:
+                # be_pct_at_rec 是小数, extrinsic_pct 是百分数 —— 否则同一列里
+                # scan 行和 backfill 行会差 100 倍, 而旗标只在越界时才显形,
+                # 这种错能安静地躺很久。
+                "be_pct_at_rec": (t["be_pct"] / 100
+                                  if t.get("be_pct") is not None else None),
+                "extrinsic_pct": t.get("extrinsic_pct"),
                 "panic_mode": t.get("panic_mode"),
                 "zone": cfg.get("value_zone"), "zone_asof": cfg.get("zone_asof"),
                 "high_beta": cfg.get("high_beta"),
@@ -1820,8 +1837,14 @@ def leap_ticket(cc: ChainCache, spot: float, cfg: dict,
                 earnings_iso: str | None, s: dict) -> dict | None:
     """Deep-ITM LEAP call per the playbook: 450-1100 DTE (Jan cycle
     preferred), delta 0.70-0.80 index / 0.75-0.85 single names, OI >= 500,
-    spread <= 5% of mid, extrinsic <= 40% of premium. Earnings inside the
-    buffer is a hard gate (剧本: 默认财报后入场), not a footnote."""
+    spread <= 5% of mid, extrinsic <= 40% of premium, breakeven <= 12% above
+    spot. Earnings inside the buffer is a hard gate (剧本: 默认财报后入场),
+    not a footnote.
+
+    **两级 OI, 别混**: `leap_hard_min_oi` (50) 是可成交地板, 在挑票之前剔除
+    候选, 软回落救不回来 —— 买不到的合约不该出现在动作项里。`leap_min_oi`
+    (500) 是流动性质量线, 属于下面 passes() 的软门: 不过就带旗标照出, 由人
+    判断。BE% 同为软门。"""
     days_to_earnings = None
     if earnings_iso:
         days_to_earnings = (date.fromisoformat(earnings_iso)
@@ -1870,15 +1893,31 @@ def leap_ticket(cc: ChainCache, spot: float, cfg: dict,
             "extrinsic_pct": extrinsic / mid * 100 if mid > 0 else None,
             "lam": spot * delta / mid if mid > 0 else None,
             "breakeven": strike + mid,
+            # 到盈亏平衡还要涨多少 (按现价). ITM call 有 BE = 现价 + 外在价值,
+            # 所以这就是"外在价值占现价的比例" —— 存下来而不是在 render 里现算,
+            # 是为了让 passes()/报告/流水账三处读同一个数。
+            "be_pct": (strike + mid) / spot * 100 - 100,
             "insurance_pct_yr": extrinsic / spot / (dte / 365.0) * 100,
         })
     if not rows:
         return {"skip_reason": f"{exp} 无可用 ITM call 报价"}
 
+    # 可成交地板: 在挑票之前剔除, 不是挑完再加 note —— 下面的 `clean or rows`
+    # 软回落会把"全都不过滤"的情况拉回全体候选, 只有在这里先剔干净, OI=1 这种
+    # 买不到的合约才不可能被选中 (2026-09-21 TSM 340C 就是这么发出去的)。
+    tradable = [c for c in rows if c["oi"] >= s["leap_hard_min_oi"]]
+    if not tradable:
+        best = max(rows, key=lambda c: c["oi"])
+        return {"skip_reason": (
+            f"{exp} 无可成交合约 — 最厚的一档 OI 也只有 {best['oi']} < "
+            f"{s['leap_hard_min_oi']} (买不到的票不出动作项)")}
+    rows = tradable
+
     def passes(c):
         return (dlo <= c["delta"] <= dhi and c["oi"] >= s["leap_min_oi"]
                 and (c["extrinsic_pct"] is None
                      or c["extrinsic_pct"] <= s["leap_max_extrinsic_pct"])
+                and c["be_pct"] <= s["leap_max_be_pct"]
                 and (c["spread_pct"] is None
                      or c["spread_pct"] <= s["leap_max_spread_pct"]))
 
@@ -1886,9 +1925,14 @@ def leap_ticket(cc: ChainCache, spot: float, cfg: dict,
     pick = min(clean or rows, key=lambda c: abs(c["delta"] - target))
     notes = []
     if not clean:
-        notes.append("无合约同时满足 delta带/OI/价差/外在价值全部过滤 — 取最接近目标 delta 的, 自查旗标")
+        notes.append("无合约同时满足 delta带/OI/价差/外在价值/BE% 全部过滤 — 取最接近目标 delta 的, 自查旗标")
     if pick["oi"] < s["leap_min_oi"]:
         notes.append(f"OI {pick['oi']} < {s['leap_min_oi']}")
+    if pick["be_pct"] > s["leap_max_be_pct"]:
+        notes.append(
+            f"到盈亏平衡 {pick['be_pct']:+.1f}% > {s['leap_max_be_pct']:g}% — "
+            f"这条门是按绝对幅度设的, 对长年份 LEAP 偏严: 这张折成 "
+            f"~{pick['insurance_pct_yr']:.1f}%/年, 先看这个再决定")
     if pick["spread_pct"] is not None and pick["spread_pct"] > s["leap_max_spread_pct"]:
         notes.append(f"价差 {pick['spread_pct']:.1f}% > {s['leap_max_spread_pct']}% — 挂 mid 磨或换行权价")
     if pick["extrinsic_pct"] is not None and pick["extrinsic_pct"] > s["leap_max_extrinsic_pct"]:
@@ -2797,7 +2841,7 @@ def render_close(results, regime, ivdf, now_et) -> str:
                     f"@ ~{leap['mid']:.2f} — delta {leap['delta']:.2f}, "
                     f"外在 {fmt(leap['extrinsic_pct'], '.0f', '%')}, "
                     f"λ {fmt(leap['lam'], '.1f', 'x')}, BE {leap['breakeven']:.2f} "
-                    f"({(leap['breakeven'] / t['close'] - 1) * 100:+.1f}%), "
+                    f"({leap['be_pct']:+.1f}%), "
                     f"保险费率 ~{leap['insurance_pct_yr']:.1f}%/年, "
                     f"合约 IV {leap['iv'] * 100:.0f}%, OI {leap['oi']}"
                     + (f", 价差 {leap['spread_pct']:.1f}%" if leap["spread_pct"] is not None else ""))

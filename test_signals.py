@@ -3286,5 +3286,146 @@ class TestOpenCspDelta(unittest.TestCase):
         self.assertNotIn("入手", [h for h, _, _ in review.OPEN_CSP_HDR])
 
 
+class TestLeapTradabilityFloor(unittest.TestCase):
+    """OI 硬拦 + BE% 软门 (2026-09-22)。
+
+    起因是 2026-09-21 的 TSM 340C: OI=1 —— 字面上买不到, 却作为 🟢 动作项
+    发了出去。根因是 `pick = min(clean or rows, ...)` 的软回落会在没有合约
+    全过时退回全体候选, 只追加一条 note。
+
+    所以这里的断言分两类, 别混:
+    - `leap_hard_min_oi` 在**挑票之前**剔候选 -> 软回落救不回来 (硬)
+    - `leap_min_oi` / BE% 只在 passes() 里 -> 不过就带旗标照出 (软)
+    """
+
+    EXP, DTE = "2028-01-21", 486
+
+    def _cc(self, spot=100.0, sigma=0.35, oi=3000, exp=None, dte=None):
+        exp, dte = exp or self.EXP, dte or self.DTE
+        T = dte / 365.0
+        traded = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=1)
+        rows = []
+        for i in range(24):
+            k = round(spot * (0.50 + 0.02 * i), 2)      # 50 … 96
+            px = sc.bs_price(spot, k, T, sc.RATE, sigma, is_call=True)
+            half = max(px * 0.005, 0.005)
+            rows.append({"strike": k, "lastPrice": px, "lastTradeDate": traded,
+                         "openInterest": oi, "bid": px - half, "ask": px + half})
+        calls = pd.DataFrame(rows)
+        return _FakeCC(_FakeChain(calls, pd.DataFrame([])),
+                       expiries=[(exp, dte)])
+
+    def _cfg(self):
+        return {"kind": "stock", "high_beta": False}
+
+    def test_unfillable_chain_skips_instead_of_picking(self):
+        # 全链 OI=1: 软回落原本会照样挑一张发出去 (TSM 340C 就是这么来的)
+        t = sc.leap_ticket(self._cc(oi=1), 100.0, self._cfg(), None,
+                           sc.SETTINGS_DEFAULTS)
+        self.assertIn("skip_reason", t)
+        self.assertIn("无可成交合约", t["skip_reason"])
+        self.assertIn("OI 也只有 1", t["skip_reason"])
+
+    def _oi_of(self, cc, strike):
+        calls = cc.chain(self.EXP).calls
+        return int(calls.loc[calls["strike"] == strike, "openInterest"].iloc[0])
+
+    def _thin(self, cc, strike, oi=1):
+        calls = cc.chain(self.EXP).calls
+        calls.loc[calls["strike"] == strike, "openInterest"] = oi
+        return cc
+
+    def test_floor_survives_the_soft_fallback(self):
+        """本次改动的要害, 分三步自证 (不是断言"选中的那张 OI 够" —— 那条
+        在软门下也成立, 会绿得毫无信息)。
+
+        把 leap_min_oi 顶到没有合约能过, 强制走 `clean or rows` 回落;
+        再把回落会选中的那一档打成 OI=1。地板关掉 = 照样选它 (旧行为,
+        TSM 340C 的复现); 地板打开 = 换一张且 OI 够。"""
+        no_floor = dict(sc.SETTINGS_DEFAULTS, leap_min_oi=99999,
+                        leap_hard_min_oi=0)
+        with_floor = dict(no_floor, leap_hard_min_oi=50)
+
+        # ① 回落会选中哪一档
+        picked = sc.leap_ticket(self._cc(), 100.0, self._cfg(), None,
+                                no_floor)["strike"]
+
+        # ② 地板关掉: 把它打成 OI=1, 回落照样把它捞回来 = 旧行为复现
+        old = sc.leap_ticket(self._thin(self._cc(), picked), 100.0,
+                             self._cfg(), None, no_floor)
+        self.assertEqual(old["strike"], picked)
+        self.assertEqual(old["oi"], 1)          # 买不到的票进了动作项
+
+        # ③ 地板打开: 同一条链, 换一张, 且真的可成交
+        cc = self._thin(self._cc(), picked)
+        new = sc.leap_ticket(cc, 100.0, self._cfg(), None, with_floor)
+        self.assertNotIn("skip_reason", new)
+        self.assertNotEqual(new["strike"], picked)
+        self.assertGreaterEqual(new["oi"], with_floor["leap_hard_min_oi"])
+        self.assertTrue(any("OI" in n for n in new["notes"]))  # 软门仍发旗标
+
+    def test_be_gate_shifts_the_pick_deeper(self):
+        """BE% 进 passes() 的**行为**证据 (光断言旗标存在测不到这条 ——
+        旗标是 pick 之后单独加的)。
+
+        sigma 0.55 下 delta 带内 BE% 从 10.7% 爬到 17.9%, 正好跨过 12%:
+        没有这条门时挑最贴近 0.80 delta 的那张 (BE 14%), 有门时 clean 只
+        剩深档, 选中的那张 BE 落回 12% 以内。"""
+        cc = self._cc(sigma=0.55)
+        t = sc.leap_ticket(cc, 100.0, self._cfg(), None, sc.SETTINGS_DEFAULTS)
+        self.assertNotIn("skip_reason", t)
+        self.assertLessEqual(t["be_pct"], sc.SETTINGS_DEFAULTS["leap_max_be_pct"])
+        # 门不存在时会选到的那张: 带内最贴近目标 delta 的 —— 它 BE 超标
+        loose = dict(sc.SETTINGS_DEFAULTS, leap_max_be_pct=999.0)
+        t2 = sc.leap_ticket(self._cc(sigma=0.55), 100.0, self._cfg(), None,
+                            loose)
+        self.assertGreater(t2["be_pct"], sc.SETTINGS_DEFAULTS["leap_max_be_pct"])
+        self.assertNotEqual(t["strike"], t2["strike"])
+        self.assertLess(t["strike"], t2["strike"])      # 更深的 ITM
+
+    def test_be_pct_is_a_soft_gate_not_a_skip(self):
+        # 高 IV -> 外在价值厚 -> BE% 破 12%。软门: 照出票, 只挂旗标。
+        t = sc.leap_ticket(self._cc(sigma=1.2), 100.0, self._cfg(), None,
+                           sc.SETTINGS_DEFAULTS)
+        self.assertNotIn("skip_reason", t)
+        self.assertGreater(t["be_pct"], sc.SETTINGS_DEFAULTS["leap_max_be_pct"])
+        self.assertTrue(any("到盈亏平衡" in n for n in t["notes"]))
+
+    def test_be_pct_equals_extrinsic_over_spot(self):
+        # ITM call 的恒等式 BE = 现价 + 外在价值。BE% 与 extrinsic_pct 量的是
+        # 同一件事、分母不同 —— 两条门一起调时这条断言会挡住把它们当独立
+        # 维度看的误解。
+        t = sc.leap_ticket(self._cc(), 100.0, self._cfg(), None,
+                           sc.SETTINGS_DEFAULTS)
+        self.assertNotIn("skip_reason", t)
+        extrinsic = t["mid"] - max(100.0 - t["strike"], 0.0)
+        self.assertAlmostEqual(t["be_pct"], extrinsic / 100.0 * 100, places=6)
+
+    def test_be_note_carries_the_annualized_cross_check(self):
+        # 12% 是绝对幅度, 对长年份 LEAP 偏严: 同样 16% 的 BE, 850 天那张
+        # 折年只有 ~7%/年。旗标必须把这个数一起给出来, 否则人只能照着
+        # 一个对期限盲的数字做决定。
+        t = sc.leap_ticket(self._cc(sigma=1.2, exp="2029-01-19", dte=851),
+                           100.0, self._cfg(), None, sc.SETTINGS_DEFAULTS)
+        note = next(n for n in t["notes"] if "到盈亏平衡" in n)
+        self.assertIn("%/年", note)
+        self.assertAlmostEqual(t["insurance_pct_yr"],
+                               t["be_pct"] / (851 / 365.0), places=6)
+
+    def test_journal_units_match_the_backfill_parser(self):
+        # be_pct_at_rec 是小数, extrinsic_pct 是百分数 —— 与 review.py 的
+        # 回填一致。错了会让同一列里 scan 行和 backfill 行差 100 倍, 而
+        # 旗标只在越界时显形, 这种错能安静地躺很久。
+        t = sc.leap_ticket(self._cc(sigma=1.2), 100.0, self._cfg(), None,
+                           sc.SETTINGS_DEFAULTS)
+        rs = [{"symbol": "AAA", "tech": {"close": 100.0}, "leap": t,
+               "cfg": {"value_zone": [80.0, 95.0], "kind": "stock"}}]
+        row = sc.journal_rows(rs, "2026-09-22", "close", {})[0]
+        self.assertAlmostEqual(row["be_pct_at_rec"], t["be_pct"] / 100)
+        self.assertLess(row["be_pct_at_rec"], 1.0)          # 小数不是百分数
+        self.assertEqual(row["extrinsic_pct"], t["extrinsic_pct"])
+        self.assertGreater(row["extrinsic_pct"], 1.0)       # 百分数不是小数
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
