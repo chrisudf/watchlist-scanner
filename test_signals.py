@@ -2654,9 +2654,9 @@ class TestReviewBackfill(unittest.TestCase):
         leap = [r for r in rows if r["kind"] == "leap"][0]
         self.assertAlmostEqual(leap["be_pct_at_rec"], 0.114, places=4)
         self.assertAlmostEqual(leap["spot_at_rec"], 249.55 / 1.114, places=1)
-        # CSP 行的 BE 没有百分比, 仍然反解不出
+        # CSP 行的 BE 没有百分比, 但"缓冲 X%"同样能还原开仓现价
         csp = [r for r in rows if r["kind"] == "csp"][0]
-        self.assertIsNone(csp["spot_at_rec"])
+        self.assertIsNotNone(csp["spot_at_rec"])
 
     def test_gate_violations_flagged(self):
         """扫描器在没有合约全过滤时回落到 clean or rows 并只加一条 note,
@@ -3134,7 +3134,8 @@ class TestOpenCspTable(unittest.TestCase):
         def st(r):
             return review.open_csp_cells([r])[0][-1]
         self.assertEqual(st(self._open("A", 100.0, 95.0, -0.05)), "⚠ 已破行权价")
-        self.assertEqual(st(self._open("B", 100.0, 103.0, 0.03)), "接近 (<5%)")
+        # ? 表示这是降级判据 (算不出 delta 才退回缓冲) —— 判据来源要可见
+        self.assertEqual(st(self._open("B", 100.0, 103.0, 0.03)), "接近 (<5%)?")
         self.assertEqual(st(self._open("C", 100.0, 130.0, 0.30)), "安全")
         # 曾破位但现在安全 —— 与"当前已破"是两种处境
         self.assertEqual(st(self._open("D", 100.0, 130.0, 0.30, breached=True)),
@@ -3171,6 +3172,118 @@ class TestOpenCspTable(unittest.TestCase):
         self.assertEqual(len(shown), review.MAX_TABLE_ROWS)
         self.assertEqual(more, 10)
         self.assertIn("另有 10 笔", chr(10).join(review.open_csp_table(rows)))
+
+
+
+class TestOpenCspDelta(unittest.TestCase):
+    """在途管理线用 delta 不用缓冲 —— 缓冲不含时间与波动率。"""
+
+    def test_iv_from_delta_round_trips(self):
+        """由 delta 反推 σ, 代回 scanner.bs_delta 必须还原那个 delta。"""
+        import review
+        for target in (0.10, 0.12, 0.15):
+            iv = review.iv_from_delta(103.23, 85.0, 23 / 365, target)
+            self.assertIsNotNone(iv)
+            back = abs(sc.bs_delta(103.23, 85.0, 23 / 365, sc.RATE, iv, False))
+            self.assertAlmostEqual(back, target, places=3)
+
+    def test_unreachable_delta_returns_none_not_a_fake_sigma(self):
+        """|delta| 对 σ **非单调**: σ→∞ 时 d1→∞、N(d1)→1, OTM put 的
+        |delta| = 1−N(d1) → 0, 所以它先升后降有个峰。
+
+        103.23/85P/23天 的峰只到 ~0.26 —— 0.30 物理上到不了。这时必须返回
+        None 而不是一个凑出来的 σ。(最初的注释写的是"单调", 被这条测出来。)
+        """
+        import review
+        peak = max(abs(sc.bs_delta(103.23, 85.0, 23 / 365, sc.RATE, x / 10, False))
+                   for x in range(1, 50))
+        self.assertLess(peak, 0.30)
+        self.assertIsNone(review.iv_from_delta(103.23, 85.0, 23 / 365, 0.30))
+
+    def test_bisect_finds_the_realistic_root(self):
+        """先升后降 = 两个根; 要的是低的那个 (股票 σ 通常 <1.5)。"""
+        import review
+        iv = review.iv_from_delta(103.23, 85.0, 23 / 365, 0.15)
+        self.assertLess(iv, 1.5)
+
+    def test_cushion_alone_cannot_tell_these_apart(self):
+        """同样 5% 缓冲: 剩 2 天 vs 剩 30 天的高波动票, delta 差一个量级。
+
+        这正是不用缓冲当判据的理由。
+        """
+        import review
+        near = {"strike": 100.0, "delta": 0.12, "dte": 5,
+                "spot_at_rec": 112.0, "iv": 0.25}
+        far = {"strike": 100.0, "delta": 0.12, "dte": 45,
+               "spot_at_rec": 112.0, "iv": 0.80}
+        d_near = review.current_put_delta(near, 105.0, 2)
+        d_far = review.current_put_delta(far, 105.0, 30)
+        self.assertLess(d_near, 0.10)          # 剩 2 天, 基本没事
+        self.assertGreater(d_far, 0.25)        # 剩 30 天高波动, 该盯
+        self.assertGreater(d_far, d_near * 3)
+
+    def test_stored_iv_preferred_over_derived(self):
+        import review
+        r = {"strike": 100.0, "delta": 0.12, "dte": 30,
+             "spot_at_rec": 120.0, "iv": 0.50}
+        with_iv = review.current_put_delta(r, 110.0, 20)
+        r2 = dict(r); r2.pop("iv")
+        derived = review.current_put_delta(r2, 110.0, 20)
+        self.assertIsNotNone(with_iv)
+        self.assertIsNotNone(derived)
+        self.assertNotAlmostEqual(with_iv, derived, places=3)
+
+    def test_no_iv_and_no_entry_spot_returns_none(self):
+        """回填行若连缓冲都没有, 就诚实地算不出 —— 不编一个。"""
+        import review
+        self.assertIsNone(review.current_put_delta(
+            {"strike": 100.0, "delta": 0.12, "dte": 30}, 110.0, 20))
+
+    def test_status_bands_use_delta(self):
+        import review
+        def st(**o):
+            r = {"kind": "csp", "symbol": "X", "date": "2026-09-01",
+                 "exp": "2026-10-01", "strike": 100.0, "mid": 1.0,
+                 "status": "open", "last_px": 110.0, "cushion_now": 0.10,
+                 "dte_left": 20, "itm_now": False}
+            r.update(o)
+            return review.open_csp_cells([r])[0][-1]
+        self.assertEqual(st(delta_now=0.35), "⚠ Δ0.35 该管理")
+        self.assertEqual(st(delta_now=0.22), "注意 Δ0.22")
+        self.assertEqual(st(delta_now=0.05), "安全")
+        self.assertEqual(st(last_px=95.0, itm_now=True), "⚠ 已破行权价")
+        # 算不出 delta 时退回缓冲, 且标 ? 说明是降级判据
+        self.assertEqual(st(cushion_now=0.02), "接近 (<5%)?")
+
+    def test_sorted_by_delta_desc_not_cushion(self):
+        """缓冲厚但 delta 高的必须排在前面 —— 实测 ISRG 就是这种。"""
+        import review
+        thick = {"kind": "csp", "symbol": "THICK", "date": "2026-09-01",
+                 "exp": "2026-10-01", "strike": 100.0, "status": "open",
+                 "last_px": 122.0, "cushion_now": 0.22, "delta_now": 0.18,
+                 "dte_left": 17}
+        thin = {"kind": "csp", "symbol": "THIN", "date": "2026-09-01",
+                "exp": "2026-10-01", "strike": 100.0, "status": "open",
+                "last_px": 108.0, "cushion_now": 0.08, "delta_now": 0.04,
+                "dte_left": 10}
+        self.assertEqual([c[0] for c in review.open_csp_cells([thin, thick])],
+                         ["THICK", "THIN"])
+
+    def test_entry_spot_recovered_from_cushion(self):
+        """CSP 行不带 IV, 但 "缓冲 17.7%" 能还原开仓现价。"""
+        import review
+        rpt = ("- **CSP (常规)**: SELL HOOD 2026-10-09 85P @ ~1.02 — "
+               "delta 0.10, 23DTE, 年化 ~19%, 缓冲 17.7%, BE 83.97, OI 854")
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "2026-09-16-close.md").write_text(rpt, encoding="utf-8")
+            rows = review.backfill_rows(Path(td))
+        self.assertAlmostEqual(rows[0]["spot_at_rec"], 85 / (1 - 0.177), places=1)
+        self.assertAlmostEqual(rows[0]["cushion_pct"], 17.7, places=4)
+
+    def test_header_says_open_date(self):
+        import review
+        self.assertIn("开仓日期", [h for h, _, _ in review.OPEN_CSP_HDR])
+        self.assertNotIn("入手", [h for h, _, _ in review.OPEN_CSP_HDR])
 
 
 if __name__ == "__main__":

@@ -83,6 +83,10 @@ CIV_RE = re.compile(r"合约 IV (\d+)%")
 # "入手价"和"正股涨跌"全是 —, 而**到盈亏平衡点的百分比正是筛选器的门槛**
 # (moomoo 的 LEAP 筛选器: 到盈亏平衡点 0~12%), 缺了它看不出票合不合规。
 BE_RE = re.compile(r"BE ([\d.]+) \(([+-][\d.]+)%\)")
+# CSP 行的 "缓冲 17.7%" = (现价 − 行权价)/现价 => 现价 = 行权价/(1−缓冲)。
+# CSP 行不带 IV, 但有了入手现价就能从入手 delta 反推当时的 σ (见 iv_from_delta),
+# 进而算今天的 delta —— 那才是"该不该 roll"的判据。
+CUSH_RE = re.compile(r"缓冲 ([\d.]+)%")
 EXT_RE = re.compile(r"外在 (\d+)%")
 
 
@@ -110,6 +114,10 @@ def backfill_rows(reports_dir: Path) -> list[dict]:
         run_type = "manual" if "-manual" in f.name else "auto"
         txt = f.read_text(encoding="utf-8", errors="ignore")
         for mm in CSP_RE.finditer(txt):
+            _cm = CUSH_RE.search(txt[mm.end():mm.end() + 180])
+            _cush = float(_cm.group(1)) if _cm else None
+            _spot = (round(float(mm["strike"]) / (1 - _cush / 100), 2)
+                     if _cush is not None and _cush < 100 else None)
             rows.append({
                 "date": d, "mode": "close", "symbol": mm["sym"], "kind": "csp",
                 "action": "SELL_PUT", "exp": mm["exp"],
@@ -117,7 +125,8 @@ def backfill_rows(reports_dir: Path) -> list[dict]:
                 "delta": float(mm["delta"]), "dte": int(mm["dte"]),
                 "panic_mode": mm["tag"].startswith("恐慌"),
                 "breakeven": round(float(mm["strike"]) - float(mm["mid"]), 4),
-                "spot_at_rec": None, "source": "backfill",
+                "cushion_pct": _cush,
+                "spot_at_rec": _spot, "source": "backfill",
                 "run_type": run_type, "source_file": f.name, "notes": [],
             })
         for mm in LEAP_RE.finditer(txt):
@@ -142,6 +151,63 @@ def backfill_rows(reports_dir: Path) -> list[dict]:
                 "run_type": run_type, "source_file": f.name, "notes": [],
             })
     return rows
+
+
+def iv_from_delta(spot, strike, T, target_delta, is_call=False):
+    """由已知的 delta 反推当时的隐含波动率 (对 σ 二分)。
+
+    CSP 的报告行不记 IV, 只记 delta/DTE/缓冲。缓冲能还原入手现价, 于是
+    (现价, 行权价, 期限, delta) 四个已知量足以反解 σ。用 scanner 自己的
+    bs_delta, 不重写。
+
+    ⚠️ **|delta| 对 σ 并不单调** (最初的注释把这句写反了, 被测试抓出来):
+    σ→∞ 时 d1 → σ√T/2 → ∞, N(d1) → 1, 于是 OTM put 的 |delta| = 1−N(d1) → 0。
+    它先升后降, 有个峰。实测 103.23/85P/23天 的峰只到 ~0.26 (σ≈2.5-3)。
+
+    这对本函数有两个后果, 都是想要的:
+      - 二分从 lo=1e-3 出发, 收敛到**较低**那个根 —— 也就是现实那一支
+        (股票 σ 通常 <1.5, 那段确实单调递增)。
+      - 目标高于峰值时 (那个 moneyness/期限下物理上到不了), 每次都 d<target,
+        lo 一路推到上界, 被 0.01<iv<4.9 的护栏挡下返回 None。**宁可返回
+        算不出, 不要返回一个假的 σ。**
+    """
+    if not all(x and x > 0 for x in (spot, strike, T)) or not target_delta:
+        return None
+    lo, hi = 1e-3, 5.0
+    for _ in range(80):
+        mid = (lo + hi) / 2
+        d = abs(sc.bs_delta(spot, strike, T, sc.RATE, mid, is_call))
+        if d < target_delta:
+            lo = mid
+        else:
+            hi = mid
+    iv = (lo + hi) / 2
+    return iv if 0.01 < iv < 4.9 else None
+
+
+def current_put_delta(r: dict, last_px, dte_left):
+    """在途空头 put 的**当前** |delta| -> float|None。
+
+    为什么要它: 缓冲不含时间与波动率。5% 缓冲剩 2 天 ≈ delta 0.05 (没事),
+    5% 缓冲剩 30 天的高波动票 ≈ delta 0.35 (该管理)。delta ≈ 到期 ITM 概率,
+    而剧本的入场是 delta 0.10-0.15 —— 翻到 0.30 就是"这笔明显走反了"的
+    尺度无关信号, 也是通行的 roll/管理触发线。
+
+    σ 的来源按可得性退化: 流水账里的合约 IV (scan 行有) > 从入手 delta 反解
+    (回填行, 靠缓冲还原的入手现价) > 算不出。
+    **假设 IV 不变** —— 而空头 put 走反时 IV 通常上行, 所以这个模型 delta
+    偏低、触发偏晚。宁可晚报不要早报, 但读的时候要知道方向。
+    """
+    k, T = r.get("strike"), (dte_left / 365 if dte_left else None)
+    if not (k and T and T > 0 and last_px):
+        return None
+    iv = r.get("iv")
+    if iv is None:
+        iv = iv_from_delta(r.get("spot_at_rec"), k,
+                           (r.get("dte") or 0) / 365, r.get("delta"))
+    if not iv:
+        return None
+    return abs(sc.bs_delta(last_px, k, T, sc.RATE, iv, False))
 
 
 # ---------------------------------------------------------------- 结算
@@ -192,6 +258,8 @@ def resolve(rows: list[dict], today: date) -> list[dict]:
                     # 缓冲 = 现价还要跌多少才碰行权价。这是在途空头 put 唯一
                     # 真正要盯的数 —— delta/年化都是开仓时的事, 开完就不变了
                     r["cushion_now"] = r["last_px"] / r["strike"] - 1
+                    r["delta_now"] = current_put_delta(
+                        r, r["last_px"], r["dte_left"])
                 # 已走过的路径 (已结算那支 min_close_in_window 的在途版本)
                 if ser is not None:
                     win = ser[[i for i in ser.index
@@ -438,10 +506,20 @@ ASSIGNED_HDR = [("标的", 6, False), ("入手", 11, False), ("到期", 11, Fals
                 ("持有期最低", 11, True), ("每股结果", 9, True)]
 
 
-OPEN_CSP_HDR = [("标的", 6, False), ("入手", 11, False), ("到期", 11, False),
+OPEN_CSP_HDR = [("标的", 6, False), ("开仓日期", 11, False), ("到期", 11, False),
                 ("剩余", 6, True), ("行权价", 8, True), ("权利金", 8, True),
                 ("盈亏平衡", 9, True), ("最新价", 8, True), ("缓冲", 8, True),
-                ("持有期最低", 11, True), ("状态", 12, False)]
+                ("Δ开仓", 7, True), ("Δ当前", 7, True),
+                ("持有期最低", 11, True), ("状态", 14, False)]
+
+# 在途空头 put 的管理线。**用 delta 不用缓冲**: 缓冲不含时间与波动率 ——
+# 5% 缓冲剩 2 天 ≈ delta 0.05 (没事), 5% 缓冲剩 30 天的高波动票 ≈ delta 0.35
+# (该管理)。delta ≈ 到期 ITM 概率, 而剧本入场是 0.10-0.15, 翻到 0.30 就是
+# 尺度无关的"明显走反了", 也是通行的 roll 触发线。
+# 算不出 delta 时 (缺 IV 且反解不出) 退回缓冲 5%, 状态里标 "?" 说明是降级判据。
+DELTA_MANAGE = 0.30
+DELTA_WATCH = 0.20
+CUSHION_FALLBACK = 0.05
 
 
 def open_csp_cells(openc: list[dict]) -> list[list[str]]:
@@ -457,8 +535,12 @@ def open_csp_cells(openc: list[dict]) -> list[list[str]]:
     和现在正压在下面的, 是两种处境。
     """
     def _rank(r):
+        """最该管的排最前: 有 delta 用 delta 降序, 没有退回缓冲升序。"""
+        dn = r.get("delta_now")
+        if dn is not None:
+            return (0, -dn)
         c = r.get("cushion_now")
-        return (0, c) if c is not None else (1, 0.0)
+        return (1, c) if c is not None else (2, 0.0)
 
     out = []
     for r in sorted(openc, key=lambda x: (_rank(x), x.get("symbol") or "",
@@ -467,13 +549,17 @@ def open_csp_cells(openc: list[dict]) -> list[list[str]]:
         be = r.get("breakeven")
         if be is None and k is not None:
             be = k - (mid or 0)
-        c = r.get("cushion_now")
+        c, dn = r.get("cushion_now"), r.get("delta_now")
         if last is None:
             st = "无价格"
         elif r.get("itm_now"):
             st = "⚠ 已破行权价"
-        elif c is not None and c < 0.05:
-            st = "接近 (<5%)"
+        elif dn is not None and dn >= DELTA_MANAGE:
+            st = f"⚠ Δ{dn:.2f} 该管理"
+        elif dn is not None and dn >= DELTA_WATCH:
+            st = f"注意 Δ{dn:.2f}"
+        elif dn is None and c is not None and c < CUSHION_FALLBACK:
+            st = "接近 (<5%)?"          # ? = 算不出 delta, 用缓冲降级判的
         elif r.get("breached"):
             st = "曾破位"
         else:
@@ -482,7 +568,8 @@ def open_csp_cells(openc: list[dict]) -> list[list[str]]:
             r.get("symbol") or "—", r.get("date") or "—", r.get("exp") or "—",
             f"{r['dte_left']}天" if r.get("dte_left") is not None else "—",
             _num(k, "{:g}"), _num(mid), _num(be), _num(last),
-            _num(c, "{:+.1%}"), _num(r.get("min_close_so_far")), st])
+            _num(c, "{:+.1%}"), _num(r.get("delta"), "{:.2f}"),
+            _num(dn, "{:.2f}"), _num(r.get("min_close_so_far")), st])
     return out
 
 
@@ -859,9 +946,15 @@ def summarize_md(res: list[dict], title="推荐复盘") -> str:
         M += ["", "**还没有到期的 CSP —— 胜率要等第一批到期后才有意义。**"]
     if openc:
         M += ["", f"### 在途 {len(openc)} 笔", "",
-              f"当前已在行权价下方 **{st['open_itm']}** 笔。按**缓冲**升序 —— "
-              "缓冲 = 现价还要跌多少才碰行权价，是在途空头 put 唯一每天都在动的"
-              "数（delta 与年化开完仓就不变了）。", ""]
+              f"当前已在行权价下方 **{st['open_itm']}** 笔。按**当前 delta** 降序 "
+              f"—— 最该管的排最前。管理线 Δ≥{DELTA_MANAGE:.2f}（≈到期 ITM 概率；"
+              f"剧本入场是 0.10-0.15，翻到 {DELTA_MANAGE:.2f} 就是明显走反了，"
+              "也是通行的 roll 触发线），关注线 "
+              f"Δ≥{DELTA_WATCH:.2f}。", "",
+              "> Δ当前是**模型值**：σ 取流水账里的合约 IV，回填行则由开仓 delta "
+              "反解（缓冲%还原开仓现价）。**假设 IV 不变** —— 空头 put 走反时 IV "
+              "通常上行，所以这个 delta 偏低、触发偏晚。算不出 delta 的行退回"
+              "缓冲 5%，状态带 `?` 标注。", ""]
         _c, _more = _capped(open_csp_cells(openc))
         M += _table_md(OPEN_CSP_HDR, _c)
         if _more:
