@@ -388,8 +388,21 @@ def leap_cells(leap: list[dict]) -> list[list[str]]:
     深度 ITM 的 LEAP 权利金本来就厚, 现价越过行权价只说明有内在价值。状态列
     分三档就是为了把这两件事分开。
     """
+    # 排序 = 截断策略。按标的字母序排, 一截断就随机丢掉需要注意的那几张;
+    # 按"离回本还差多远"排, 留下的永远是最该看的 (✗ OTM 最前, 越过平衡最后)。
+    def _rank(r):
+        k, mid, last = r.get("strike"), r.get("mid"), r.get("last_px")
+        be = (k + mid) if (k is not None and mid is not None) else None
+        if last is None:
+            return (0, 0)                       # 无价格: 排最前, 它是数据问题
+        if be is not None and last > be:
+            return (2, -(last / be - 1))        # 越过平衡: 最后, 超得越多越后
+        if r.get("itm_now"):
+            return (1, -(last / k - 1) if k else 0)
+        return (0, (last / k - 1) if k else 0)  # OTM: 最前, 越深越前
+
     out = []
-    for r in sorted(leap, key=lambda x: (x["symbol"], x["date"])):
+    for r in sorted(leap, key=lambda x: (_rank(x), x["symbol"], x["date"])):
         k, mid, last = r.get("strike"), r.get("mid"), r.get("last_px")
         be = (k + mid) if (k is not None and mid is not None) else None
         ret = r.get("underlying_ret")
@@ -437,14 +450,40 @@ def assigned_cells(done: list[dict]) -> list[list[str]]:
     return out
 
 
-def leap_table(leap: list[dict]) -> list[str]:
+# 单表行数上限。理由是 Gmail: 超过 102,400 字节的正文会被截成
+# "[Message clipped] View entire message" —— 而 scanner.md_to_email_html 为了
+# 手机可读把每张表渲染两遍 (宽 <table> + 窄屏卡片), 实测每行约 2.2KB。
+# LEAP 仓位 450-1100 DTE 不到期, 只增不减: 按每周 1-2 张估, 半年就 ~36 张、
+# HTML ~110KB, 邮件必被截断, 而截掉的正好是排在最后的部分。
+# 截断发生在渲染层不如发生在这里 —— 这里至少能按优先级留下该看的那些,
+# 并明说省了多少笔。
+MAX_TABLE_ROWS = 20
+
+
+def _capped(cells, limit=MAX_TABLE_ROWS):
+    """-> (要显示的行, 被省略的条数)。"""
+    if limit is None or len(cells) <= limit:
+        return cells, 0
+    return cells[:limit], len(cells) - limit
+
+
+def leap_table(leap: list[dict], limit=MAX_TABLE_ROWS) -> list[str]:
     """LEAP 逐笔明细 (纯文本)。聚合数读不出该动哪一张。"""
-    return _table_text(LEAP_HDR, leap_cells(leap))
+    cells, more = _capped(leap_cells(leap), limit)
+    out = _table_text(LEAP_HDR, cells)
+    if more:
+        out.append(f"  (另有 {more} 笔已越过盈亏平衡, 未列出 —— 完整列表见 "
+                   f"reports/review-*.md 或 --json)")
+    return out
 
 
-def assigned_table(done: list[dict]) -> list[str]:
+def assigned_table(done: list[dict], limit=MAX_TABLE_ROWS) -> list[str]:
     """被行权 CSP 明细 (纯文本)。"""
-    return _table_text(ASSIGNED_HDR, assigned_cells(done))
+    cells, more = _capped(assigned_cells(done), limit)
+    out = _table_text(ASSIGNED_HDR, cells)
+    if more:
+        out.append(f"  (另有 {more} 笔结果更好的未列出)")
+    return out
 
 
 def delta_baseline(done: list[dict]) -> dict | None:
@@ -701,7 +740,7 @@ def summarize_md(res: list[dict], title="推荐复盘") -> str:
             M += ["", f"每股账面合计 {st['pnl_sum']:+.2f} / 单均 "
                       f"{st['pnl_avg']:+.2f}（跨标的每股金额**不可加**，仅供对账）。"]
     else:
-        M += ["", "_还没有到期的 CSP —— 胜率要等第一批到期后才有意义。_"]
+        M += ["", "**还没有到期的 CSP —— 胜率要等第一批到期后才有意义。**"]
     if openc:
         M += ["", f"未到期 {len(openc)} 笔，其中当前已在行权价下方 "
                   f"{st['open_itm']} 笔。"]
@@ -712,7 +751,10 @@ def summarize_md(res: list[dict], title="推荐复盘") -> str:
               "（到期擦边被行权，和中途暴跌 30% 再拉回来，是两种完全不同的经历，"
               "而汇总里的一个计数把它们抹平了）。每股结果为正 = 被行权但仍不亏。",
               ""]
-        M += _table_md(ASSIGNED_HDR, assigned_cells(done))
+        _c, _more = _capped(assigned_cells(done))
+        M += _table_md(ASSIGNED_HDR, _c)
+        if _more:
+            M += ["", f"另有 **{_more}** 笔结果更好的未列出。"]
 
     M += ["", "## LEAP", "",
           f"**{len(leap)} 笔 —— 不计入胜率。** LEAP 是 450-1100 DTE 的多头仓，"
@@ -729,14 +771,19 @@ def summarize_md(res: list[dict], title="推荐复盘") -> str:
                       f"均值 {st['leap_ret_avg']:+.1%} / "
                       f"上涨 {st['leap_ret_up']}/{st['leap_ret_n']}。"]
         M.append("")
-        M += _table_md(LEAP_HDR, leap_cells(leap))
+        _c, _more = _capped(leap_cells(leap))
+        M += _table_md(LEAP_HDR, _c)
+        if _more:
+            M += ["", f"另有 **{_more}** 笔已越过盈亏平衡，未列出 —— "
+                      "邮件正文有 Gmail 的 100KB 截断限制，完整列表见 "
+                      "`reports/review-*.md` 或 `--json`。"]
 
     if st["by_symbol"]:
         M += ["", "## 按标的（仅已结算 CSP）", "",
               "| 标的 | 作废 | 每股合计 |", "|---|---|--:|"]
         for sym, o, tot, pnl in st["by_symbol"]:
             M.append(f"| {sym} | {o}/{tot} | {pnl:+.2f} |")
-    M += ["", "---", "", "_分析工具输出，不构成投资建议。_"]
+    M += ["", "---", "", "分析工具输出，不构成投资建议。"]
     return "\n".join(M)
 
 
