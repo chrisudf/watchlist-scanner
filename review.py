@@ -175,6 +175,17 @@ def resolve(rows: list[dict], today: date) -> list[dict]:
                 # 未到期也给一个"此刻在不在行权价上方", 方便看盘中风险
                 if r["last_px"] is not None and r.get("strike"):
                     r["itm_now"] = r["last_px"] <= r["strike"]
+                    # 缓冲 = 现价还要跌多少才碰行权价。这是在途空头 put 唯一
+                    # 真正要盯的数 —— delta/年化都是开仓时的事, 开完就不变了
+                    r["cushion_now"] = r["last_px"] / r["strike"] - 1
+                # 已走过的路径 (已结算那支 min_close_in_window 的在途版本)
+                if ser is not None:
+                    win = ser[[i for i in ser.index
+                               if date.fromisoformat(r["date"]) <= i <= today]]
+                    if len(win):
+                        r["min_close_so_far"] = round(float(win.min()), 4)
+                        if r.get("strike"):
+                            r["breached"] = bool(float(win.min()) <= r["strike"])
             elif ser is None:
                 r["status"] = "unresolved_no_price"
             else:
@@ -391,6 +402,54 @@ ASSIGNED_HDR = [("标的", 6, False), ("入手", 11, False), ("到期", 11, Fals
                 ("持有期最低", 11, True), ("每股结果", 9, True)]
 
 
+OPEN_CSP_HDR = [("标的", 6, False), ("入手", 11, False), ("到期", 11, False),
+                ("剩余", 6, True), ("行权价", 8, True), ("权利金", 8, True),
+                ("盈亏平衡", 9, True), ("最新价", 8, True), ("缓冲", 8, True),
+                ("持有期最低", 11, True), ("状态", 12, False)]
+
+
+def open_csp_cells(openc: list[dict]) -> list[list[str]]:
+    """在途 CSP 明细 (纯函数)。
+
+    此前这些只汇总成一行"当前已在行权价下方 N 笔" —— 看不到是哪几笔、离到期
+    还有多久、离行权价还有多远。而在途空头 put 真正要盯的就是**缓冲**
+    (现价还要跌多少才碰行权价): delta 与年化都是开仓那一刻的事, 开完就不再变,
+    缓冲是每天都在动的那个。
+
+    按缓冲升序 = 最危险的排最前 (与 LEAP/被行权表同一条截断策略: 排序决定
+    截断时留下谁)。"曾破位"与"当前已破"分开 —— 中途探过行权价又拉回来的,
+    和现在正压在下面的, 是两种处境。
+    """
+    def _rank(r):
+        c = r.get("cushion_now")
+        return (0, c) if c is not None else (1, 0.0)
+
+    out = []
+    for r in sorted(openc, key=lambda x: (_rank(x), x.get("symbol") or "",
+                                          x.get("date") or "")):
+        k, mid, last = r.get("strike"), r.get("mid"), r.get("last_px")
+        be = r.get("breakeven")
+        if be is None and k is not None:
+            be = k - (mid or 0)
+        c = r.get("cushion_now")
+        if last is None:
+            st = "无价格"
+        elif r.get("itm_now"):
+            st = "⚠ 已破行权价"
+        elif c is not None and c < 0.05:
+            st = "接近 (<5%)"
+        elif r.get("breached"):
+            st = "曾破位"
+        else:
+            st = "安全"
+        out.append([
+            r.get("symbol") or "—", r.get("date") or "—", r.get("exp") or "—",
+            f"{r['dte_left']}天" if r.get("dte_left") is not None else "—",
+            _num(k, "{:g}"), _num(mid), _num(be), _num(last),
+            _num(c, "{:+.1%}"), _num(r.get("min_close_so_far")), st])
+    return out
+
+
 def leap_cells(leap: list[dict]) -> list[list[str]]:
     """LEAP 明细的单元格矩阵 (纯函数)。
 
@@ -475,6 +534,15 @@ def _capped(cells, limit=MAX_TABLE_ROWS):
     if limit is None or len(cells) <= limit:
         return cells, 0
     return cells[:limit], len(cells) - limit
+
+
+def open_csp_table(openc: list[dict], limit=MAX_TABLE_ROWS) -> list[str]:
+    """在途 CSP 明细 (纯文本)。"""
+    cells, more = _capped(open_csp_cells(openc), limit)
+    out = _table_text(OPEN_CSP_HDR, cells)
+    if more:
+        out.append(f"  (另有 {more} 笔缓冲更厚的未列出)")
+    return out
 
 
 def leap_table(leap: list[dict], limit=MAX_TABLE_ROWS) -> list[str]:
@@ -660,6 +728,8 @@ def summarize(res: list[dict]) -> str:
     if openc:
         L.append(f"  未到期 {len(openc)} 笔, 其中当前已在行权价下方 "
                  f"{st['open_itm']} 笔")
+        L.append("")
+        L += open_csp_table(openc)
     if st["assigned_cells"]:
         L.append("")
         L.append(f"  被行权明细 ({len(st['assigned_cells'])} 笔) —— "
@@ -751,8 +821,14 @@ def summarize_md(res: list[dict], title="推荐复盘") -> str:
     else:
         M += ["", "**还没有到期的 CSP —— 胜率要等第一批到期后才有意义。**"]
     if openc:
-        M += ["", f"未到期 {len(openc)} 笔，其中当前已在行权价下方 "
-                  f"{st['open_itm']} 笔。"]
+        M += ["", f"### 在途 {len(openc)} 笔", "",
+              f"当前已在行权价下方 **{st['open_itm']}** 笔。按**缓冲**升序 —— "
+              "缓冲 = 现价还要跌多少才碰行权价，是在途空头 put 唯一每天都在动的"
+              "数（delta 与年化开完仓就不变了）。", ""]
+        _c, _more = _capped(open_csp_cells(openc))
+        M += _table_md(OPEN_CSP_HDR, _c)
+        if _more:
+            M += ["", f"另有 **{_more}** 笔缓冲更厚的未列出。"]
     if st["assigned_cells"]:
         M += ["", f"### 被行权明细（{len(st['assigned_cells'])} 笔）", "",
               "作废的单子没什么可看 —— 权利金全收，按设计发生。**被行权的才带"

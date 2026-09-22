@@ -3075,5 +3075,71 @@ class TestLeapBreakevenWording(unittest.TestCase):
             self.assertNotIn("才是真的不亏。两个数差得远", out)
 
 
+
+class TestOpenCspTable(unittest.TestCase):
+    """在途 CSP: 汇总成一行"已在行权价下方 N 笔"读不出该盯哪一笔。"""
+
+    def _open(self, sym, strike, last, cushion, **o):
+        r = {"kind": "csp", "symbol": sym, "date": "2026-09-14",
+             "exp": "2026-10-02", "strike": strike, "mid": 2.0,
+             "breakeven": strike - 2.0, "status": "open", "last_px": last,
+             "cushion_now": cushion, "itm_now": last <= strike,
+             "dte_left": 10, "min_close_so_far": last * 0.97, "source": "scan"}
+        r.update(o)
+        return r
+
+    def test_sorted_riskiest_first(self):
+        """缓冲升序 —— 截断时留下的永远是最该盯的。"""
+        import review
+        rows = [self._open("FAT", 100.0, 145.0, 0.45),
+                self._open("THIN", 100.0, 108.0, 0.08),
+                self._open("MID", 100.0, 120.0, 0.20)]
+        self.assertEqual([c[0] for c in review.open_csp_cells(rows)],
+                         ["THIN", "MID", "FAT"])
+
+    def test_status_bands(self):
+        import review
+        def st(r):
+            return review.open_csp_cells([r])[0][-1]
+        self.assertEqual(st(self._open("A", 100.0, 95.0, -0.05)), "⚠ 已破行权价")
+        self.assertEqual(st(self._open("B", 100.0, 103.0, 0.03)), "接近 (<5%)")
+        self.assertEqual(st(self._open("C", 100.0, 130.0, 0.30)), "安全")
+        # 曾破位但现在安全 —— 与"当前已破"是两种处境
+        self.assertEqual(st(self._open("D", 100.0, 130.0, 0.30, breached=True)),
+                         "曾破位")
+
+    def test_cushion_is_the_headline_number(self):
+        """delta/年化是开仓那一刻的事, 缓冲是每天都在动的那个。"""
+        import review
+        row = review.open_csp_cells([self._open("X", 100.0, 116.6, 0.166)])[0]
+        self.assertIn("+16.6%", row)
+
+    def test_missing_fields_degrade_not_crash(self):
+        """一行缺字段不该炸掉整份报告 (与坏 JSONL 行跳过同一条容错口径)。"""
+        import review
+        cells = review.open_csp_cells([{"kind": "csp", "status": "open",
+                                        "strike": 10.0}])
+        self.assertEqual(cells[0][0], "—")
+        self.assertEqual(cells[0][-1], "无价格")
+
+    def test_appears_in_both_renderers(self):
+        import review
+        res = [self._open("GOOG", 325.0, 350.87, 0.08)]
+        t, m = review.summarize(res), review.summarize_md(res)
+        for frag in ("GOOG", "+8.0%", "325"):
+            self.assertIn(frag, t, frag)
+            self.assertIn(frag, m, frag)
+        self.assertIn("在途", m)
+
+    def test_capped_like_the_others(self):
+        import review
+        rows = [self._open(f"S{i:02d}", 100.0, 100 + i, i / 100)
+                for i in range(30)]
+        shown, more = review._capped(review.open_csp_cells(rows))
+        self.assertEqual(len(shown), review.MAX_TABLE_ROWS)
+        self.assertEqual(more, 10)
+        self.assertIn("另有 10 笔", chr(10).join(review.open_csp_table(rows)))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
