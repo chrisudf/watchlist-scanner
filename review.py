@@ -339,34 +339,59 @@ def _pad(t, w: int, right=False) -> str:
     return (gap + t) if right else (t + gap)
 
 
-def leap_table(leap: list[dict]) -> list[str]:
-    """LEAP 逐笔明细 (纯函数) -> 报表行。
+def _table_text(hdr, rows) -> list[str]:
+    """(表头规格, 单元格矩阵) -> 纯文本表。列间留一格 (右对齐数字列会与紧随
+    其后的中文列贴死, 实测 "+18.7%✓ 越过平衡")。"""
+    if not rows:
+        return []
+    out = ["  " + " ".join(_pad(h, w, r) for h, w, r in hdr),
+           "  " + "-" * (sum(w for _, w, _ in hdr) + len(hdr) - 1)]
+    for cells in rows:
+        out.append("  " + " ".join(_pad(c, w, rt)
+                                   for c, (_, w, rt) in zip(cells, hdr)))
+    return out
 
-    只给"当前 ITM 17/30"这类聚合数读不出任何可操作信息 —— 是哪几张、什么时候
-    进的、离到期还有多久, 全看不见。LEAP 是要长期持有并择机 roll 的仓位, 明细
-    才是这一段的用处。
+
+def _table_md(hdr, rows) -> list[str]:
+    """同一份 (表头规格, 单元格矩阵) -> markdown 表。数值列右对齐 (--:)。"""
+    if not rows:
+        return []
+    out = ["| " + " | ".join(h for h, _, _ in hdr) + " |",
+           "|" + "|".join("--:" if r else "---" for _, _, r in hdr) + "|"]
+    for cells in rows:
+        out.append("| " + " | ".join(str(c) for c in cells) + " |")
+    return out
+
+
+def _num(v, fmt="{:.2f}"):
+    """None -> — (不补 0、不留空: 缺数据和数据为零是两回事)。"""
+    return fmt.format(v) if v is not None else "—"
+
+
+# 表定义: (表头规格, 取单元格的函数)。**文本与 markdown 共用同一份** ——
+# 两处各写一遍列定义就会漂移, 这是 compute_stats 同源化的同一条理由。
+LEAP_HDR = [("标的", 6, False), ("入手", 11, False), ("到期", 11, False),
+            ("行权价", 8, True), ("入手价", 8, True), ("权利金", 8, True),
+            ("盈亏平衡", 9, True), ("最新价", 8, True), ("正股涨跌", 9, True),
+            ("状态", 12, False), ("剩余", 7, True)]
+
+ASSIGNED_HDR = [("标的", 6, False), ("入手", 11, False), ("到期", 11, False),
+                ("行权价", 8, True), ("权利金", 8, True), ("盈亏平衡", 9, True),
+                ("到期收盘", 9, True), ("落价幅度", 9, True),
+                ("持有期最低", 11, True), ("每股结果", 9, True)]
+
+
+def leap_cells(leap: list[dict]) -> list[list[str]]:
+    """LEAP 明细的单元格矩阵 (纯函数)。
 
     **ITM 不等于赚钱**: 多头 call 的盈亏平衡是 行权价 + 权利金, 不是行权价。
-    深度 ITM 的 LEAP 权利金本来就厚 (实测 mock 里 NVDA 150C 付了 45+),
-    现价越过行权价只说明有内在价值, 越过盈亏平衡才是真的不亏。所以两列都给,
-    并且汇总里两个计数并排 —— 只报 ITM 会系统性高估这条腿的表现。
-
-    入手时现价取自 spot_at_rec: scan/mock 行有, 回填行没有 (报告正文里没写),
-    那几行显示 "—" 而不是留空或补 0。
+    深度 ITM 的 LEAP 权利金本来就厚, 现价越过行权价只说明有内在价值。状态列
+    分三档就是为了把这两件事分开。
     """
-    if not leap:
-        return []
-    hdr = [("标的", 6, False), ("入手", 11, False), ("到期", 11, False),
-           ("行权价", 8, True), ("入手价", 8, True), ("权利金", 8, True),
-           ("盈亏平衡", 9, True), ("最新价", 8, True), ("正股涨跌", 9, True),
-           ("状态", 12, False), ("剩余", 7, True)]
-    # 列间留一格: 右对齐的数字列与紧随其后的列会贴死 (实测 "+18.7%✓ 越过平衡")
-    out = ["  " + " ".join(_pad(h, w, r) for h, w, r in hdr)]
-    out.append("  " + "-" * (sum(w for _, w, _ in hdr) + len(hdr) - 1))
+    out = []
     for r in sorted(leap, key=lambda x: (x["symbol"], x["date"])):
         k, mid, last = r.get("strike"), r.get("mid"), r.get("last_px")
         be = (k + mid) if (k is not None and mid is not None) else None
-        sp = r.get("spot_at_rec")
         ret = r.get("underlying_ret")
         if last is None:
             st = "无价格"
@@ -376,18 +401,50 @@ def leap_table(leap: list[dict]) -> list[str]:
             st = "ITM 未回本"
         else:
             st = "✗ OTM"
-        cells = [r["symbol"], r["date"], r.get("exp") or "—",
-                 f"{k:g}" if k is not None else "—",
-                 f"{sp:.2f}" if sp is not None else "—",
-                 f"{mid:.2f}" if mid is not None else "—",
-                 f"{be:.2f}" if be is not None else "—",
-                 f"{last:.2f}" if last is not None else "—",
-                 f"{ret:+.1%}" if ret is not None else "—",
-                 st,
-                 f"{r['dte_left']}天" if r.get("dte_left") is not None else "—"]
-        out.append("  " + " ".join(_pad(c, w, rt)
-                                   for c, (_, w, rt) in zip(cells, hdr)))
+        out.append([
+            r["symbol"], r["date"], r.get("exp") or "—",
+            _num(k, "{:g}"), _num(r.get("spot_at_rec")), _num(mid), _num(be),
+            _num(last), _num(ret, "{:+.1%}"), st,
+            f"{r['dte_left']}天" if r.get("dte_left") is not None else "—"])
     return out
+
+
+def assigned_cells(done: list[dict]) -> list[list[str]]:
+    """被行权的 CSP 明细 (纯函数)。
+
+    **这是这套剧本里真正要复盘的部分。** 作废的单子没什么可看的 —— 权利金全收,
+    按设计发生。被行权的才带信息: 落价幅度说明是擦边还是砸穿, 持有期最低价说明
+    路径有多难受 (到期擦边被行权和中途暴跌 30% 是两种完全不同的经历, 汇总里的
+    一个计数把它们抹平了)。
+
+    每股结果为正 = 被行权但仍不亏 (到期收盘仍在盈亏平衡之上), 那是预期内的
+    接货, 不是失败。
+    """
+    rows = [r for r in done if r.get("status") == "assigned"]
+    out = []
+    for r in sorted(rows, key=lambda x: (x.get("pnl_per_share") or 0)):
+        k, mid = r.get("strike"), r.get("mid")
+        be = r.get("breakeven")
+        if be is None and k is not None:
+            be = k - (mid or 0)
+        close = r.get("settle_close")
+        drop = (close / k - 1) if (close is not None and k) else None
+        out.append([
+            r["symbol"], r["date"], r.get("exp") or "—",
+            _num(k, "{:g}"), _num(mid), _num(be), _num(close),
+            _num(drop, "{:+.1%}"), _num(r.get("min_close_in_window")),
+            _num(r.get("pnl_per_share"), "{:+.2f}")])
+    return out
+
+
+def leap_table(leap: list[dict]) -> list[str]:
+    """LEAP 逐笔明细 (纯文本)。聚合数读不出该动哪一张。"""
+    return _table_text(LEAP_HDR, leap_cells(leap))
+
+
+def assigned_table(done: list[dict]) -> list[str]:
+    """被行权 CSP 明细 (纯文本)。"""
+    return _table_text(ASSIGNED_HDR, assigned_cells(done))
 
 
 def delta_baseline(done: list[dict]) -> dict | None:
@@ -471,6 +528,7 @@ def compute_stats(res: list[dict]) -> dict:
             st["leap_ret_avg"] = sum(rets) / len(rets)
             st["leap_ret_up"] = sum(1 for x in rets if x > 0)
             st["leap_ret_n"] = len(rets)
+    st["assigned_cells"] = assigned_cells(done)
     by = {}
     for r in done:
         by.setdefault(r["symbol"], []).append(r)
@@ -553,6 +611,11 @@ def summarize(res: list[dict]) -> str:
     if openc:
         L.append(f"  未到期 {len(openc)} 笔, 其中当前已在行权价下方 "
                  f"{st['open_itm']} 笔")
+    if st["assigned_cells"]:
+        L.append("")
+        L.append(f"  被行权明细 ({len(st['assigned_cells'])} 笔) —— "
+                 "作废的单子没什么可看, 被行权的才带信息")
+        L += assigned_table(done)
 
     L.append("")
     L.append(f"【LEAP】{len(leap)} 笔 —— **不计入胜率**")
@@ -642,6 +705,14 @@ def summarize_md(res: list[dict], title="推荐复盘") -> str:
     if openc:
         M += ["", f"未到期 {len(openc)} 笔，其中当前已在行权价下方 "
                   f"{st['open_itm']} 笔。"]
+    if st["assigned_cells"]:
+        M += ["", f"### 被行权明细（{len(st['assigned_cells'])} 笔）", "",
+              "作废的单子没什么可看 —— 权利金全收，按设计发生。**被行权的才带"
+              "信息**：落价幅度说明是擦边还是砸穿，持有期最低价说明路径有多难受"
+              "（到期擦边被行权，和中途暴跌 30% 再拉回来，是两种完全不同的经历，"
+              "而汇总里的一个计数把它们抹平了）。每股结果为正 = 被行权但仍不亏。",
+              ""]
+        M += _table_md(ASSIGNED_HDR, assigned_cells(done))
 
     M += ["", "## LEAP", "",
           f"**{len(leap)} 笔 —— 不计入胜率。** LEAP 是 450-1100 DTE 的多头仓，"
@@ -657,31 +728,8 @@ def summarize_md(res: list[dict], title="推荐复盘") -> str:
             M += ["", f"正股自推荐日涨跌：中位 {st['leap_ret_med']:+.1%} / "
                       f"均值 {st['leap_ret_avg']:+.1%} / "
                       f"上涨 {st['leap_ret_up']}/{st['leap_ret_n']}。"]
-        M += ["", "| 标的 | 入手 | 到期 | 行权价 | 入手价 | 权利金 | 盈亏平衡 "
-                  "| 最新价 | 正股涨跌 | 状态 | 剩余 |",
-              "|---|---|---|--:|--:|--:|--:|--:|--:|---|--:|"]
-        for r in sorted(leap, key=lambda x: (x["symbol"], x["date"])):
-            k, mid, last = r.get("strike"), r.get("mid"), r.get("last_px")
-            be = (k + mid) if (k is not None and mid is not None) else None
-            sp, ret = r.get("spot_at_rec"), r.get("underlying_ret")
-            if last is None:
-                stt = "无价格"
-            elif be is not None and last > be:
-                stt = "✓ 越过平衡"
-            elif r.get("itm_now"):
-                stt = "ITM 未回本"
-            else:
-                stt = "✗ OTM"
-            M.append("| " + " | ".join([
-                r["symbol"], r["date"], r.get("exp") or "—",
-                f"{k:g}" if k is not None else "—",
-                f"{sp:.2f}" if sp is not None else "—",
-                f"{mid:.2f}" if mid is not None else "—",
-                f"{be:.2f}" if be is not None else "—",
-                f"{last:.2f}" if last is not None else "—",
-                f"{ret:+.1%}" if ret is not None else "—", stt,
-                f"{r['dte_left']}天" if r.get("dte_left") is not None else "—",
-            ]) + " |")
+        M.append("")
+        M += _table_md(LEAP_HDR, leap_cells(leap))
 
     if st["by_symbol"]:
         M += ["", "## 按标的（仅已结算 CSP）", "",

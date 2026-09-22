@@ -2892,5 +2892,90 @@ class TestMarkdownRenderer(unittest.TestCase):
         self.assertIn("# ", review.summarize_md([]))
 
 
+
+class TestAssignedTable(unittest.TestCase):
+    """被行权明细: 作废的单子没什么可看, 被行权的才带信息。"""
+
+    def _done(self):
+        return [
+            {"kind": "csp", "symbol": "HOOD", "date": "2026-02-02",
+             "exp": "2026-02-23", "strike": 75.0, "mid": 0.85,
+             "breakeven": 74.15, "status": "assigned", "settle_close": 71.78,
+             "min_close_in_window": 71.12, "pnl_per_share": -2.37,
+             "above_breakeven": False, "breached": True},
+            {"kind": "csp", "symbol": "NVDA", "date": "2026-07-21",
+             "exp": "2026-08-21", "strike": 170.0, "mid": 2.5,
+             "breakeven": 167.5, "status": "expired_otm", "settle_close": 185.0,
+             "pnl_per_share": 2.5, "above_breakeven": True, "breached": False},
+            # 被行权但仍不亏: 到期收盘落在行权价与盈亏平衡之间
+            {"kind": "csp", "symbol": "GLD", "date": "2026-03-01",
+             "exp": "2026-03-20", "strike": 300.0, "mid": 5.0,
+             "breakeven": 295.0, "status": "assigned", "settle_close": 297.0,
+             "min_close_in_window": 296.0, "pnl_per_share": 2.0,
+             "above_breakeven": True, "breached": True},
+        ]
+
+    def test_only_assigned_rows(self):
+        """作废的不进这张表。"""
+        import review
+        cells = review.assigned_cells(self._done())
+        self.assertEqual({c[0] for c in cells}, {"HOOD", "GLD"})
+
+    def test_sorted_worst_first(self):
+        """最该复盘的排最前 —— 每股结果升序。"""
+        import review
+        cells = review.assigned_cells(self._done())
+        self.assertEqual([c[0] for c in cells], ["HOOD", "GLD"])
+
+    def test_assigned_can_still_be_profitable(self):
+        """被行权 != 亏。GLD 到期 297 落在行权价 300 与盈亏平衡 295 之间。"""
+        import review
+        row = [c for c in review.assigned_cells(self._done()) if c[0] == "GLD"][0]
+        self.assertEqual(row[-1], "+2.00")
+
+    def test_drop_depth_and_path_low_both_shown(self):
+        """落价幅度说明擦边还是砸穿, 持有期最低说明路径有多难受。"""
+        import review
+        row = [c for c in review.assigned_cells(self._done()) if c[0] == "HOOD"][0]
+        self.assertIn("-4.3%", row)      # 71.78/75 - 1
+        self.assertIn("71.12", row)      # 持有期最低
+
+    def test_appears_in_both_renderers(self):
+        """两个渲染器共用同一份 cells —— 加一张表不该写两遍。"""
+        import review
+        res = self._done() + []
+        for r in res:
+            r.setdefault("source", "scan")
+        t, m = review.summarize(res), review.summarize_md(res)
+        for frag in ("被行权明细", "HOOD", "71.12", "-2.37"):
+            self.assertIn(frag, t, frag)
+            self.assertIn(frag, m, frag)
+
+    def test_absent_when_nothing_assigned(self):
+        import review
+        clean = [r for r in self._done() if r["status"] == "expired_otm"]
+        for r in clean:
+            r.setdefault("source", "scan")
+        self.assertNotIn("被行权明细", review.summarize(clean))
+        self.assertNotIn("被行权明细", review.summarize_md(clean))
+
+    def test_leap_table_shares_one_column_spec(self):
+        """LEAP 表的列定义只有一份 —— 文本与 md 用同一个 LEAP_HDR。"""
+        import review
+        leap = [{"kind": "leap", "symbol": "NVDA", "date": "2025-12-01",
+                 "exp": "2027-04-15", "strike": 180.0, "mid": 21.92,
+                 "spot_at_rec": 179.92, "last_px": 222.27,
+                 "underlying_ret": 0.2354, "itm_now": True, "dte_left": 206}]
+        cells = review.leap_cells(leap)
+        txt = chr(10).join(review._table_text(review.LEAP_HDR, cells))
+        md = chr(10).join(review._table_md(review.LEAP_HDR, cells))
+        for c in cells[0]:
+            self.assertIn(str(c), txt)
+            self.assertIn(str(c), md)
+        self.assertEqual(len(review.LEAP_HDR), len(cells[0]))
+        self.assertEqual(len(review.ASSIGNED_HDR),
+                         len(review.assigned_cells(self._done())[0]))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
