@@ -153,6 +153,18 @@ SETTINGS_DEFAULTS = {
     "leap_max_be_pct": 12.0,
     "leap_earnings_buffer_days": 14,  # 财报前 <=2 周不进 LEAP (2026-08-09 校准)
     "leap_earnings_note_days": 30,    # 财报 15-30 天内出票但带提示
+    # LEAP 的 IV 贵不贵 (2026-09-24, 与 stock-analysis 技能第 4 步同口径):
+    # 读数 P = 该到期日平值 IV 在**标的自身**滚动实际波动分布里的分位。
+    # 取代原来的"自建 IVP > 60": 那是 30 天口径, 财报后 NVDA 的 IV30 掉了
+    # ~10 点而 Jan'28 只掉 ~2.5 点, 两个方向都会骗人; IV 绝对值也不能跨标的
+    # 比 —— 同一天 NVDA/IBM 的 Jan'28 平值 IV 都是 ~39%, 分位却是 3 / 98。
+    # 50/80 而不是 40/60: IV 平均比事后实际波动高几个点 (波动率风险溢价),
+    # 正常就落在 60-70 分位。初版阈值, 样本攒够再校准。
+    "leap_iv_bands": [50.0, 80.0],   # P < 50 = A 便宜; 50-80 = B; > 80 = C 贵
+    "leap_iv_bump": 1.15,            # IV > 此倍 x max(近1年, 近2年实际波动) → 升一档
+    "leap_iv_abs_gate": 0.58,        # 合约 IV >= 此值 = D 档, 不用 LEAP 表达
+    "leap_iv_hist_years": 10,        # 实际波动分布取多少年日线
+    "leap_iv_min_years": 5.0,        # 历史短于此, 分位只作参考 (带提示)
     # regime
     "stage2_window_bars": 10,    # trading days after inversion resolves
     "episode_min_days": 3, "episode_min_peak": 1.10,
@@ -383,6 +395,9 @@ def journal_rows(results, d: str, mode: str, regime: dict) -> list[dict]:
                 "be_pct_at_rec": (t["be_pct"] / 100
                                   if t.get("be_pct") is not None else None),
                 "extrinsic_pct": t.get("extrinsic_pct"),
+                # LEAP 开仓时的 IV 档位 —— 复盘要能分出"C 档照开的票"表现如何
+                "iv_band": (t.get("iv_gauge") or {}).get("band"),
+                "iv_pctile": (t.get("iv_gauge") or {}).get("pctile"),
                 "panic_mode": t.get("panic_mode"),
                 "zone": cfg.get("value_zone"), "zone_asof": cfg.get("zone_asof"),
                 "high_beta": cfg.get("high_beta"),
@@ -2005,6 +2020,115 @@ def leap_ticket(cc: ChainCache, spot: float, cfg: dict,
     return pick
 
 
+IV_BAND_TEXT = {
+    "A": "IV 便宜: 剧本允许 ATM 凸性档 (长期限 ~0.60δ), 本票是 deep ITM, 也可改用平值",
+    "B": "IV 正常: deep ITM 正合剧本",
+    "C": "IV 贵: 剧本改 call spread/PMCC 或等回落, deep ITM 也改 spread",
+    "D": "合约 IV 过绝对门: 剧本不用 LEAP 表达, 改 spread / sell put / 正股",
+}
+
+
+def leap_iv_band(atm_iv: float, closes, dte: int, s: dict) -> dict | None:
+    """LEAP 到期日的平值 IV 贵不贵 (纯函数) -> 档位读数, 历史不够时 None。
+
+    P = atm_iv 在"滚动实际波动"分布里的分位: 窗口长度 = 合约剩余期限
+    (上限 24 个月) 的交易日数, 每 5 个交易日取一个窗口, 收盘对收盘对数收益。
+    拿**同一只票自己的**历史比, 因为 IV 绝对值不跨标的可比。
+
+    两道修正:
+      - 升档: IV > leap_iv_bump x max(近1年, 近2年实际波动)。波动 regime
+        下移的标的 (NVDA 十年前体量小、波动高), 长历史分位会把 IV 显得便宜
+        —— 连近两年都比不过的 IV 不算便宜。
+      - D 档: 合约 IV >= leap_iv_abs_gate 时与分位无关。平值 LEAP 价格约等于
+        0.4 x IV x sqrt(T) x 股价, IV 60% 时 16 个月平值要付股价 ~28%,
+        便不便宜都救不回盈亏平衡 (IONQ 77% 在自身历史里是 0 分位, 照样不行)。
+    反向情况 (IV 低于近 1-2 年实际波动 = regime 上移) 只标 regime_up,
+    不自动降档 —— 买方默认保守, 降不降由人写理由。"""
+    px = [float(x) for x in closes if x is not None and x > 0 and math.isfinite(x)]
+    rets = [math.log(px[i] / px[i - 1]) for i in range(1, len(px))]
+    h = max(21, round(min(dte, 730) * 252 / 365))
+    if atm_iv is None or len(rets) < h + 60:
+        return None
+
+    def rv(xs):
+        m = sum(xs) / len(xs)
+        return math.sqrt(sum((x - m) ** 2 for x in xs) / len(xs) * 252)
+
+    windows = [rv(rets[i:i + h]) for i in range(0, len(rets) - h + 1, 5)]
+    pctile = 100.0 * sum(1 for w in windows if w < atm_iv) / len(windows)
+    rv1y, rv2y = rv(rets[-252:]), rv(rets[-504:])
+    lo, hi = s["leap_iv_bands"]
+    idx = 0 if pctile < lo else 1 if pctile <= hi else 2
+    bumped = atm_iv > s["leap_iv_bump"] * max(rv1y, rv2y) and idx < 2
+    band = "ABC"[idx + bumped]
+    if atm_iv >= s["leap_iv_abs_gate"]:
+        band = "D"
+    return {"band": band, "atm_iv": atm_iv, "pctile": pctile,
+            "rv1y": rv1y, "rv2y": rv2y, "bumped": bumped,
+            "regime_up": atm_iv < min(rv1y, rv2y),
+            "years": len(rets) / 252, "windows": len(windows)}
+
+
+def leap_atm_iv(cc: ChainCache, exp: str, dte: int, spot: float) -> float | None:
+    """LEAP 到期日的平值 IV: 离现价最近的行权价, call/put 各反解再取均值。
+
+    两腿平均是为了抵掉股息: BS 不计股息时 call 的 IV 偏高、put 偏低,
+    幅度相近 (KO 2028-01 平值 call 19.5% / put 23.2%, 均值 21.3% = CBOE)。"""
+    ch = cc.chain(exp)
+    cutoff = _stale_cutoff()
+    T = dte / 365.0
+    ivs = []
+    for df, is_call in ((ch.calls, True), (ch.puts, False)):
+        if df is None or df.empty:
+            continue
+        row = df.loc[(df["strike"] - spot).abs().idxmin()]
+        mid, _src = _mark(row, cutoff)
+        iv = contract_iv(row, mid, spot, T, is_call)
+        if iv:
+            ivs.append(iv)
+    return sum(ivs) / len(ivs) if ivs else None
+
+
+def attach_leap_iv_band(ticket: dict, cc: ChainCache, spot: float, s: dict) -> None:
+    """给已出的 LEAP 真票挂上 iv_gauge 与一条档位 note (原地修改)。
+
+    多一次 10 年日线请求, 只在真票发出时才付。取不到就明说, 不回落到
+    30 天自建 IVP —— 那正是被这条规则取代的口径。"""
+    try:
+        atm = leap_atm_iv(cc, ticket["exp"], ticket["dte"], spot)
+        hist = cc.tk.history(period=f"{s['leap_iv_hist_years']}y",
+                             interval="1d", auto_adjust=True)
+        g = leap_iv_band(atm, list(hist["Close"]), ticket["dte"], s)
+    except Exception as e:
+        ticket["notes"].insert(0, f"IV 档位计算失败 ({type(e).__name__}) — "
+                                  "下单前用 stock-analysis 的 leap_iv_gauge.py 实查")
+        return
+    if g is None:
+        ticket["notes"].insert(0, "IV 档位无读数 (平值报价或历史不足) — "
+                                  "下单前用 stock-analysis 的 leap_iv_gauge.py 实查")
+        return
+    head = (f"IV 档位 {g['band']}: 平值 IV {g['atm_iv'] * 100:.0f}% 在自身"
+            f"{g['years']:.0f}年实际波动里是 {g['pctile']:.0f} 分位 (近1年 "
+            f"{g['rv1y'] * 100:.0f}% / 近2年 {g['rv2y'] * 100:.0f}%)"
+            + (f" → IV 超过近 1-2 年实际波动的 {s['leap_iv_bump']:g} 倍, 升一档"
+               if g["bumped"] else "")
+            + f" — {IV_BAND_TEXT[g['band']]}")
+    extra = []
+    if g["years"] < s["leap_iv_min_years"]:
+        extra.append(f"历史只有 {g['years']:.1f} 年, 分位仅供参考")
+    if g["regime_up"] and g["band"] == "C":
+        extra.append("IV 低于近 1-2 年实际波动 (波动 regime 上移), 可人工降一档但要写理由")
+    g["note"] = head + ("; " + "; ".join(extra) if extra else "")
+    ticket["iv_gauge"] = g
+    ticket["notes"].insert(0, g["note"])
+
+
+def leap_iv_expensive(leap) -> bool:
+    """报告层的 IV 门: 真票且档位 C/D = 剧本要求改结构。"""
+    return (bool(leap) and "skip_reason" not in leap
+            and (leap.get("iv_gauge") or {}).get("band") in ("C", "D"))
+
+
 def stock_ladder(zone, s: dict) -> list[float]:
     """正股分批档位: ① 接货带上沿 ② 下沿 ③ 恐慌档 (下沿再打折) —
     末档留给真正的恐慌价; 间距是否递增取决于区间宽度, render 侧核对."""
@@ -2422,6 +2546,11 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
                 # TREND"兜底失效, 不会无限挂着
                 emitted = "skip_reason" not in r["leap"]
                 r["leap_emitted"] = emitted
+                if emitted:
+                    # IV 档位只给真票算 (多一次 10 年日线请求)。C/D 档仍然
+                    # 算"已发" —— 票照出、由报告改写成 spread 提示, 和原来
+                    # 自建 IVP>60 的处理一致, 不影响 pending/窗口的生命周期
+                    attach_leap_iv_band(r["leap"], cc, tech["close"], s)
                 if emitted and stage == "STAGE2_WINDOW":
                     # 真票已发 — 现在才烧每窗口一次的 dedup key。ep_end
                     # 只在 STAGE2 分支里绑定, 由 stage 判断护住
@@ -2514,7 +2643,7 @@ def by_actionability(results: list[dict]) -> list[dict]:
                                           STATE_ORDER.get(r["state"], 9)))
 
 
-def action_label(r: dict, ivp) -> str:
+def action_label(r: dict) -> str:
     """概览表"操作"列的短词 — 细节永远在下方票据里, 这里只指路."""
     if r["error"] or r["tech"] is None:
         return "—"
@@ -2522,7 +2651,7 @@ def action_label(r: dict, ivp) -> str:
         return "⚠️止损"
     leap, csp = r["leap"], r["csp"]
     if leap and "skip_reason" not in leap:
-        return "IV高·spread" if ivp is not None and ivp > 60 else "LEAP票👇"
+        return "IV高·spread" if leap_iv_expensive(leap) else "LEAP票👇"
     if leap and "skip_reason" in leap:
         return "等财报后" if "财报" in leap["skip_reason"] else "LEAP被拦"
     if any("等阶段2" in n for n in r["notes"]):
@@ -2571,7 +2700,7 @@ def ticket_skip_line(label: str, ticket: dict) -> str:
     return f"- {label}: {ticket['skip_reason']}"
 
 
-def action_block(results: list[dict], ivdf) -> list[str]:
+def action_block(results: list[dict]) -> list[str]:
     """报告最顶上的 3-6 行 — 手机上扫一眼就知道今天要不要动手.
     全市场硬停牌 (regime_halt 票) 合并成一行 — 同一段 ~150 字的拦截
     理由不逐票重复, 全文只在市场状态的 ⛔ 行出现一次."""
@@ -2594,10 +2723,14 @@ def action_block(results: list[dict], ivdf) -> list[str]:
         floor_tagged = False
         leap, csp = r["leap"], r["csp"]
         if leap and "skip_reason" not in leap:
-            ivp = self_ivp(ivdf, sym, r["iv30"]) if r["iv30"] else None
-            if ivp is not None and ivp > 60:
-                items.append((sym, f"- 🟡 **{sym}** 右侧确认但自建IVP "
-                                   f"{ivp:.0f}>60 — 改 spread/PMCC (见下)"))
+            if leap_iv_expensive(leap):
+                g = leap["iv_gauge"]
+                items.append((sym, f"- 🟡 **{sym}** 右侧确认但 LEAP IV 档位 "
+                                   f"{g['band']} (平值 IV {g['atm_iv'] * 100:.0f}%, "
+                                   f"自身 {g['pctile']:.0f} 分位) — "
+                                   + ("不用 LEAP, 改 spread/sell put/正股"
+                                      if g["band"] == "D" else "改 spread/PMCC")
+                                   + " (见下)"))
             else:
                 items.append((sym, f"- 🟢 **{sym}** LEAP: {floor_tag}BUY {leap['exp']} "
                                    f"{leap['strike']:g}C @ ~{leap['mid']:.2f} "
@@ -2762,7 +2895,7 @@ def render_close(results, regime, ivdf, now_et) -> str:
     d = now_et.strftime("%Y-%m-%d")
     lines = [f"# 左右侧 watchlist 扫描 — {d} 尾盘 "
              f"({now_et:%H:%M} ET)", ""]
-    lines += action_block(results, ivdf)
+    lines += action_block(results)
     lines += regime_block(regime)
 
     ordered = by_actionability(results)
@@ -2792,7 +2925,7 @@ def render_close(results, regime, ivdf, now_et) -> str:
                 else fmt(r["iv30"] and r["iv30"] * 100, ".0f", "%"))
         lines.append(
             f"| {r['symbol']} | {zone_s} | {t['close']:.2f} "
-            f"| {STATE_LABEL[r['state']]} | {action_label(r, ivp)} "
+            f"| {STATE_LABEL[r['state']]} | {action_label(r)} "
             f"| {t['change_pct']:+.1f} | {t['vs_sma20_pct']:+.1f}% "
             f"| {t['vol_ratio']:.1f}x | {sig_marks(t['signals'])} "
             f"| {ivrv} | {fmt(ivp, '.0f')} |")
@@ -2877,16 +3010,20 @@ def render_close(results, regime, ivdf, now_et) -> str:
                 f"30-50%\"定, 打完末档仍扛得住再跌; 止损靠论点失效不靠价格")
         leap = r["leap"]
         if leap:
-            ivp = self_ivp(ivdf, r["symbol"], r["iv30"]) if r["iv30"] else None
             if "skip_reason" in leap:
                 lines.append(ticket_skip_line("LEAP", leap))
-            elif ivp is not None and ivp > 60:
-                # 剧本 IV 档位: IVP >60 连 deep ITM 都改用 spread/PMCC/RR
+            elif leap_iv_expensive(leap):
+                # 剧本 IV 档位: C 档连 deep ITM 都改 spread/PMCC; D 档不用 LEAP。
+                # 档位读数那条 note 照印 —— 分位/近两年实际波动是判断依据
+                g = leap["iv_gauge"]
                 lines.append(
-                    f"- LEAP: 自建IVP {ivp:.0f} > 60 — 剧本: 改用 spread/PMCC/"
-                    f"risk reversal 或等 IVP 回落 (候选 {leap['exp']} "
-                    f"{leap['strike']:g}C @ ~{leap['mid']:.2f}, 合约 IV "
-                    f"{leap['iv'] * 100:.0f}%; moomoo IVP 实查确认)")
+                    f"- LEAP: IV 档位 {g['band']} — "
+                    + ("剧本: 不用 LEAP 表达, 改 spread / sell put / 正股"
+                       if g["band"] == "D" else
+                       "剧本: 改用 call spread/PMCC/risk reversal 或等 IV 回落")
+                    + f" (候选 {leap['exp']} {leap['strike']:g}C @ "
+                    f"~{leap['mid']:.2f}, 合约 IV {leap['iv'] * 100:.0f}%)")
+                lines.append(f"  - {g['note']}")
             else:
                 lines.append(
                     f"- **LEAP**: BUY {r['symbol']} {leap['exp']} {leap['strike']:g}C "
@@ -2929,7 +3066,8 @@ def render_close(results, regime, ivdf, now_et) -> str:
     lines += [
         "---",
         "执行提醒: 左侧三条件齐才进 (价值区+被迫卖出证据+右侧确认); 加仓只加在强势上; "
-        "IV 建议以 moomoo IVP/合约 IV 实查为准 (自建IVP 样本积累中)。",
+        "LEAP 的 IV 档位 = 平值 IV 在自身多年实际波动里的分位 (A 便宜/B 正常/C 贵/D 过绝对门); "
+        "概览表的 IVP 是 30 天口径的自建样本, 只供 CSP 参考。",
         "数据: yfinance ~15min 延迟。合约价为 mid 估算, 下单前实查盘口。非投资建议。",
     ]
     return "\n".join(lines)

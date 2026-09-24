@@ -286,40 +286,43 @@ class TestActionLabel(unittest.TestCase):
         csp = {"exp": "2026-08-28", "strike": 90, "mid": 1.0, "delta": 0.12,
                "annualized_pct": 10}
         cases = [
-            (self._r(notes=["右侧止损触发: 收盘跌破20日线"]), None, "⚠️止损"),
-            (self._r(leap=leap), None, "LEAP票👇"),
-            (self._r(leap=leap), 70.0, "IV高·spread"),
-            (self._r(leap={"skip_reason": "财报 2026-08-27 在 19 天内"}), None, "等财报后"),
+            (self._r(notes=["右侧止损触发: 收盘跌破20日线"]), "⚠️止损"),
+            (self._r(leap=leap), "LEAP票👇"),
+            # IV 档位 C/D 才改写成 spread; A/B 与无读数照常出票
+            (self._r(leap={**leap, "iv_gauge": {"band": "B"}}), "LEAP票👇"),
+            (self._r(leap={**leap, "iv_gauge": {"band": "C"}}), "IV高·spread"),
+            (self._r(leap={**leap, "iv_gauge": {"band": "D"}}), "IV高·spread"),
+            (self._r(leap={"skip_reason": "财报 2026-08-27 在 19 天内"}), "等财报后"),
             (self._r(csp=csp, state="LEFT_ZONE",
-                     cfg={"value_zone": [80, 95], "options": True}), None, "CSP票👇"),
-            (self._r(notes=["右侧信号出现但倒挂未解除 — 等阶段2"]), None, "等阶段2"),
-            (self._r(state="TREND"), None, "持有·跟20日线"),
-            (self._r(state="TREND", retest=True), None, "回踩中👀"),
+                     cfg={"value_zone": [80, 95], "options": True}), "CSP票👇"),
+            (self._r(notes=["右侧信号出现但倒挂未解除 — 等阶段2"]), "等阶段2"),
+            (self._r(state="TREND"), "持有·跟20日线"),
+            (self._r(state="TREND", retest=True), "回踩中👀"),
             (self._r(state="TREND", retest=True,
                      spread={"exp": "2026-12-18", "long_strike": 500,
                              "short_strike": 550, "debit": 15.0}),
-             None, "spread票👇"),
-            (self._r(state="PULLBACK"), None, "设区间"),
+             "spread票👇"),
+            (self._r(state="PULLBACK"), "设区间"),
             # 无期权链标的设区间同样解锁正股分批档 — 也要提示
             (self._r(state="PULLBACK",
                      cfg={"value_zone": None, "options": False}),
-             None, "设区间"),
+             "设区间"),
             # MSFT case: 设了接货带, 现价在上方 — 不是模糊的"观望"
             (self._r(state="UPTREND", tech={"close": 500},
                      cfg={"value_zone": [380, 440], "options": True}),
-             None, "等回落入区"),
+             "等回落入区"),
             (self._r(state="PULLBACK", tech={"close": 313},
                      cfg={"value_zone": [176, 264], "options": True}),
-             None, "等回落入区"),
+             "等回落入区"),
             # 无期权链但在接货带内 — 正股分批是唯一工具
             (self._r(state="LEFT_ZONE", ladder=[264, 176, 144.32],
                      cfg={"value_zone": [176, 264], "options": False},
-                     tech={"close": 250}), None, "分批档👇"),
-            (self._r(), None, "别追·等回调"),
-            (self._r(error="boom", tech=None), None, "—"),
+                     tech={"close": 250}), "分批档👇"),
+            (self._r(), "别追·等回调"),
+            (self._r(error="boom", tech=None), "—"),
         ]
-        for r, ivp, expect in cases:
-            self.assertEqual(sc.action_label(r, ivp), expect)
+        for r, expect in cases:
+            self.assertEqual(sc.action_label(r), expect)
 
     def test_sort_by_actionability(self):
         rs = [self._r(state="UPTREND"), self._r(state="CONFIRMED"),
@@ -1135,13 +1138,12 @@ class TestActionBlockHaltDedup(unittest.TestCase):
     def test_regime_halt_merges_into_one_line(self):
         # 二轮评审 finding: 全市场硬停牌逐票重复 ~150 字长文 — 合并一行,
         # 全文只留在市场状态 ⛔ 行
-        ivdf = pd.DataFrame(columns=["date", "symbol", "iv30", "rv30"])
         halt = {"skip_reason": "VX 期货全曲线倒挂 (M1 28.00 > M2 25.00) — 停开新票",
                 "regime_halt": True}
         rs = [self._r("AAA", csp=dict(halt)),
               self._r("BBB", csp=dict(halt), leap=dict(halt)),
               self._r("CCC", state="UPTREND")]
-        text = "\n".join(sc.action_block(rs, ivdf))
+        text = "\n".join(sc.action_block(rs))
         self.assertEqual(text.count("市场门拦下部分新票"), 1)
         # 三轮评审 (Copilot): VVIX 只拦 CSP、VX 开关下只拦 LEAP/spread —
         # 同一标的可以一边被拦一边有别的有效票, 汇总行不得写死"全市场停牌"
@@ -1155,9 +1157,8 @@ class TestActionBlockHaltDedup(unittest.TestCase):
         # 硬拦只在"本来就要出票"时才看得见 — 多数标的当天并不出票, 那时
         # 陈旧会完全静默, 而概览表照样印着过期收盘价 (实测: HOOD 价格陈旧
         # 16.5%, 报告里零提示)。陈旧必须无条件出现在"今日动作"那一屏
-        ivdf = pd.DataFrame(columns=["date", "symbol", "iv30", "rv30"])
         rs = [self._r("AAA", stale_data=True), self._r("BBB")]
-        text = "\n".join(sc.action_block(rs, ivdf))
+        text = "\n".join(sc.action_block(rs))
         self.assertIn("日线陈旧", text)
         self.assertIn("AAA", text)
         self.assertNotIn("其余今日无动作: AAA", text)   # 不能被算进"无动作"
@@ -1165,10 +1166,9 @@ class TestActionBlockHaltDedup(unittest.TestCase):
 
     def test_non_regime_skip_still_itemized(self):
         # 普通 skip (年化不足等) 照旧逐票 ⏸, 且 LEAP 行带工具前缀
-        ivdf = pd.DataFrame(columns=["date", "symbol", "iv30", "rv30"])
         rs = [self._r("AAA", csp={"skip_reason": "年化仅 6.0%"},
                       leap={"skip_reason": "财报 2026-09-09 就在 6 天后"})]
-        text = "\n".join(sc.action_block(rs, ivdf))
+        text = "\n".join(sc.action_block(rs))
         self.assertIn("⏸ **AAA** CSP: 年化仅", text)
         self.assertIn("⏸ **AAA** LEAP: 财报", text)
         self.assertNotIn("全市场硬停牌", text)
@@ -1670,16 +1670,14 @@ class TestActionBlockFloorTag(unittest.TestCase):
         return base
 
     def test_below_floor_prefixes_sell_line(self):
-        ivdf = pd.DataFrame(columns=["date", "symbol", "iv30", "rv30"])
-        text = "\n".join(sc.action_block([self._r(below_floor=True)], ivdf))
+        text = "\n".join(sc.action_block([self._r(below_floor=True)]))
         self.assertIn("破下沿", text)
         self.assertIn("论点检查", text)
         self.assertIn("SELL 2026-10-02 50P", text)
 
     def test_in_zone_sell_line_unprefixed(self):
-        ivdf = pd.DataFrame(columns=["date", "symbol", "iv30", "rv30"])
         text = "\n".join(sc.action_block(
-            [self._r(below_floor=False, tech={"close": 50.0})], ivdf))
+            [self._r(below_floor=False, tech={"close": 50.0})]))
         self.assertNotIn("破下沿", text)
         self.assertIn("SELL 2026-10-02 50P", text)
 
@@ -1688,30 +1686,27 @@ class TestActionBlockFloorTag(unittest.TestCase):
         # 开新多头的论点检查分量不低于卖 put, 🟢 行同样带前置
         leap = {"exp": "2028-01-21", "strike": 30.0, "mid": 12.0,
                 "delta": 0.80}
-        ivdf = pd.DataFrame(columns=["date", "symbol", "iv30", "rv30"])
         text = "\n".join(sc.action_block(
-            [self._r(below_floor=True, csp=None, leap=leap)], ivdf))
+            [self._r(below_floor=True, csp=None, leap=leap)]))
         self.assertIn("🟢", text)
         self.assertIn("破下沿", text)
 
     def test_ladder_only_below_floor_gets_standalone_warning(self):
         # DRAM/SPCX 场景 (options=false 只有分批档): 破下沿恰是剧本要求
         # 论点检查的日子, 不能被第一屏归进"其余今日无动作"
-        ivdf = pd.DataFrame(columns=["date", "symbol", "iv30", "rv30"])
         r = self._r(below_floor=True, csp=None,
                     ladder=[57.5, 45.0, 36.9],
                     cfg={"value_zone": [45.0, 57.5], "options": False})
-        text = "\n".join(sc.action_block([r], ivdf))
+        text = "\n".join(sc.action_block([r]))
         self.assertIn("已破价值区下沿", text)
         self.assertNotIn("其余今日无动作", text)
 
     def test_csp_skipped_below_floor_gets_standalone_warning(self):
         # CSP 被 skip (权利金太薄) 时 ⏸ 行原文是"改正股限价单" — 破下沿
         # 当天这等于催继续摊, 独立 ⚠️ 行必须在场
-        ivdf = pd.DataFrame(columns=["date", "symbol", "iv30", "rv30"])
         r = self._r(below_floor=True,
                     csp={"skip_reason": "接货档权利金太薄: 年化仅 4.1%"})
-        text = "\n".join(sc.action_block([r], ivdf))
+        text = "\n".join(sc.action_block([r]))
         self.assertIn("已破价值区下沿", text)
 
 
@@ -1934,7 +1929,7 @@ class TestZoneInvalidOnSplit(unittest.TestCase):
 
     def test_action_label_and_overview_column(self):
         r = self._run((5, 10.0))
-        self.assertEqual(sc.action_label(r, None), "拆股·重锚区间")
+        self.assertEqual(sc.action_label(r), "拆股·重锚区间")
         ivdf = pd.DataFrame(columns=["date", "symbol", "iv30", "rv30"])
         now = datetime(2026, 9, 4, 15, 45, tzinfo=sc.ET)
         text = sc.render_close([r], dict(TestRenderOpenZoneAlert.REGIME),
@@ -1984,7 +1979,7 @@ class TestZoneReviewFixes(unittest.TestCase):
                               {"stage": "NORMAL"}, sc.SETTINGS_DEFAULTS,
                               "close", fetch_options=False)
         self.assertEqual(r["state"], "TREND")      # 右侧状态确实还在
-        self.assertEqual(sc.action_label(r, None), "拆股·重锚区间")
+        self.assertEqual(sc.action_label(r), "拆股·重锚区间")
 
     def test_split_history_coverage_gap_is_reported(self):
         # 日线窗只有 1 年: 校准日更早时 split_after 的 None 是"查不到"
@@ -3462,6 +3457,157 @@ class TestLeapExpiryMaturity(unittest.TestCase):
         self.assertLess(row["be_pct_at_rec"], 1.0)          # 小数不是百分数
         self.assertEqual(row["extrinsic_pct"], t["extrinsic_pct"])
         self.assertGreater(row["extrinsic_pct"], 1.0)       # 百分数不是小数
+
+
+def _gbm_closes(vols_by_year, seed=7, start=100.0):
+    """合成日线: 每年一段, 年化波动按 vols_by_year 给 (252 根/年)。"""
+    import random
+    rnd = random.Random(seed)
+    px, out = start, [start]
+    for vol in vols_by_year:
+        sd = vol / math.sqrt(252)
+        for _ in range(252):
+            px *= math.exp(rnd.gauss(0.0, sd))
+            out.append(px)
+    return out
+
+
+class TestLeapIvBand(unittest.TestCase):
+    """LEAP 的 IV 档位 (2026-09-24): 平值 IV 对比**自身**滚动实际波动的分位,
+    取代 30 天口径的自建 IVP>60。同一天 NVDA/IBM 的 Jan'28 平值 IV 都是 ~39%,
+    分位却是 3 / 98 —— 绝对值不跨标的比。"""
+
+    S = sc.SETTINGS_DEFAULTS
+    DTE = 486
+
+    def test_bands_follow_own_history(self):
+        flat40 = _gbm_closes([0.40] * 10)
+        self.assertEqual(sc.leap_iv_band(0.30, flat40, self.DTE, self.S)["band"], "A")
+        self.assertEqual(sc.leap_iv_band(0.46, flat40, self.DTE, self.S)["band"], "C")
+        # 同一个 30%: 放在 20% 波动的标的上就是贵
+        flat20 = _gbm_closes([0.20] * 10)
+        self.assertEqual(sc.leap_iv_band(0.30, flat20, self.DTE, self.S)["band"], "C")
+
+    def test_absolute_gate_overrides_pctile(self):
+        """IONQ 型: 77% 在自身历史里 0 分位, 照样过不了 58% 绝对门。"""
+        wild = _gbm_closes([0.95] * 6)
+        g = sc.leap_iv_band(0.77, wild, self.DTE, self.S)
+        self.assertLess(g["pctile"], 50)
+        self.assertEqual(g["band"], "D")
+
+    def test_bump_when_iv_beats_recent_regime(self):
+        """NVDA 型: 早年波动高、近两年低 —— 长历史分位把 IV 显得便宜,
+        连近两年实际波动都比不过的 IV 要升一档。"""
+        closes = _gbm_closes([0.60] * 8 + [0.25] * 2)
+        g = sc.leap_iv_band(0.35, closes, self.DTE, self.S)
+        self.assertLess(g["pctile"], 50)
+        self.assertTrue(g["bumped"])
+        self.assertEqual(g["band"], "B")
+
+    def test_regime_up_flagged_not_auto_downgraded(self):
+        """IBM 型: 近两年波动上移, IV 低于近期实际波动 —— 只标记, 不自动降档。"""
+        closes = _gbm_closes([0.20] * 8 + [0.50] * 2)
+        g = sc.leap_iv_band(0.40, closes, self.DTE, self.S)
+        self.assertEqual(g["band"], "C")
+        self.assertTrue(g["regime_up"])
+        self.assertFalse(g["bumped"])
+
+    def test_no_reading_without_enough_history_or_iv(self):
+        self.assertIsNone(sc.leap_iv_band(0.40, _gbm_closes([0.4])[:200],
+                                          self.DTE, self.S))
+        self.assertIsNone(sc.leap_iv_band(None, _gbm_closes([0.4] * 3),
+                                          self.DTE, self.S))
+
+    def test_thresholds_come_from_settings(self):
+        flat40 = _gbm_closes([0.40] * 10)
+        # 0.42 在这条合成日线上是 ~90 分位: 默认 C, 把 B/C 分界放宽到 95 就是 B
+        self.assertEqual(sc.leap_iv_band(0.42, flat40, self.DTE, self.S)["band"], "C")
+        loose = {**self.S, "leap_iv_bands": [50.0, 95.0]}
+        self.assertEqual(sc.leap_iv_band(0.42, flat40, self.DTE, loose)["band"], "B")
+
+
+class TestAttachLeapIvBand(unittest.TestCase):
+    def _cc(self, iv=0.35, closes=None, boom=False):
+        traded = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=1)
+
+        def leg():
+            return pd.DataFrame([{"strike": 100.0, "bid": 9.9, "ask": 10.1,
+                                  "lastPrice": 10.0, "lastTradeDate": traded,
+                                  "openInterest": 900, "impliedVolatility": iv}])
+
+        chain = _FakeChain(leg(), leg())
+        hist = pd.DataFrame({"Close": closes or _gbm_closes([0.40] * 10)})
+
+        class _Tk:
+            def history(_self, **kw):
+                if boom:
+                    raise ConnectionError("yahoo down")
+                return hist
+
+        class _CC:
+            tk = _Tk()
+
+            def chain(_self, exp):
+                return chain
+
+        return _CC()
+
+    def _ticket(self):
+        return {"exp": "2028-01-21", "dte": 486, "strike": 80.0, "mid": 30.0,
+                "delta": 0.80, "notes": ["仓位: ..."]}
+
+    def test_gauge_and_note_attached(self):
+        t = self._ticket()
+        sc.attach_leap_iv_band(t, self._cc(iv=0.30), 100.0, sc.SETTINGS_DEFAULTS)
+        self.assertEqual(t["iv_gauge"]["band"], "A")
+        self.assertTrue(t["notes"][0].startswith("IV 档位 A"))
+        self.assertEqual(t["notes"][0], t["iv_gauge"]["note"])
+        self.assertFalse(sc.leap_iv_expensive(t))
+
+    def test_failure_is_said_not_silently_fallen_back(self):
+        t = self._ticket()
+        sc.attach_leap_iv_band(t, self._cc(boom=True), 100.0, sc.SETTINGS_DEFAULTS)
+        self.assertNotIn("iv_gauge", t)
+        self.assertIn("IV 档位计算失败", t["notes"][0])
+        self.assertFalse(sc.leap_iv_expensive(t))     # 无读数不改写成 spread
+
+
+class TestActionBlockLeapIvBand(unittest.TestCase):
+    LEAP = {"exp": "2028-01-21", "strike": 180.0, "mid": 70.0, "delta": 0.80,
+            "iv": 0.40}
+
+    def _r(self, band):
+        leap = dict(self.LEAP, notes=[])
+        if band:
+            leap["iv_gauge"] = {"band": band, "atm_iv": 0.39, "pctile": 91.0,
+                                "note": f"IV 档位 {band}: ..."}
+        return {"symbol": "NVDA", "error": None, "tech": {"close": 225.0},
+                "notes": [], "state": "CONFIRMED", "leap": leap, "csp": None,
+                "iv30": 0.31, "cfg": {"value_zone": None, "options": True}}
+
+    def test_c_band_rewrites_to_spread(self):
+        text = "\n".join(sc.action_block([self._r("C")]))
+        self.assertIn("🟡", text)
+        self.assertIn("LEAP IV 档位 C", text)
+        self.assertIn("改 spread/PMCC", text)
+        self.assertNotIn("🟢", text)
+
+    def test_d_band_says_no_leap(self):
+        text = "\n".join(sc.action_block([self._r("D")]))
+        self.assertIn("不用 LEAP", text)
+
+    def test_a_b_and_missing_keep_the_ticket(self):
+        for band in ("A", "B", None):
+            text = "\n".join(sc.action_block([self._r(band)]))
+            self.assertIn("🟢", text, band)
+            self.assertIn("BUY 2028-01-21 180C", text, band)
+
+    def test_journal_carries_band_and_review_flags_it(self):
+        import review
+        rows = sc.journal_rows([self._r("C")], "2026-09-24", "close", {})
+        self.assertEqual(rows[0]["iv_band"], "C")
+        self.assertIn("IVC档", review.leap_flags(rows[0]))
+        self.assertEqual(review.leap_flags({"iv_band": "B"}), "—")
 
 
 if __name__ == "__main__":
