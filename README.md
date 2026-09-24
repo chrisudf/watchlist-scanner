@@ -565,7 +565,7 @@ LEAP 真票发出时, 扫描器取该到期日的平值 IV (离现价最近的�
 |---|---|---|
 | A 便宜 | P < 50 | 🟢 照出 deep ITM, note 提示也可改用平值凸性档 |
 | B 正常 | P 50-80 | 🟢 照出, deep ITM 正合剧本 |
-| C 贵 | P > 80, 或 IV > 1.15 × max(近1年, 近2年实际波动) 升上来 | 🟡 改 spread/PMCC, 候选合约仍列出 |
+| C 贵 | P > 80, 或 IV > 1.15 × max(近1年, 近2年实际波动) 升上来 (指数 1.25, 见下) | 🟡 改 spread/PMCC, 候选合约仍列出 |
 | D 绝对门 | 平值 IV ≥ 58% | 🟡 不用 LEAP, 改 spread / sell put / 正股 |
 
 为什么不再用自建 IVP > 60: 那是 30 天口径, 两个方向都会骗人 —— 2026-09 财报后
@@ -573,10 +573,19 @@ NVDA 的 IV30 掉了 ~10 点, Jan'28 只掉 ~2.5 点; IBM 的 IV30 因为财报�
 反而高过 LEAP。IV 绝对值也不跨标的比: 2026-09-22 NVDA / IBM 的 Jan'28 平值 IV
 都是 ~39%, 在各自历史里却是 3 / 98 分位。
 
+两处口径 (详见 lesson.md 2026-09-24, 报告里都有标注):
+
+- **指数的升档线是 1.25 倍** (`leap_iv_bump_index`, 只管 kind="index")。成分股
+  涨跌不同步, 实际波动被分散压低, 期权却要为"一起跌"收钱, 指数 IV/实际波动
+  常态就在 1.15-1.25。档位 note 会写出"指数升档线 1.25 倍"。
+- **IV 先从 bid/ask mid 反解**, 反解不出 (多见于有股息的深度实值) 才用 Yahoo 的
+  IV 列。Yahoo 列对深度实值系统性偏高约 9 个点, delta 也跟着偏低。票上的合约 IV
+  后面标 `(mid反解)` 或 `(⚠Yahoo列)`, 流水账记 `iv_src`。
+
 阈值用 50/80 而不是 40/60, 因为 IV 平均比事后实际波动高几个点 (波动率风险溢价),
 正常就落在 60-70 分位。这是初版, 流水账记下了每张票的 `iv_band` / `iv_pctile`,
 复盘表的旗标列会标出 `IVC档` / `IVD档`, 攒够样本再校准。阈值都在 `[settings]`:
-`leap_iv_bands` / `leap_iv_bump` / `leap_iv_abs_gate` / `leap_iv_hist_years` /
+`leap_iv_bands` / `leap_iv_bump` / `leap_iv_bump_index` / `leap_iv_abs_gate` / `leap_iv_hist_years` /
 `leap_iv_min_years`。与 stock-analysis 技能第 4 步 (`leap_iv_gauge.py`) 同口径。
 
 ### LEAP 看明细, 不看聚合

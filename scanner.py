@@ -162,6 +162,11 @@ SETTINGS_DEFAULTS = {
     # 正常就落在 60-70 分位。初版阈值, 样本攒够再校准。
     "leap_iv_bands": [50.0, 80.0],   # P < 50 = A 便宜; 50-80 = B; > 80 = C 贵
     "leap_iv_bump": 1.15,            # IV > 此倍 x max(近1年, 近2年实际波动) → 升一档
+    # 指数单独一条升档线 (lesson.md 2026-09-24): 成分股涨跌不同步, 实际波动
+    # 被分散压低, 期权却要为"一起跌"的相关性风险收钱 —— 指数 IV/实际波动
+    # 常态就在 1.15-1.25。按个股的 1.15 会把 QQQ 这类常态读数判成 C 档。
+    # 只管 kind="index"; GLD/DRAM 这类 etf 不是分散化股票指数, 仍走个股线
+    "leap_iv_bump_index": 1.25,
     "leap_iv_abs_gate": 0.58,        # 合约 IV >= 此值 = D 档, 不用 LEAP 表达
     "leap_iv_hist_years": 10,        # 实际波动分布取多少年日线
     "leap_iv_min_years": 5.0,        # 历史短于此, 分位只作参考 (带提示)
@@ -383,7 +388,9 @@ def journal_rows(results, d: str, mode: str, regime: dict) -> list[dict]:
                 "exp": t.get("exp"), "strike": t.get("strike"),
                 "mid": t.get("mid"), "delta": t.get("delta"), "dte": t.get("dte"),
                 "oi": t.get("oi"), "spread_pct": t.get("spread_pct"),
-                "iv": t.get("iv"), "src": t.get("src"),
+                # iv_src: 2026-09-24 起 LEAP 的 iv 改为 mid 反解 (之前是 Yahoo
+                # 列, 深度实值偏高 ~9 pts)。旧行没有这个字段 = Yahoo 口径
+                "iv": t.get("iv"), "iv_src": t.get("iv_src"), "src": t.get("src"),
                 "spot_at_rec": spot,
                 "annualized_pct": t.get("annualized_pct"),
                 "cushion_pct": t.get("cushion_pct"),
@@ -1358,6 +1365,25 @@ def contract_iv(row, mid, spot, T, is_call):
     return None
 
 
+def mid_first_iv(row, mid, spot, T, is_call) -> tuple[float | None, str | None]:
+    """先从 mid 反解, 反解不出才退回 Yahoo 的 impliedVolatility 列 -> (iv, "mid"/"yahoo")。
+
+    与 contract_iv 的优先级相反, 目前只给 LEAP 用 (lesson.md 2026-09-24):
+    Yahoo 列对深度实值 LEAP 系统性偏高 ~9 pts (NVDA 2028-01 170C: Yahoo
+    51.7% / mid 反解 42.0% / CBOE 40.5%), 而 delta 就是拿这个 IV 算的。
+    代价是 mid 反解对 spot 敏感 (深度实值每 1% spot 误差 ~2.7 vol pts),
+    LEAP 票靠 daily_bar_stale 门保证 spot 与报价同步。反解失败的典型是有
+    股息的深度实值: mid 低于无股息 BS 下界 (KO 65C: 26.82 < 27.65)。"""
+    if mid is not None:
+        iv = implied_vol(mid, spot, float(row["strike"]), T, RATE, is_call)
+        if iv is not None:
+            return iv, "mid"
+    iv = row.get("impliedVolatility")
+    if iv is not None and not pd.isna(iv) and 0.01 < float(iv) < 5.0:
+        return float(iv), "yahoo"
+    return None, None
+
+
 class ChainCache:
     """One yf.Ticker per symbol; option chains fetched at most once."""
 
@@ -1948,7 +1974,7 @@ def leap_ticket(cc: ChainCache, spot: float, cfg: dict,
         if mid is None:
             continue
         strike = float(row["strike"])
-        iv = contract_iv(row, mid, spot, T, is_call=True)
+        iv, iv_src = mid_first_iv(row, mid, spot, T, is_call=True)
         if iv is None:
             continue
         delta = bs_delta(spot, strike, T, RATE, iv, is_call=True)
@@ -1957,7 +1983,7 @@ def leap_ticket(cc: ChainCache, spot: float, cfg: dict,
         bid, ask = float(row.get("bid") or 0), float(row.get("ask") or 0)
         rows.append({
             "exp": exp, "dte": dte, "strike": strike, "mid": mid, "src": src,
-            "iv": iv, "delta": delta,
+            "iv": iv, "iv_src": iv_src, "delta": delta,
             "oi": _oi(row),
             # 同 _put_candidates: 价差只对健康盘口有意义
             "spread_pct": (ask - bid) / mid * 100 if 0 < bid <= ask else None,
@@ -2006,6 +2032,9 @@ def leap_ticket(cc: ChainCache, spot: float, cfg: dict,
         notes.append(f"外在价值 {pick['extrinsic_pct']:.0f}% > {s['leap_max_extrinsic_pct']}% — 深度不够")
     if pick["src"] == "last":
         notes.append("盘口不可用, 按最近成交价估算 — 下单前实查")
+    if pick["iv_src"] == "yahoo":
+        notes.append("合约 IV 取自 Yahoo 列 (mid 低于无股息 BS 下界, 反解不出, 多见于"
+                     "有股息的深度实值) — Yahoo 列对深度实值偏高, delta 随之偏低, 下单前实查")
     if days_to_earnings is not None and s["leap_earnings_buffer_days"] \
             < days_to_earnings <= s["leap_earnings_note_days"]:
         notes.append(f"财报 {earnings_iso} 在 {days_to_earnings} 天后, 持有期内 — "
@@ -2028,7 +2057,8 @@ IV_BAND_TEXT = {
 }
 
 
-def leap_iv_band(atm_iv: float, closes, dte: int, s: dict) -> dict | None:
+def leap_iv_band(atm_iv: float, closes, dte: int, s: dict,
+                 index: bool = False) -> dict | None:
     """LEAP 到期日的平值 IV 贵不贵 (纯函数) -> 档位读数, 历史不够时 None。
 
     P = atm_iv 在"滚动实际波动"分布里的分位: 窗口长度 = 合约剩余期限
@@ -2038,7 +2068,8 @@ def leap_iv_band(atm_iv: float, closes, dte: int, s: dict) -> dict | None:
     两道修正:
       - 升档: IV > leap_iv_bump x max(近1年, 近2年实际波动)。波动 regime
         下移的标的 (NVDA 十年前体量小、波动高), 长历史分位会把 IV 显得便宜
-        —— 连近两年都比不过的 IV 不算便宜。
+        —— 连近两年都比不过的 IV 不算便宜。指数 (index=True) 改用
+        leap_iv_bump_index, 理由见该设置的注释与 lesson.md 2026-09-24。
       - D 档: 合约 IV >= leap_iv_abs_gate 时与分位无关。平值 LEAP 价格约等于
         0.4 x IV x sqrt(T) x 股价, IV 60% 时 16 个月平值要付股价 ~28%,
         便不便宜都救不回盈亏平衡 (IONQ 77% 在自身历史里是 0 分位, 照样不行)。
@@ -2059,18 +2090,23 @@ def leap_iv_band(atm_iv: float, closes, dte: int, s: dict) -> dict | None:
     rv1y, rv2y = rv(rets[-252:]), rv(rets[-504:])
     lo, hi = s["leap_iv_bands"]
     idx = 0 if pctile < lo else 1 if pctile <= hi else 2
-    bumped = atm_iv > s["leap_iv_bump"] * max(rv1y, rv2y) and idx < 2
+    bump = s["leap_iv_bump_index"] if index else s["leap_iv_bump"]
+    bumped = atm_iv > bump * max(rv1y, rv2y) and idx < 2
     band = "ABC"[idx + bumped]
     if atm_iv >= s["leap_iv_abs_gate"]:
         band = "D"
     return {"band": band, "atm_iv": atm_iv, "pctile": pctile,
             "rv1y": rv1y, "rv2y": rv2y, "bumped": bumped,
+            "bump": bump, "index": index,
             "regime_up": atm_iv < min(rv1y, rv2y),
             "years": len(rets) / 252, "windows": len(windows)}
 
 
-def leap_atm_iv(cc: ChainCache, exp: str, dte: int, spot: float) -> float | None:
-    """LEAP 到期日的平值 IV: 离现价最近的行权价, call/put 各反解再取均值。
+def leap_atm_iv(cc: ChainCache, exp: str, dte: int,
+                spot: float) -> tuple[float | None, str | None]:
+    """LEAP 到期日的平值 IV: 离现价最近的行权价, call/put 各反解再取均值
+    -> (iv, 来源)。来源 "mid" = 两腿都是 mid 反解, 否则 "yahoo" (有腿退回了
+    Yahoo 列, 见 mid_first_iv)。
 
     两腿平均是为了抵掉股息: BS 不计股息时 call 的 IV 偏高、put 偏低,
     幅度相近 (KO 2028-01 平值 call 19.5% / put 23.2%, 均值 21.3% = CBOE)。"""
@@ -2083,22 +2119,26 @@ def leap_atm_iv(cc: ChainCache, exp: str, dte: int, spot: float) -> float | None
             continue
         row = df.loc[(df["strike"] - spot).abs().idxmin()]
         mid, _src = _mark(row, cutoff)
-        iv = contract_iv(row, mid, spot, T, is_call)
+        iv, iv_src = mid_first_iv(row, mid, spot, T, is_call)
         if iv:
-            ivs.append(iv)
-    return sum(ivs) / len(ivs) if ivs else None
+            ivs.append((iv, iv_src))
+    if not ivs:
+        return None, None
+    src = "mid" if all(x == "mid" for _, x in ivs) else "yahoo"
+    return sum(v for v, _ in ivs) / len(ivs), src
 
 
-def attach_leap_iv_band(ticket: dict, cc: ChainCache, spot: float, s: dict) -> None:
+def attach_leap_iv_band(ticket: dict, cc: ChainCache, spot: float, s: dict,
+                        index: bool = False) -> None:
     """给已出的 LEAP 真票挂上 iv_gauge 与一条档位 note (原地修改)。
 
     多一次 10 年日线请求, 只在真票发出时才付。取不到就明说, 不回落到
     30 天自建 IVP —— 那正是被这条规则取代的口径。"""
     try:
-        atm = leap_atm_iv(cc, ticket["exp"], ticket["dte"], spot)
+        atm, atm_src = leap_atm_iv(cc, ticket["exp"], ticket["dte"], spot)
         hist = cc.tk.history(period=f"{s['leap_iv_hist_years']}y",
                              interval="1d", auto_adjust=True)
-        g = leap_iv_band(atm, list(hist["Close"]), ticket["dte"], s)
+        g = leap_iv_band(atm, list(hist["Close"]), ticket["dte"], s, index=index)
     except Exception as e:
         ticket["notes"].insert(0, f"IV 档位计算失败 ({type(e).__name__}) — "
                                   "下单前用 stock-analysis 的 leap_iv_gauge.py 实查")
@@ -2107,10 +2147,15 @@ def attach_leap_iv_band(ticket: dict, cc: ChainCache, spot: float, s: dict) -> N
         ticket["notes"].insert(0, "IV 档位无读数 (平值报价或历史不足) — "
                                   "下单前用 stock-analysis 的 leap_iv_gauge.py 实查")
         return
-    head = (f"IV 档位 {g['band']}: 平值 IV {g['atm_iv'] * 100:.0f}% 在自身"
-            f"{g['years']:.0f}年实际波动里是 {g['pctile']:.0f} 分位 (近1年 "
-            f"{g['rv1y'] * 100:.0f}% / 近2年 {g['rv2y'] * 100:.0f}%)"
-            + (f" → IV 超过近 1-2 年实际波动的 {s['leap_iv_bump']:g} 倍, 升一档"
+    g["atm_src"] = atm_src
+    # 两处口径标注 (lesson.md 2026-09-24): 指数用单独的升档线; 平值 IV 若有腿
+    # 退回了 Yahoo 列要说出来 —— 以后重构时这两条是最容易被"统一"掉的
+    head = (f"IV 档位 {g['band']}: 平值 IV {g['atm_iv'] * 100:.0f}%"
+            + ("" if atm_src == "mid" else " (含 Yahoo 列)")
+            + f" 在自身{g['years']:.0f}年实际波动里是 {g['pctile']:.0f} 分位 (近1年 "
+            f"{g['rv1y'] * 100:.0f}% / 近2年 {g['rv2y'] * 100:.0f}%"
+            + (f", 指数升档线 {g['bump']:g} 倍" if index else "") + ")"
+            + (f" → IV 超过近 1-2 年实际波动的 {g['bump']:g} 倍, 升一档"
                if g["bumped"] else "")
             + f" — {IV_BAND_TEXT[g['band']]}")
     extra = []
@@ -2121,6 +2166,12 @@ def attach_leap_iv_band(ticket: dict, cc: ChainCache, spot: float, s: dict) -> N
     g["note"] = head + ("; " + "; ".join(extra) if extra else "")
     ticket["iv_gauge"] = g
     ticket["notes"].insert(0, g["note"])
+
+
+def iv_src_tag(ticket: dict) -> str:
+    """合约 IV 后面的来源标注 (lesson.md 2026-09-24)。紧跟在 "合约 IV N%" 之后,
+    review.py 的 CIV_RE 只认前半段, 不受影响。"""
+    return {"mid": " (mid反解)", "yahoo": " (⚠Yahoo列)"}.get(ticket.get("iv_src"), "")
 
 
 def leap_iv_expensive(leap) -> bool:
@@ -2550,7 +2601,8 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
                     # IV 档位只给真票算 (多一次 10 年日线请求)。C/D 档仍然
                     # 算"已发" —— 票照出、由报告改写成 spread 提示, 和原来
                     # 自建 IVP>60 的处理一致, 不影响 pending/窗口的生命周期
-                    attach_leap_iv_band(r["leap"], cc, tech["close"], s)
+                    attach_leap_iv_band(r["leap"], cc, tech["close"], s,
+                                        index=cfg["kind"] == "index")
                 if emitted and stage == "STAGE2_WINDOW":
                     # 真票已发 — 现在才烧每窗口一次的 dedup key。ep_end
                     # 只在 STAGE2 分支里绑定, 由 stage 判断护住
@@ -3022,7 +3074,8 @@ def render_close(results, regime, ivdf, now_et) -> str:
                        if g["band"] == "D" else
                        "剧本: 改用 call spread/PMCC/risk reversal 或等 IV 回落")
                     + f" (候选 {leap['exp']} {leap['strike']:g}C @ "
-                    f"~{leap['mid']:.2f}, 合约 IV {leap['iv'] * 100:.0f}%)")
+                    f"~{leap['mid']:.2f}, 合约 IV {leap['iv'] * 100:.0f}%"
+                    f"{iv_src_tag(leap)})")
                 lines.append(f"  - {g['note']}")
             else:
                 lines.append(
@@ -3032,7 +3085,7 @@ def render_close(results, regime, ivdf, now_et) -> str:
                     f"λ {fmt(leap['lam'], '.1f', 'x')}, BE {leap['breakeven']:.2f} "
                     f"({leap['be_pct']:+.1f}%), "
                     f"保险费率 ~{leap['insurance_pct_yr']:.1f}%/年, "
-                    f"合约 IV {leap['iv'] * 100:.0f}%, OI {leap['oi']}"
+                    f"合约 IV {leap['iv'] * 100:.0f}%{iv_src_tag(leap)}, OI {leap['oi']}"
                     + (f", 价差 {leap['spread_pct']:.1f}%" if leap["spread_pct"] is not None else ""))
                 for n in leap["notes"]:
                     lines.append(f"  - {n}")

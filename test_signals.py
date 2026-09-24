@@ -3527,15 +3527,17 @@ class TestLeapIvBand(unittest.TestCase):
 
 
 class TestAttachLeapIvBand(unittest.TestCase):
-    def _cc(self, iv=0.35, closes=None, boom=False):
+    def _cc(self, iv=0.35, closes=None, boom=False, yahoo_iv=0.90):
         traded = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=1)
 
-        def leg():
-            return pd.DataFrame([{"strike": 100.0, "bid": 9.9, "ask": 10.1,
-                                  "lastPrice": 10.0, "lastTradeDate": traded,
-                                  "openInterest": 900, "impliedVolatility": iv}])
+        def leg(is_call):
+            px = sc.bs_price(100.0, 100.0, 486 / 365.0, sc.RATE, iv, is_call)
+            return pd.DataFrame([{"strike": 100.0, "bid": px - 0.05, "ask": px + 0.05,
+                                  "lastPrice": px, "lastTradeDate": traded,
+                                  "openInterest": 900,
+                                  "impliedVolatility": yahoo_iv}])
 
-        chain = _FakeChain(leg(), leg())
+        chain = _FakeChain(leg(True), leg(False))
         hist = pd.DataFrame({"Close": closes or _gbm_closes([0.40] * 10)})
 
         class _Tk:
@@ -3560,9 +3562,28 @@ class TestAttachLeapIvBand(unittest.TestCase):
         t = self._ticket()
         sc.attach_leap_iv_band(t, self._cc(iv=0.30), 100.0, sc.SETTINGS_DEFAULTS)
         self.assertEqual(t["iv_gauge"]["band"], "A")
+        # 平值 IV 来自 mid 反解, 不是 Yahoo 列的 0.90 (lesson.md 2026-09-24)
+        self.assertAlmostEqual(t["iv_gauge"]["atm_iv"], 0.30, places=3)
+        self.assertEqual(t["iv_gauge"]["atm_src"], "mid")
         self.assertTrue(t["notes"][0].startswith("IV 档位 A"))
+        self.assertNotIn("Yahoo", t["notes"][0])
         self.assertEqual(t["notes"][0], t["iv_gauge"]["note"])
         self.assertFalse(sc.leap_iv_expensive(t))
+
+    def test_index_uses_its_own_bump_line_and_says_so(self):
+        """QQQ 型: IV 高出近两年实际波动 ~20% —— 个股线 (1.15) 升档, 指数线
+        (1.25) 不升, 且报告里写明用的是指数升档线。"""
+        # 近两年实际波动 ~19%: 0.233 落在 1.15x (0.223) 与 1.25x (0.242) 之间
+        closes = _gbm_closes([0.30] * 8 + [0.20] * 2)
+        stock, index = self._ticket(), self._ticket()
+        sc.attach_leap_iv_band(stock, self._cc(iv=0.233, closes=closes), 100.0,
+                               sc.SETTINGS_DEFAULTS)
+        sc.attach_leap_iv_band(index, self._cc(iv=0.233, closes=closes), 100.0,
+                               sc.SETTINGS_DEFAULTS, index=True)
+        self.assertTrue(stock["iv_gauge"]["bumped"])
+        self.assertFalse(index["iv_gauge"]["bumped"])
+        self.assertIn("指数升档线 1.25 倍", index["notes"][0])
+        self.assertNotIn("指数升档线", stock["notes"][0])
 
     def test_failure_is_said_not_silently_fallen_back(self):
         t = self._ticket()
@@ -3570,6 +3591,49 @@ class TestAttachLeapIvBand(unittest.TestCase):
         self.assertNotIn("iv_gauge", t)
         self.assertIn("IV 档位计算失败", t["notes"][0])
         self.assertFalse(sc.leap_iv_expensive(t))     # 无读数不改写成 spread
+
+
+class TestMidFirstIv(unittest.TestCase):
+    """LEAP 的合约 IV 先 mid 反解, 失败才退回 Yahoo 列 (lesson.md 2026-09-24):
+    Yahoo 列对深度实值系统性偏高 ~9 pts, delta 跟着偏低。"""
+
+    T = 486 / 365.0
+
+    def _row(self, strike, px, yahoo_iv):
+        return pd.Series({"strike": strike, "impliedVolatility": yahoo_iv,
+                          "bid": px - 0.1, "ask": px + 0.1})
+
+    def test_mid_wins_over_yahoo_column(self):
+        px = sc.bs_price(222.57, 170.0, self.T, sc.RATE, 0.42, True)
+        iv, src = sc.mid_first_iv(self._row(170.0, px, 0.517), px, 222.57,
+                                  self.T, True)
+        self.assertEqual(src, "mid")
+        self.assertAlmostEqual(iv, 0.42, places=3)
+
+    def test_falls_back_when_mid_below_no_dividend_bound(self):
+        """KO 65C 型: 有股息的深度实值, mid 低于无股息 BS 下界, 反解不出。"""
+        iv, src = sc.mid_first_iv(self._row(65.0, 26.82, 0.324), 26.82, 89.29,
+                                  self.T, True)
+        self.assertEqual((iv, src), (0.324, "yahoo"))
+
+    def test_nothing_usable(self):
+        self.assertEqual(sc.mid_first_iv(self._row(65.0, 26.82, float("nan")),
+                                         None, 89.29, self.T, True), (None, None))
+
+    def test_leap_ticket_records_mid_source(self):
+        cc = TestLeapExpiryMaturity()._cc()
+        t = sc.leap_ticket(cc, 100.0, {"kind": "stock", "high_beta": False},
+                           None, sc.SETTINGS_DEFAULTS)
+        self.assertEqual(t["iv_src"], "mid")
+        self.assertFalse(any("Yahoo 列" in n for n in t["notes"]))
+
+    def test_display_tag_keeps_review_regex_working(self):
+        import review
+        for src, tag in (("mid", "(mid反解)"), ("yahoo", "(⚠Yahoo列)")):
+            line = f"合约 IV 42%{sc.iv_src_tag({'iv_src': src})}, OI 900"
+            self.assertIn(tag, line)
+            self.assertEqual(review.CIV_RE.search(line).group(1), "42")
+        self.assertEqual(sc.iv_src_tag({}), "")        # 旧票没有来源字段
 
 
 class TestActionBlockLeapIvBand(unittest.TestCase):
@@ -3604,8 +3668,11 @@ class TestActionBlockLeapIvBand(unittest.TestCase):
 
     def test_journal_carries_band_and_review_flags_it(self):
         import review
-        rows = sc.journal_rows([self._r("C")], "2026-09-24", "close", {})
+        r = self._r("C")
+        r["leap"]["iv_src"] = "mid"
+        rows = sc.journal_rows([r], "2026-09-24", "close", {})
         self.assertEqual(rows[0]["iv_band"], "C")
+        self.assertEqual(rows[0]["iv_src"], "mid")
         self.assertIn("IVC档", review.leap_flags(rows[0]))
         self.assertEqual(review.leap_flags({"iv_band": "B"}), "—")
 
