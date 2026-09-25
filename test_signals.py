@@ -3585,8 +3585,8 @@ class TestAttachLeapIvBand(unittest.TestCase):
         self.assertFalse(sc.leap_iv_expensive(t))
 
     def test_index_uses_its_own_bump_line_and_says_so(self):
-        """QQQ 型: IV 高出近两年实际波动 ~30% —— 个股 C 线 (1.25) 升档, 指数
-        C 线 (1.35) 不升, 且报告里写明用的是指数口径。"""
+        """指数走 leap_iv_ratio_bands_index: 默认与个股同线 (9/25 回测后 1.35 → 1.25),
+        设置分开时各用各的, 报告里写明用的是指数口径。"""
         # 近两年实际波动 0.194: 0.25 落在 1.25x (0.242) 与 1.35x (0.262) 之间
         closes = _gbm_closes([0.30] * 8 + [0.20] * 2)
         stock, index = self._ticket(), self._ticket()
@@ -3595,9 +3595,15 @@ class TestAttachLeapIvBand(unittest.TestCase):
         sc.attach_leap_iv_band(index, self._cc(iv=0.25, closes=closes), 100.0,
                                sc.SETTINGS_DEFAULTS, index=True)
         self.assertTrue(stock["iv_gauge"]["bumped"])
-        self.assertFalse(index["iv_gauge"]["bumped"])
-        self.assertIn("指数口径 C 线 1.35 倍", index["notes"][0])
+        self.assertTrue(index["iv_gauge"]["bumped"])          # 默认同线
+        self.assertIn("指数口径 C 线 1.25 倍", index["notes"][0])
         self.assertNotIn("指数口径", stock["notes"][0])
+        wide = {**sc.SETTINGS_DEFAULTS, "leap_iv_ratio_bands_index": [1.0, 1.35]}
+        loose = self._ticket()
+        sc.attach_leap_iv_band(loose, self._cc(iv=0.25, closes=closes), 100.0,
+                               wide, index=True)
+        self.assertFalse(loose["iv_gauge"]["bumped"])         # 分开时各用各的
+        self.assertIn("指数口径 C 线 1.35 倍", loose["notes"][0])
 
     def test_atm_from_last_trades_is_labelled(self):
         cc = self._cc(iv=0.30)
