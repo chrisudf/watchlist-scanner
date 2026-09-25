@@ -288,10 +288,10 @@ class TestActionLabel(unittest.TestCase):
         cases = [
             (self._r(notes=["右侧止损触发: 收盘跌破20日线"]), "⚠️止损"),
             (self._r(leap=leap), "LEAP票👇"),
-            # IV 档位 C/D 才改写成 spread; A/B 与无读数照常出票
+            # 只有 D 档 (过 58% 绝对门) 改写; A/B/C 与无读数照常出票 (9/25 起 C 不改写)
             (self._r(leap={**leap, "iv_gauge": {"band": "B"}}), "LEAP票👇"),
-            (self._r(leap={**leap, "iv_gauge": {"band": "C"}}), "IV高·spread"),
-            (self._r(leap={**leap, "iv_gauge": {"band": "D"}}), "IV高·spread"),
+            (self._r(leap={**leap, "iv_gauge": {"band": "C"}}), "LEAP票👇"),
+            (self._r(leap={**leap, "iv_gauge": {"band": "D"}}), "IV过门·不用LEAP"),
             (self._r(leap={"skip_reason": "财报 2026-08-27 在 19 天内"}), "等财报后"),
             (self._r(csp=csp, state="LEFT_ZONE",
                      cfg={"value_zone": [80, 95], "options": True}), "CSP票👇"),
@@ -3582,7 +3582,7 @@ class TestAttachLeapIvBand(unittest.TestCase):
         self.assertIn("实际波动中位数", t["notes"][0])
         self.assertNotIn("Yahoo", t["notes"][0])
         self.assertEqual(t["notes"][0], t["iv_gauge"]["note"])
-        self.assertFalse(sc.leap_iv_expensive(t))
+        self.assertFalse(sc.leap_iv_over_gate(t))
 
     def test_index_uses_its_own_bump_line_and_says_so(self):
         """指数走 leap_iv_ratio_bands_index: 默认与个股同线 (9/25 回测后 1.35 → 1.25),
@@ -3605,6 +3605,21 @@ class TestAttachLeapIvBand(unittest.TestCase):
         self.assertFalse(loose["iv_gauge"]["bumped"])         # 分开时各用各的
         self.assertIn("指数口径 C 线 1.35 倍", loose["notes"][0])
 
+    def test_c_band_note_says_deep_itm_and_halves_single_stocks(self):
+        flat20 = _gbm_closes([0.20] * 10)            # 0.30 → 1.48 倍, C 档
+        stock, index = self._ticket(), self._ticket()
+        sc.attach_leap_iv_band(stock, self._cc(iv=0.30, closes=flat20), 100.0,
+                               sc.SETTINGS_DEFAULTS)
+        sc.attach_leap_iv_band(index, self._cc(iv=0.30, closes=flat20), 100.0,
+                               sc.SETTINGS_DEFAULTS, index=True)
+        for t in (stock, index):
+            self.assertEqual(t["iv_gauge"]["band"], "C")
+            self.assertIn("只做本票这类深度实值", t["notes"][0])
+            self.assertIn("不等回落", t["notes"][0])
+            self.assertFalse(sc.leap_iv_over_gate(t))
+        self.assertIn("个股未经回测, 仓位减半", stock["notes"][0])
+        self.assertNotIn("仓位减半", index["notes"][0])
+
     def test_atm_from_last_trades_is_labelled(self):
         cc = self._cc(iv=0.30)
         for leg in (cc.chain("x").calls, cc.chain("x").puts):
@@ -3619,7 +3634,7 @@ class TestAttachLeapIvBand(unittest.TestCase):
         sc.attach_leap_iv_band(t, self._cc(boom=True), 100.0, sc.SETTINGS_DEFAULTS)
         self.assertNotIn("iv_gauge", t)
         self.assertIn("IV 档位计算失败", t["notes"][0])
-        self.assertFalse(sc.leap_iv_expensive(t))     # 无读数不改写成 spread
+        self.assertFalse(sc.leap_iv_over_gate(t))     # 无读数不改写
 
 
 class TestLeapIvBandNotes(unittest.TestCase):
@@ -3713,23 +3728,27 @@ class TestActionBlockLeapIvBand(unittest.TestCase):
     LEAP = {"exp": "2028-01-21", "strike": 180.0, "mid": 70.0, "delta": 0.80,
             "iv": 0.40}
 
-    def _r(self, band):
+    def _r(self, band, index=False):
         leap = dict(self.LEAP, notes=[])
         if band:
             leap["iv_gauge"] = {"band": band, "atm_iv": 0.39, "ratio": 1.31,
-                                "med_rv": 0.30,
+                                "med_rv": 0.30, "index": index,
                                 "note": f"IV 档位 {band}: ..."}
         return {"symbol": "NVDA", "error": None, "tech": {"close": 225.0},
                 "notes": [], "state": "CONFIRMED", "leap": leap, "csp": None,
                 "iv30": 0.31, "cfg": {"value_zone": None, "options": True}}
 
-    def test_c_band_rewrites_to_spread(self):
-        text = "\n".join(sc.action_block([self._r("C")]))
-        self.assertIn("🟡", text)
-        self.assertIn("LEAP IV 档位 C", text)
-        self.assertIn("自身实际波动中位数的 1.31 倍", text)
-        self.assertIn("改 spread/PMCC", text)
-        self.assertNotIn("🟢", text)
+    def test_c_band_keeps_ticket_with_deep_itm_tag(self):
+        """9/25 起 C 档不改写成 spread: 照出 🟢 深度实值票, 行尾写明做法;
+        个股多一句仓位减半 (未经回测), 指数没有。"""
+        stock = "\n".join(sc.action_block([self._r("C")]))
+        self.assertIn("🟢", stock)
+        self.assertNotIn("🟡", stock)
+        self.assertIn("BUY 2028-01-21 180C", stock)
+        self.assertIn("IV C 档: 只做深度实值, 个股仓位减半", stock)
+        index = "\n".join(sc.action_block([self._r("C", index=True)]))
+        self.assertIn("IV C 档: 只做深度实值", index)
+        self.assertNotIn("仓位减半", index)
 
     def test_d_band_says_no_leap(self):
         text = "\n".join(sc.action_block([self._r("D")]))

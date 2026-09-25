@@ -2073,7 +2073,10 @@ def leap_ticket(cc: ChainCache, spot: float, cfg: dict,
 IV_BAND_TEXT = {
     "A": "IV 便宜: 剧本允许 ATM 凸性档 (长期限 ~0.60δ), 本票是 deep ITM, 也可改用平值",
     "B": "IV 正常: deep ITM 正合剧本",
-    "C": "IV 贵: 剧本改 call spread/PMCC 或等回落, deep ITM 也改 spread",
+    # C 档 (2026-09-25 回测后改, lesson.md "C 档动作"): 深度实值对 IV 贵几乎不
+    # 敏感, "等回落"中位要等 5 个月、期间指数已涨 6-8% —— 所以照出本票, 不改 spread
+    "C": "IV 贵: 只做本票这类深度实值 (想控制风险金额可换同风险的深度实值价差), "
+         "不买平值/虚值, 不等回落",
     "D": "合约 IV 过绝对门: 剧本不用 LEAP 表达, 改 spread / sell put / 正股",
 }
 
@@ -2190,7 +2193,8 @@ def attach_leap_iv_band(ticket: dict, cc: ChainCache, spot: float, s: dict,
             + (f", 指数口径 C 线 {g['bump']:g} 倍" if index else "") + ")"
             + (f" → IV 超过近 1-2 年实际波动的 {g['bump']:g} 倍, 升一档"
                if g["bumped"] else "")
-            + f" — {IV_BAND_TEXT[g['band']]}")
+            + f" — {IV_BAND_TEXT[g['band']]}"
+            + ("; 个股未经回测, 仓位减半" if g["band"] == "C" and not index else ""))
     extra = []
     if g["years"] < s["leap_iv_min_years"]:
         extra.append(f"历史只有 {g['years']:.1f} 年, 中位数只代表一个 regime, 比值仅供参考")
@@ -2216,10 +2220,21 @@ def iv_src_tag(ticket: dict) -> str:
             "yahoo": " (⚠Yahoo列)"}.get(ticket.get("iv_src"), "")
 
 
-def leap_iv_expensive(leap) -> bool:
-    """报告层的 IV 门: 真票且档位 C/D = 剧本要求改结构。"""
+def leap_iv_over_gate(leap) -> bool:
+    """报告层的 IV 门: 真票且档位 D (平值 IV 过 58% 绝对门) = 不用 LEAP 表达。
+
+    C 档不再改写 (2026-09-25): 指数代理回测显示深度实值在 C 档几乎不多付,
+    改 spread 封顶、"等回落"错过反弹 —— C 档照出 🟢, 由档位 note 写明做法。"""
     return (bool(leap) and "skip_reason" not in leap
-            and (leap.get("iv_gauge") or {}).get("band") in ("C", "D"))
+            and (leap.get("iv_gauge") or {}).get("band") == "D")
+
+
+def leap_band_tag(leap) -> str:
+    """🟢 行尾的档位提示: 只有 C 档需要在第一屏就看到做法 (A/B 照常)。"""
+    g = (leap or {}).get("iv_gauge") or {}
+    if g.get("band") != "C":
+        return ""
+    return " · IV C 档: 只做深度实值" + ("" if g.get("index") else ", 个股仓位减半")
 
 
 def stock_ladder(zone, s: dict) -> list[float]:
@@ -2745,7 +2760,7 @@ def action_label(r: dict) -> str:
         return "⚠️止损"
     leap, csp = r["leap"], r["csp"]
     if leap and "skip_reason" not in leap:
-        return "IV高·spread" if leap_iv_expensive(leap) else "LEAP票👇"
+        return "IV过门·不用LEAP" if leap_iv_over_gate(leap) else "LEAP票👇"
     if leap and "skip_reason" in leap:
         return "等财报后" if "财报" in leap["skip_reason"] else "LEAP被拦"
     if any("等阶段2" in n for n in r["notes"]):
@@ -2817,18 +2832,15 @@ def action_block(results: list[dict]) -> list[str]:
         floor_tagged = False
         leap, csp = r["leap"], r["csp"]
         if leap and "skip_reason" not in leap:
-            if leap_iv_expensive(leap):
+            if leap_iv_over_gate(leap):
                 g = leap["iv_gauge"]
-                items.append((sym, f"- 🟡 **{sym}** 右侧确认但 LEAP IV 档位 "
-                                   f"{g['band']} (平值 IV {g['atm_iv'] * 100:.0f}% = "
-                                   f"自身实际波动中位数的 {g['ratio']:.2f} 倍) — "
-                                   + ("不用 LEAP, 改 spread/sell put/正股"
-                                      if g["band"] == "D" else "改 spread/PMCC")
-                                   + " (见下)"))
+                items.append((sym, f"- 🟡 **{sym}** 右侧确认但平值 IV "
+                                   f"{g['atm_iv'] * 100:.0f}% 过绝对门 (IV 档位 D) — "
+                                   "不用 LEAP, 改 spread/sell put/正股 (见下)"))
             else:
                 items.append((sym, f"- 🟢 **{sym}** LEAP: {floor_tag}BUY {leap['exp']} "
                                    f"{leap['strike']:g}C @ ~{leap['mid']:.2f} "
-                                   f"(delta {leap['delta']:.2f}, 详见下)"))
+                                   f"(delta {leap['delta']:.2f}{leap_band_tag(leap)}, 详见下)"))
                 floor_tagged = floor_tagged or bool(floor_tag)
         elif _regime_halted(leap):
             if sym not in halted:
@@ -3106,15 +3118,12 @@ def render_close(results, regime, ivdf, now_et) -> str:
         if leap:
             if "skip_reason" in leap:
                 lines.append(ticket_skip_line("LEAP", leap))
-            elif leap_iv_expensive(leap):
-                # 剧本 IV 档位: C 档连 deep ITM 都改 spread/PMCC; D 档不用 LEAP。
-                # 档位读数那条 note 照印 —— 比值/近两年实际波动是判断依据
+            elif leap_iv_over_gate(leap):
+                # D 档: 不用 LEAP 表达。C 档照常出票 (走下面的分支), 做法写在档位
+                # note 里。档位读数那条 note 照印 —— 比值/近两年实际波动是判断依据
                 g = leap["iv_gauge"]
                 lines.append(
-                    f"- LEAP: IV 档位 {g['band']} — "
-                    + ("剧本: 不用 LEAP 表达, 改 spread / sell put / 正股"
-                       if g["band"] == "D" else
-                       "剧本: 改用 call spread/PMCC/risk reversal 或等 IV 回落")
+                    f"- LEAP: IV 档位 {g['band']} — 剧本: 不用 LEAP 表达, 改 spread / sell put / 正股"
                     + f" (候选 {leap['exp']} {leap['strike']:g}C @ "
                     f"~{leap['mid']:.2f}, 合约 IV {leap['iv'] * 100:.0f}%"
                     f"{iv_src_tag(leap)})")
