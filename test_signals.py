@@ -3475,7 +3475,7 @@ def _gbm_closes(vols_by_year, seed=7, start=100.0):
 class TestLeapIvBand(unittest.TestCase):
     """LEAP 的 IV 档位 (2026-09-25): 平值 IV ÷ **自身**滚动实际波动中位数,
     取代 30 天口径的自建 IVP>60, 也取代第一版的分位法 (lesson.md 2026-09-25:
-    长窗口分布很窄, 正常溢价在分位上就是 81-99)。同一天 NVDA/IBM 的 Jan'28
+    长窗口分布很窄, IV 只比中位数高 ~15% 在分位上就是 81-99)。同一天 NVDA/IBM 的 Jan'28
     平值 IV 都是 ~39%, 比值却是 0.78 / 1.67 —— 绝对值不跨标的比。
 
     合成日线: flat40 的实际波动中位数 0.404, 近1年 0.366 / 近2年 0.388。"""
@@ -3487,7 +3487,7 @@ class TestLeapIvBand(unittest.TestCase):
         flat40 = _gbm_closes([0.40] * 10)
         band = lambda iv, c=flat40: sc.leap_iv_band(iv, c, self.DTE, self.S)["band"]
         self.assertEqual(band(0.30), "A")          # 0.74 倍
-        self.assertEqual(band(0.44), "B")          # 1.09 倍: 正常溢价不算贵
+        self.assertEqual(band(0.44), "B")          # 1.09 倍: 常见水平, 不算贵
         self.assertEqual(band(0.55), "C")          # 1.36 倍
         # 同一个 30%: 放在 20% 波动的标的上就是贵 (1.48 倍)
         self.assertEqual(band(0.30, _gbm_closes([0.20] * 10)), "C")
@@ -3599,6 +3599,15 @@ class TestAttachLeapIvBand(unittest.TestCase):
         self.assertIn("指数口径 C 线 1.35 倍", index["notes"][0])
         self.assertNotIn("指数口径", stock["notes"][0])
 
+    def test_atm_from_last_trades_is_labelled(self):
+        cc = self._cc(iv=0.30)
+        for leg in (cc.chain("x").calls, cc.chain("x").puts):
+            leg["bid"], leg["ask"] = 0.0, 0.0
+        t = self._ticket()
+        sc.attach_leap_iv_band(t, cc, 100.0, sc.SETTINGS_DEFAULTS)
+        self.assertEqual(t["iv_gauge"]["atm_src"], "last")
+        self.assertIn("(含成交价)", t["notes"][0])
+
     def test_failure_is_said_not_silently_fallen_back(self):
         t = self._ticket()
         sc.attach_leap_iv_band(t, self._cc(boom=True), 100.0, sc.SETTINGS_DEFAULTS)
@@ -3665,6 +3674,18 @@ class TestMidFirstIv(unittest.TestCase):
         self.assertEqual(sc.mid_first_iv(self._row(65.0, 26.82, float("nan")),
                                          None, 89.29, self.T, True), (None, None))
 
+    def test_last_trade_price_is_labelled_as_such(self):
+        """盘后没有盘口, _mark 落到最近成交价 —— 反解的不是 mid, 标注要说实话。"""
+        calls = TestLeapExpiryMaturity()._calls(100.0, 0.35, 3000, 486)
+        calls["bid"], calls["ask"] = 0.0, 0.0
+        cc = _FakeCC(_FakeChain(calls, pd.DataFrame([])),
+                     expiries=[("2028-01-21", 486)])
+        t = sc.leap_ticket(cc, 100.0, {"kind": "stock", "high_beta": False},
+                           None, sc.SETTINGS_DEFAULTS)
+        self.assertEqual(t["src"], "last")
+        self.assertEqual(t["iv_src"], "last")
+        self.assertEqual(sc.iv_src_tag(t), " (成交价反解)")
+
     def test_leap_ticket_records_mid_source(self):
         cc = TestLeapExpiryMaturity()._cc()
         t = sc.leap_ticket(cc, 100.0, {"kind": "stock", "high_beta": False},
@@ -3674,7 +3695,8 @@ class TestMidFirstIv(unittest.TestCase):
 
     def test_display_tag_keeps_review_regex_working(self):
         import review
-        for src, tag in (("mid", "(mid反解)"), ("yahoo", "(⚠Yahoo列)")):
+        for src, tag in (("mid", "(mid反解)"), ("last", "(成交价反解)"),
+                         ("yahoo", "(⚠Yahoo列)")):
             line = f"合约 IV 42%{sc.iv_src_tag({'iv_src': src})}, OI 900"
             self.assertIn(tag, line)
             self.assertEqual(review.CIV_RE.search(line).group(1), "42")

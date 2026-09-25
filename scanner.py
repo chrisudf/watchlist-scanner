@@ -159,10 +159,13 @@ SETTINGS_DEFAULTS = {
     # ~10 点而 Jan'28 只掉 ~2.5 点, 两个方向都会骗人; IV 绝对值也不能跨标的
     # 比 —— 同一天 NVDA/IBM 的 Jan'28 平值 IV 都是 ~39%, 比值却是 0.78 / 1.67。
     # 为什么是比值不是分位 (lesson.md 2026-09-25): 长窗口的实际波动分布很窄,
-    # 正常的波动率风险溢价 (IV 比实际波动高 ~15%) 在分位上就是 81-99 ——
-    # 回放 8 张历史推荐, 分位法拦了 6 张, 其中 3 张只是正常溢价。比值与窗口
-    # 长度基本无关 (同一只 TSM 换到期日, 分位 81→94, 比值 1.15→1.14)。
-    # 1.0 / 1.25 是判断值, 流水账记了 iv_ratio, 样本攒够再校准。
+    # IV 只比中位数高 ~15% (今天多数大票都这样) 在分位上就是 81-99 —— 回放
+    # 8 张历史推荐, 分位法拦了 6 张, 其中 3 张就是这种。比值与窗口长度基本无关
+    # (同一只 TSM 换到期日, 分位 81→94, 比值 1.15→1.14)。
+    # 1.25 不是"正常溢价": 长期限的波动消息基本不定价 (Dew-Becker 等 2017),
+    # 今天比值 1.1-1.2 主要是近两年波动高于 10 年常态。它的含义是"容忍当前
+    # 波动水平比常态高多少"。1.0 / 1.25 都是判断值, 没有回测; 流水账记了
+    # iv_ratio, 样本攒够再校准。
     "leap_iv_ratio_bands": [1.0, 1.25],   # < 1.0 = A 便宜; 1.0-1.25 = B; > 1.25 = C 贵
     # 指数的 C 线单独高 0.10 (lesson.md 2026-09-24/25): 成分股涨跌不同步, 实际
     # 波动被分散压低, 期权却要为"一起跌"的相关性风险收钱, 指数 IV/实际波动的
@@ -399,8 +402,9 @@ def journal_rows(results, d: str, mode: str, regime: dict) -> list[dict]:
                 "exp": t.get("exp"), "strike": t.get("strike"),
                 "mid": t.get("mid"), "delta": t.get("delta"), "dte": t.get("dte"),
                 "oi": t.get("oi"), "spread_pct": t.get("spread_pct"),
-                # iv_src: 2026-09-24 起 LEAP 的 iv 改为 mid 反解 (之前是 Yahoo
-                # 列, 深度实值偏高 ~9 pts)。旧行没有这个字段 = Yahoo 口径
+                # iv_src: 2026-09-24 起 LEAP 的 iv 改为反解 —— "mid" 盘口中间价 /
+                # "last" 最近成交价 / "yahoo" 反解失败退回 Yahoo 列 (之前一律是
+                # Yahoo 列, 深度实值偏高 ~9 pts)。旧行没有这个字段 = Yahoo 口径
                 "iv": t.get("iv"), "iv_src": t.get("iv_src"), "src": t.get("src"),
                 "spot_at_rec": spot,
                 "annualized_pct": t.get("annualized_pct"),
@@ -1379,6 +1383,9 @@ def contract_iv(row, mid, spot, T, is_call):
 def mid_first_iv(row, mid, spot, T, is_call) -> tuple[float | None, str | None]:
     """先从 mid 反解, 反解不出才退回 Yahoo 的 impliedVolatility 列 -> (iv, "mid"/"yahoo")。
 
+    参数 mid 可能是最近成交价 (_mark 的 "last" 路径), 这时来源仍返回 "mid",
+    由调用方按 _mark 的来源改标成 "last" —— 标注要说实话 (lesson.md 2026-09-25)。
+
     与 contract_iv 的优先级相反, 目前只给 LEAP 用 (lesson.md 2026-09-24):
     Yahoo 列对深度实值 LEAP 系统性偏高 ~9 pts (NVDA 2028-01 170C: Yahoo
     51.7% / mid 反解 42.0% / CBOE 40.5%), 而 delta 就是拿这个 IV 算的。
@@ -1988,6 +1995,8 @@ def leap_ticket(cc: ChainCache, spot: float, cfg: dict,
         iv, iv_src = mid_first_iv(row, mid, spot, T, is_call=True)
         if iv is None:
             continue
+        if iv_src == "mid" and src == "last":
+            iv_src = "last"             # 盘口不可用, 反解的是最近成交价
         delta = bs_delta(spot, strike, T, RATE, iv, is_call=True)
         intrinsic = max(spot - strike, 0.0)
         extrinsic = max(mid - intrinsic, 0.0)
@@ -2124,8 +2133,8 @@ def leap_iv_band(atm_iv: float, closes, dte: int, s: dict,
 def leap_atm_iv(cc: ChainCache, exp: str, dte: int,
                 spot: float) -> tuple[float | None, str | None]:
     """LEAP 到期日的平值 IV: 离现价最近的行权价, call/put 各反解再取均值
-    -> (iv, 来源)。来源 "mid" = 两腿都是 mid 反解, 否则 "yahoo" (有腿退回了
-    Yahoo 列, 见 mid_first_iv)。
+    -> (iv, 来源)。来源 "mid" = 两腿都是 mid 反解; 有腿退回了 Yahoo 列就是
+    "yahoo" (见 mid_first_iv); 否则有腿用的是最近成交价就是 "last"。
 
     两腿平均是为了抵掉股息: BS 不计股息时 call 的 IV 偏高、put 偏低,
     幅度相近 (KO 2028-01 平值 call 19.5% / put 23.2%, 均值 21.3% = CBOE)。"""
@@ -2137,13 +2146,16 @@ def leap_atm_iv(cc: ChainCache, exp: str, dte: int,
         if df is None or df.empty:
             continue
         row = df.loc[(df["strike"] - spot).abs().idxmin()]
-        mid, _src = _mark(row, cutoff)
+        mid, px_src = _mark(row, cutoff)
         iv, iv_src = mid_first_iv(row, mid, spot, T, is_call)
+        if iv_src == "mid" and px_src == "last":
+            iv_src = "last"
         if iv:
             ivs.append((iv, iv_src))
     if not ivs:
         return None, None
-    src = "mid" if all(x == "mid" for _, x in ivs) else "yahoo"
+    srcs = {x for _, x in ivs}
+    src = "yahoo" if "yahoo" in srcs else "last" if "last" in srcs else "mid"
     return sum(v for v, _ in ivs) / len(ivs), src
 
 
@@ -2170,7 +2182,7 @@ def attach_leap_iv_band(ticket: dict, cc: ChainCache, spot: float, s: dict,
     # 两处口径标注 (lesson.md 2026-09-24): 指数用单独的升档线; 平值 IV 若有腿
     # 退回了 Yahoo 列要说出来 —— 以后重构时这两条是最容易被"统一"掉的
     head = (f"IV 档位 {g['band']}: 平值 IV {g['atm_iv'] * 100:.0f}%"
-            + ("" if atm_src == "mid" else " (含 Yahoo 列)")
+            + {"mid": "", "last": " (含成交价)"}.get(atm_src, " (含 Yahoo 列)")
             + f" = 自身{g['years']:.0f}年实际波动中位数 {g['med_rv'] * 100:.0f}% 的 "
             f"{g['ratio']:.2f} 倍 (近1年 {g['rv1y'] * 100:.0f}% / 近2年 "
             f"{g['rv2y'] * 100:.0f}%"
@@ -2199,7 +2211,8 @@ def attach_leap_iv_band(ticket: dict, cc: ChainCache, spot: float, s: dict,
 def iv_src_tag(ticket: dict) -> str:
     """合约 IV 后面的来源标注 (lesson.md 2026-09-24)。紧跟在 "合约 IV N%" 之后,
     review.py 的 CIV_RE 只认前半段, 不受影响。"""
-    return {"mid": " (mid反解)", "yahoo": " (⚠Yahoo列)"}.get(ticket.get("iv_src"), "")
+    return {"mid": " (mid反解)", "last": " (成交价反解)",
+            "yahoo": " (⚠Yahoo列)"}.get(ticket.get("iv_src"), "")
 
 
 def leap_iv_expensive(leap) -> bool:
