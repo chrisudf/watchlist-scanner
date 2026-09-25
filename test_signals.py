@@ -3473,39 +3473,52 @@ def _gbm_closes(vols_by_year, seed=7, start=100.0):
 
 
 class TestLeapIvBand(unittest.TestCase):
-    """LEAP 的 IV 档位 (2026-09-24): 平值 IV 对比**自身**滚动实际波动的分位,
-    取代 30 天口径的自建 IVP>60。同一天 NVDA/IBM 的 Jan'28 平值 IV 都是 ~39%,
-    分位却是 3 / 98 —— 绝对值不跨标的比。"""
+    """LEAP 的 IV 档位 (2026-09-25): 平值 IV ÷ **自身**滚动实际波动中位数,
+    取代 30 天口径的自建 IVP>60, 也取代第一版的分位法 (lesson.md 2026-09-25:
+    长窗口分布很窄, 正常溢价在分位上就是 81-99)。同一天 NVDA/IBM 的 Jan'28
+    平值 IV 都是 ~39%, 比值却是 0.78 / 1.67 —— 绝对值不跨标的比。
+
+    合成日线: flat40 的实际波动中位数 0.404, 近1年 0.366 / 近2年 0.388。"""
 
     S = sc.SETTINGS_DEFAULTS
     DTE = 486
 
     def test_bands_follow_own_history(self):
         flat40 = _gbm_closes([0.40] * 10)
-        self.assertEqual(sc.leap_iv_band(0.30, flat40, self.DTE, self.S)["band"], "A")
-        self.assertEqual(sc.leap_iv_band(0.46, flat40, self.DTE, self.S)["band"], "C")
-        # 同一个 30%: 放在 20% 波动的标的上就是贵
-        flat20 = _gbm_closes([0.20] * 10)
-        self.assertEqual(sc.leap_iv_band(0.30, flat20, self.DTE, self.S)["band"], "C")
+        band = lambda iv, c=flat40: sc.leap_iv_band(iv, c, self.DTE, self.S)["band"]
+        self.assertEqual(band(0.30), "A")          # 0.74 倍
+        self.assertEqual(band(0.44), "B")          # 1.09 倍: 正常溢价不算贵
+        self.assertEqual(band(0.55), "C")          # 1.36 倍
+        # 同一个 30%: 放在 20% 波动的标的上就是贵 (1.48 倍)
+        self.assertEqual(band(0.30, _gbm_closes([0.20] * 10)), "C")
 
-    def test_absolute_gate_overrides_pctile(self):
-        """IONQ 型: 77% 在自身历史里 0 分位, 照样过不了 58% 绝对门。"""
+    def test_ratio_does_not_depend_on_expiry(self):
+        """分位法的毛病: 同一只 TSM、同样 42% 的 IV, 2028 到期 81 分位、2029 到期
+        94 分位 —— 窗口越长分布越窄。中位数不随窗口长度变, 比值也就不变。"""
+        flat40 = _gbm_closes([0.40] * 10)
+        near = sc.leap_iv_band(0.45, flat40, 486, self.S)
+        far = sc.leap_iv_band(0.45, flat40, 851, self.S)
+        self.assertAlmostEqual(near["ratio"], far["ratio"], places=2)
+        self.assertEqual(near["band"], far["band"])
+
+    def test_absolute_gate_overrides_ratio(self):
+        """IONQ 型: 77% 只有自身实际波动中位数的 0.8 倍, 照样过不了 58% 绝对门。"""
         wild = _gbm_closes([0.95] * 6)
         g = sc.leap_iv_band(0.77, wild, self.DTE, self.S)
-        self.assertLess(g["pctile"], 50)
+        self.assertLess(g["ratio"], 1.0)
         self.assertEqual(g["band"], "D")
 
     def test_bump_when_iv_beats_recent_regime(self):
-        """NVDA 型: 早年波动高、近两年低 —— 长历史分位把 IV 显得便宜,
+        """NVDA 型: 早年波动高、近两年低 —— 长历史中位数把 IV 显得便宜,
         连近两年实际波动都比不过的 IV 要升一档。"""
         closes = _gbm_closes([0.60] * 8 + [0.25] * 2)
         g = sc.leap_iv_band(0.35, closes, self.DTE, self.S)
-        self.assertLess(g["pctile"], 50)
+        self.assertLess(g["ratio"], 1.0)
         self.assertTrue(g["bumped"])
         self.assertEqual(g["band"], "B")
 
     def test_regime_up_flagged_not_auto_downgraded(self):
-        """IBM 型: 近两年波动上移, IV 低于近期实际波动 —— 只标记, 不自动降档。"""
+        """IBM/GLD 型: 近两年波动上移, IV 低于近期实际波动 —— 只标记, 不自动降档。"""
         closes = _gbm_closes([0.20] * 8 + [0.50] * 2)
         g = sc.leap_iv_band(0.40, closes, self.DTE, self.S)
         self.assertEqual(g["band"], "C")
@@ -3520,10 +3533,10 @@ class TestLeapIvBand(unittest.TestCase):
 
     def test_thresholds_come_from_settings(self):
         flat40 = _gbm_closes([0.40] * 10)
-        # 0.42 在这条合成日线上是 ~90 分位: 默认 C, 把 B/C 分界放宽到 95 就是 B
-        self.assertEqual(sc.leap_iv_band(0.42, flat40, self.DTE, self.S)["band"], "C")
-        loose = {**self.S, "leap_iv_bands": [50.0, 95.0]}
-        self.assertEqual(sc.leap_iv_band(0.42, flat40, self.DTE, loose)["band"], "B")
+        self.assertEqual(sc.leap_iv_band(0.55, flat40, self.DTE, self.S)["band"], "C")
+        # C 线同时是升档线, 放宽到 1.5 两处一起松 (0.55 < 1.5 x 近两年 0.388)
+        loose = {**self.S, "leap_iv_ratio_bands": [1.0, 1.5]}
+        self.assertEqual(sc.leap_iv_band(0.55, flat40, self.DTE, loose)["band"], "B")
 
 
 class TestAttachLeapIvBand(unittest.TestCase):
@@ -3566,24 +3579,25 @@ class TestAttachLeapIvBand(unittest.TestCase):
         self.assertAlmostEqual(t["iv_gauge"]["atm_iv"], 0.30, places=3)
         self.assertEqual(t["iv_gauge"]["atm_src"], "mid")
         self.assertTrue(t["notes"][0].startswith("IV 档位 A"))
+        self.assertIn("实际波动中位数", t["notes"][0])
         self.assertNotIn("Yahoo", t["notes"][0])
         self.assertEqual(t["notes"][0], t["iv_gauge"]["note"])
         self.assertFalse(sc.leap_iv_expensive(t))
 
     def test_index_uses_its_own_bump_line_and_says_so(self):
-        """QQQ 型: IV 高出近两年实际波动 ~20% —— 个股线 (1.15) 升档, 指数线
-        (1.25) 不升, 且报告里写明用的是指数升档线。"""
-        # 近两年实际波动 ~19%: 0.233 落在 1.15x (0.223) 与 1.25x (0.242) 之间
+        """QQQ 型: IV 高出近两年实际波动 ~30% —— 个股 C 线 (1.25) 升档, 指数
+        C 线 (1.35) 不升, 且报告里写明用的是指数口径。"""
+        # 近两年实际波动 0.194: 0.25 落在 1.25x (0.242) 与 1.35x (0.262) 之间
         closes = _gbm_closes([0.30] * 8 + [0.20] * 2)
         stock, index = self._ticket(), self._ticket()
-        sc.attach_leap_iv_band(stock, self._cc(iv=0.233, closes=closes), 100.0,
+        sc.attach_leap_iv_band(stock, self._cc(iv=0.25, closes=closes), 100.0,
                                sc.SETTINGS_DEFAULTS)
-        sc.attach_leap_iv_band(index, self._cc(iv=0.233, closes=closes), 100.0,
+        sc.attach_leap_iv_band(index, self._cc(iv=0.25, closes=closes), 100.0,
                                sc.SETTINGS_DEFAULTS, index=True)
         self.assertTrue(stock["iv_gauge"]["bumped"])
         self.assertFalse(index["iv_gauge"]["bumped"])
-        self.assertIn("指数升档线 1.25 倍", index["notes"][0])
-        self.assertNotIn("指数升档线", stock["notes"][0])
+        self.assertIn("指数口径 C 线 1.35 倍", index["notes"][0])
+        self.assertNotIn("指数口径", stock["notes"][0])
 
     def test_failure_is_said_not_silently_fallen_back(self):
         t = self._ticket()
@@ -3591,6 +3605,37 @@ class TestAttachLeapIvBand(unittest.TestCase):
         self.assertNotIn("iv_gauge", t)
         self.assertIn("IV 档位计算失败", t["notes"][0])
         self.assertFalse(sc.leap_iv_expensive(t))     # 无读数不改写成 spread
+
+
+class TestLeapIvBandNotes(unittest.TestCase):
+    """档位 note 的两类附加标注 (lesson.md 2026-09-25)。"""
+
+    def _attach(self, iv, closes):
+        t = {"exp": "2028-01-21", "dte": 486, "notes": []}
+        sc.attach_leap_iv_band(t, TestAttachLeapIvBand()._cc(iv=iv, closes=closes),
+                               100.0, sc.SETTINGS_DEFAULTS)
+        return t
+
+    def test_edge_of_band_is_flagged(self):
+        # flat40 中位数 0.404: 0.50 -> 1.24 倍, 贴 1.25 线; 0.44 -> 1.09 倍, 不贴
+        flat40 = _gbm_closes([0.40] * 10)
+        self.assertIn("贴近 1.25 分界", self._attach(0.50, flat40)["notes"][0])
+        self.assertNotIn("贴近", self._attach(0.44, flat40)["notes"][0])
+
+    def test_edge_of_absolute_gate_is_flagged(self):
+        """SOFI 型: 58.5% 刚过绝对门, 本身比自身历史还便宜。"""
+        wild = _gbm_closes([0.62] * 6)
+        n = self._attach(0.585, wild)["notes"][0]
+        self.assertTrue(n.startswith("IV 档位 D"))
+        self.assertIn("贴近 58% 绝对门", n)
+
+    def test_stale_long_median_flagged_when_iv_below_recent_high(self):
+        """GLD 型: 近两年波动翻倍, IV 夹在近1年与近2年实际波动之间 —— C 档,
+        但要提示长期中位数可能过时。"""
+        closes = _gbm_closes([0.14] * 8 + [0.24, 0.30])
+        t = self._attach(0.25, closes)
+        self.assertEqual(t["iv_gauge"]["band"], "C")
+        self.assertIn("长期中位数可能过时", t["notes"][0])
 
 
 class TestMidFirstIv(unittest.TestCase):
@@ -3643,7 +3688,8 @@ class TestActionBlockLeapIvBand(unittest.TestCase):
     def _r(self, band):
         leap = dict(self.LEAP, notes=[])
         if band:
-            leap["iv_gauge"] = {"band": band, "atm_iv": 0.39, "pctile": 91.0,
+            leap["iv_gauge"] = {"band": band, "atm_iv": 0.39, "ratio": 1.31,
+                                "med_rv": 0.30,
                                 "note": f"IV 档位 {band}: ..."}
         return {"symbol": "NVDA", "error": None, "tech": {"close": 225.0},
                 "notes": [], "state": "CONFIRMED", "leap": leap, "csp": None,
@@ -3653,6 +3699,7 @@ class TestActionBlockLeapIvBand(unittest.TestCase):
         text = "\n".join(sc.action_block([self._r("C")]))
         self.assertIn("🟡", text)
         self.assertIn("LEAP IV 档位 C", text)
+        self.assertIn("自身实际波动中位数的 1.31 倍", text)
         self.assertIn("改 spread/PMCC", text)
         self.assertNotIn("🟢", text)
 
@@ -3672,6 +3719,7 @@ class TestActionBlockLeapIvBand(unittest.TestCase):
         r["leap"]["iv_src"] = "mid"
         rows = sc.journal_rows([r], "2026-09-24", "close", {})
         self.assertEqual(rows[0]["iv_band"], "C")
+        self.assertEqual(rows[0]["iv_ratio"], 1.31)
         self.assertEqual(rows[0]["iv_src"], "mid")
         self.assertIn("IVC档", review.leap_flags(rows[0]))
         self.assertEqual(review.leap_flags({"iv_band": "B"}), "—")

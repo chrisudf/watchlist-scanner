@@ -153,23 +153,34 @@ SETTINGS_DEFAULTS = {
     "leap_max_be_pct": 12.0,
     "leap_earnings_buffer_days": 14,  # 财报前 <=2 周不进 LEAP (2026-08-09 校准)
     "leap_earnings_note_days": 30,    # 财报 15-30 天内出票但带提示
-    # LEAP 的 IV 贵不贵 (2026-09-24, 与 stock-analysis 技能第 4 步同口径):
-    # 读数 P = 该到期日平值 IV 在**标的自身**滚动实际波动分布里的分位。
+    # LEAP 的 IV 贵不贵 (2026-09-25, 与 stock-analysis 技能第 4 步同口径):
+    # 读数 = 该到期日平值 IV ÷ **标的自身**滚动实际波动的中位数 (比值)。
     # 取代原来的"自建 IVP > 60": 那是 30 天口径, 财报后 NVDA 的 IV30 掉了
     # ~10 点而 Jan'28 只掉 ~2.5 点, 两个方向都会骗人; IV 绝对值也不能跨标的
-    # 比 —— 同一天 NVDA/IBM 的 Jan'28 平值 IV 都是 ~39%, 分位却是 3 / 98。
-    # 50/80 而不是 40/60: IV 平均比事后实际波动高几个点 (波动率风险溢价),
-    # 正常就落在 60-70 分位。初版阈值, 样本攒够再校准。
-    "leap_iv_bands": [50.0, 80.0],   # P < 50 = A 便宜; 50-80 = B; > 80 = C 贵
-    "leap_iv_bump": 1.15,            # IV > 此倍 x max(近1年, 近2年实际波动) → 升一档
-    # 指数单独一条升档线 (lesson.md 2026-09-24): 成分股涨跌不同步, 实际波动
-    # 被分散压低, 期权却要为"一起跌"的相关性风险收钱 —— 指数 IV/实际波动
-    # 常态就在 1.15-1.25。按个股的 1.15 会把 QQQ 这类常态读数判成 C 档。
-    # 只管 kind="index"; GLD/DRAM 这类 etf 不是分散化股票指数, 仍走个股线
-    "leap_iv_bump_index": 1.25,
+    # 比 —— 同一天 NVDA/IBM 的 Jan'28 平值 IV 都是 ~39%, 比值却是 0.78 / 1.67。
+    # 为什么是比值不是分位 (lesson.md 2026-09-25): 长窗口的实际波动分布很窄,
+    # 正常的波动率风险溢价 (IV 比实际波动高 ~15%) 在分位上就是 81-99 ——
+    # 回放 8 张历史推荐, 分位法拦了 6 张, 其中 3 张只是正常溢价。比值与窗口
+    # 长度基本无关 (同一只 TSM 换到期日, 分位 81→94, 比值 1.15→1.14)。
+    # 1.0 / 1.25 是判断值, 流水账记了 iv_ratio, 样本攒够再校准。
+    "leap_iv_ratio_bands": [1.0, 1.25],   # < 1.0 = A 便宜; 1.0-1.25 = B; > 1.25 = C 贵
+    # 指数的 C 线单独高 0.10 (lesson.md 2026-09-24/25): 成分股涨跌不同步, 实际
+    # 波动被分散压低, 期权却要为"一起跌"的相关性风险收钱, 指数 IV/实际波动的
+    # 常态比个股高一截。只管 kind="index"; GLD/DRAM 这类 etf 不是分散化股票
+    # 指数, 仍走个股线。
+    # 升档没有单独的倍数, 就用同一条 C 线: IV > C线 x max(近1年, 近2年实际波动)
+    # → 升一档。第一版升档是 1.15, 比 C 线 1.25 还严, 近期波动 ≈ 长期的稳定
+    # 标的实际上 1.15 倍就被判贵, 1.25 的阈值被悄悄架空 (lesson.md 2026-09-25)
+    "leap_iv_ratio_bands_index": [1.0, 1.35],
+    # 贴线标注 (lesson.md 2026-09-25): 比值离分界 < 0.03、或平值 IV 离 58% 绝对门
+    # < 2 个点时, note 写明"读数噪声就能翻档"。9/25 实测 SOFI 58.5% 刚过绝对门
+    # (比值 0.94, 本来是 A), ISRG 比值 1.25 正压 B/C 线 —— 延迟报价的抖动足以
+    # 让它们隔天换档。只标注, 不改档位。
+    "leap_iv_edge_ratio": 0.03,
+    "leap_iv_edge_abs": 0.02,
     "leap_iv_abs_gate": 0.58,        # 合约 IV >= 此值 = D 档, 不用 LEAP 表达
     "leap_iv_hist_years": 10,        # 实际波动分布取多少年日线
-    "leap_iv_min_years": 5.0,        # 历史短于此, 分位只作参考 (带提示)
+    "leap_iv_min_years": 5.0,        # 历史短于此, 中位数只代表一个 regime (带提示)
     # regime
     "stage2_window_bars": 10,    # trading days after inversion resolves
     "episode_min_days": 3, "episode_min_peak": 1.10,
@@ -404,7 +415,7 @@ def journal_rows(results, d: str, mode: str, regime: dict) -> list[dict]:
                 "extrinsic_pct": t.get("extrinsic_pct"),
                 # LEAP 开仓时的 IV 档位 —— 复盘要能分出"C 档照开的票"表现如何
                 "iv_band": (t.get("iv_gauge") or {}).get("band"),
-                "iv_pctile": (t.get("iv_gauge") or {}).get("pctile"),
+                "iv_ratio": (t.get("iv_gauge") or {}).get("ratio"),
                 "panic_mode": t.get("panic_mode"),
                 "zone": cfg.get("value_zone"), "zone_asof": cfg.get("zone_asof"),
                 "high_beta": cfg.get("high_beta"),
@@ -2061,20 +2072,25 @@ def leap_iv_band(atm_iv: float, closes, dte: int, s: dict,
                  index: bool = False) -> dict | None:
     """LEAP 到期日的平值 IV 贵不贵 (纯函数) -> 档位读数, 历史不够时 None。
 
-    P = atm_iv 在"滚动实际波动"分布里的分位: 窗口长度 = 合约剩余期限
-    (上限 24 个月) 的交易日数, 每 5 个交易日取一个窗口, 收盘对收盘对数收益。
-    拿**同一只票自己的**历史比, 因为 IV 绝对值不跨标的可比。
+    比值 = atm_iv ÷ "滚动实际波动"的中位数: 窗口长度 = 合约剩余期限 (上限
+    24 个月) 的交易日数, 每 5 个交易日取一个窗口, 收盘对收盘对数收益。拿**同一
+    只票自己的**历史比, 因为 IV 绝对值不跨标的可比。用中位数不用均值: 2020 年
+    那种崩盘窗口会把均值抬高, 中位数不受几个极端窗口左右 (代价是比值略偏严)。
+    比值衡量的是"相对自己的历史贵不贵", 不是"市场定错了价" —— 基本面真变了
+    (COHR 型), 高比值可以是合理的, 但买方照样要付这个价。
 
     两道修正:
-      - 升档: IV > leap_iv_bump x max(近1年, 近2年实际波动)。波动 regime
-        下移的标的 (NVDA 十年前体量小、波动高), 长历史分位会把 IV 显得便宜
-        —— 连近两年都比不过的 IV 不算便宜。指数 (index=True) 改用
-        leap_iv_bump_index, 理由见该设置的注释与 lesson.md 2026-09-24。
-      - D 档: 合约 IV >= leap_iv_abs_gate 时与分位无关。平值 LEAP 价格约等于
+      - 升档: IV > C线 x max(近1年, 近2年实际波动)。波动 regime 下移的标的
+        (NVDA 十年前体量小、波动高), 长历史中位数会把 IV 显得便宜 —— 相对近期
+        实际波动也过了 C 线的 IV 不算便宜。用同一条 C 线而不是另设倍数, 见
+        leap_iv_ratio_bands_index 的注释。指数 (index=True) 用指数那组阈值。
+      - D 档: 合约 IV >= leap_iv_abs_gate 时与比值无关。平值 LEAP 价格约等于
         0.4 x IV x sqrt(T) x 股价, IV 60% 时 16 个月平值要付股价 ~28%,
-        便不便宜都救不回盈亏平衡 (IONQ 77% 在自身历史里是 0 分位, 照样不行)。
-    反向情况 (IV 低于近 1-2 年实际波动 = regime 上移) 只标 regime_up,
-    不自动降档 —— 买方默认保守, 降不降由人写理由。"""
+        便不便宜都救不回盈亏平衡 (IONQ 77% 只有自身实际波动中位数的 0.8 倍, 照样不行)。
+    反向情况 (IV 低于近 1-2 年实际波动的较高者 = regime 上移, 长期中位数可能
+    已过时) 只标 regime_up, 不自动降档 —— 买方默认保守, 降不降由人写理由。
+    条件用较高者不用较低者: 9/25 的 GLD 近1年 30% / 近2年 24%, IV 24.3% 夹在
+    中间, 按"低于两者"不报, 而黄金波动近两年已翻倍, 10 年中位数 14% 明显过时。"""
     px = [float(x) for x in closes if x is not None and x > 0 and math.isfinite(x)]
     rets = [math.log(px[i] / px[i - 1]) for i in range(1, len(px))]
     h = max(21, round(min(dte, 730) * 252 / 365))
@@ -2085,21 +2101,24 @@ def leap_iv_band(atm_iv: float, closes, dte: int, s: dict,
         m = sum(xs) / len(xs)
         return math.sqrt(sum((x - m) ** 2 for x in xs) / len(xs) * 252)
 
-    windows = [rv(rets[i:i + h]) for i in range(0, len(rets) - h + 1, 5)]
-    pctile = 100.0 * sum(1 for w in windows if w < atm_iv) / len(windows)
+    windows = sorted(rv(rets[i:i + h]) for i in range(0, len(rets) - h + 1, 5))
+    n = len(windows)
+    med_rv = (windows[n // 2] if n % 2
+              else (windows[n // 2 - 1] + windows[n // 2]) / 2)
+    ratio = atm_iv / med_rv
     rv1y, rv2y = rv(rets[-252:]), rv(rets[-504:])
-    lo, hi = s["leap_iv_bands"]
-    idx = 0 if pctile < lo else 1 if pctile <= hi else 2
-    bump = s["leap_iv_bump_index"] if index else s["leap_iv_bump"]
+    lo, hi = s["leap_iv_ratio_bands_index" if index else "leap_iv_ratio_bands"]
+    idx = 0 if ratio < lo else 1 if ratio <= hi else 2
+    bump = hi
     bumped = atm_iv > bump * max(rv1y, rv2y) and idx < 2
     band = "ABC"[idx + bumped]
     if atm_iv >= s["leap_iv_abs_gate"]:
         band = "D"
-    return {"band": band, "atm_iv": atm_iv, "pctile": pctile,
+    return {"band": band, "atm_iv": atm_iv, "med_rv": med_rv, "ratio": ratio,
             "rv1y": rv1y, "rv2y": rv2y, "bumped": bumped,
             "bump": bump, "index": index,
-            "regime_up": atm_iv < min(rv1y, rv2y),
-            "years": len(rets) / 252, "windows": len(windows)}
+            "regime_up": atm_iv < max(rv1y, rv2y), "lo": lo,
+            "years": len(rets) / 252, "windows": n}
 
 
 def leap_atm_iv(cc: ChainCache, exp: str, dte: int,
@@ -2152,17 +2171,26 @@ def attach_leap_iv_band(ticket: dict, cc: ChainCache, spot: float, s: dict,
     # 退回了 Yahoo 列要说出来 —— 以后重构时这两条是最容易被"统一"掉的
     head = (f"IV 档位 {g['band']}: 平值 IV {g['atm_iv'] * 100:.0f}%"
             + ("" if atm_src == "mid" else " (含 Yahoo 列)")
-            + f" 在自身{g['years']:.0f}年实际波动里是 {g['pctile']:.0f} 分位 (近1年 "
-            f"{g['rv1y'] * 100:.0f}% / 近2年 {g['rv2y'] * 100:.0f}%"
-            + (f", 指数升档线 {g['bump']:g} 倍" if index else "") + ")"
+            + f" = 自身{g['years']:.0f}年实际波动中位数 {g['med_rv'] * 100:.0f}% 的 "
+            f"{g['ratio']:.2f} 倍 (近1年 {g['rv1y'] * 100:.0f}% / 近2年 "
+            f"{g['rv2y'] * 100:.0f}%"
+            + (f", 指数口径 C 线 {g['bump']:g} 倍" if index else "") + ")"
             + (f" → IV 超过近 1-2 年实际波动的 {g['bump']:g} 倍, 升一档"
                if g["bumped"] else "")
             + f" — {IV_BAND_TEXT[g['band']]}")
     extra = []
     if g["years"] < s["leap_iv_min_years"]:
-        extra.append(f"历史只有 {g['years']:.1f} 年, 分位仅供参考")
+        extra.append(f"历史只有 {g['years']:.1f} 年, 中位数只代表一个 regime, 比值仅供参考")
     if g["regime_up"] and g["band"] == "C":
-        extra.append("IV 低于近 1-2 年实际波动 (波动 regime 上移), 可人工降一档但要写理由")
+        extra.append(f"IV 只有近 1-2 年实际波动较高者的 {g['atm_iv'] / max(g['rv1y'], g['rv2y']):.2f} 倍 "
+                     "(波动 regime 上移, 长期中位数可能过时), 可人工降一档但要写理由")
+    edge = s["leap_iv_edge_ratio"]
+    near = [x for x in (g["lo"], g["bump"]) if abs(g["ratio"] - x) < edge]
+    if near:
+        extra.append(f"比值贴近 {near[0]:g} 分界 (±{edge:g} 内), 读数噪声就能翻档")
+    if abs(g["atm_iv"] - s["leap_iv_abs_gate"]) < s["leap_iv_edge_abs"]:
+        extra.append(f"平值 IV 贴近 {s['leap_iv_abs_gate']:.0%} 绝对门 "
+                     f"(±{s['leap_iv_edge_abs'] * 100:.0f} 点内), 读数噪声就能进出 D 档")
     g["note"] = head + ("; " + "; ".join(extra) if extra else "")
     ticket["iv_gauge"] = g
     ticket["notes"].insert(0, g["note"])
@@ -2778,8 +2806,8 @@ def action_block(results: list[dict]) -> list[str]:
             if leap_iv_expensive(leap):
                 g = leap["iv_gauge"]
                 items.append((sym, f"- 🟡 **{sym}** 右侧确认但 LEAP IV 档位 "
-                                   f"{g['band']} (平值 IV {g['atm_iv'] * 100:.0f}%, "
-                                   f"自身 {g['pctile']:.0f} 分位) — "
+                                   f"{g['band']} (平值 IV {g['atm_iv'] * 100:.0f}% = "
+                                   f"自身实际波动中位数的 {g['ratio']:.2f} 倍) — "
                                    + ("不用 LEAP, 改 spread/sell put/正股"
                                       if g["band"] == "D" else "改 spread/PMCC")
                                    + " (见下)"))
@@ -3066,7 +3094,7 @@ def render_close(results, regime, ivdf, now_et) -> str:
                 lines.append(ticket_skip_line("LEAP", leap))
             elif leap_iv_expensive(leap):
                 # 剧本 IV 档位: C 档连 deep ITM 都改 spread/PMCC; D 档不用 LEAP。
-                # 档位读数那条 note 照印 —— 分位/近两年实际波动是判断依据
+                # 档位读数那条 note 照印 —— 比值/近两年实际波动是判断依据
                 g = leap["iv_gauge"]
                 lines.append(
                     f"- LEAP: IV 档位 {g['band']} — "
@@ -3119,7 +3147,7 @@ def render_close(results, regime, ivdf, now_et) -> str:
     lines += [
         "---",
         "执行提醒: 左侧三条件齐才进 (价值区+被迫卖出证据+右侧确认); 加仓只加在强势上; "
-        "LEAP 的 IV 档位 = 平值 IV 在自身多年实际波动里的分位 (A 便宜/B 正常/C 贵/D 过绝对门); "
+        "LEAP 的 IV 档位 = 平值 IV ÷ 自身多年实际波动中位数 (A 便宜/B 正常/C 贵/D 过绝对门); "
         "概览表的 IVP 是 30 天口径的自建样本, 只供 CSP 参考。",
         "数据: yfinance ~15min 延迟。合约价为 mid 估算, 下单前实查盘口。非投资建议。",
     ]
