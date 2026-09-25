@@ -508,6 +508,9 @@ def leap_flags(r: dict) -> str:
     sp = r.get("spread_pct")
     if sp is not None and sp > LEAP_GATES["spread_pct"]:
         f.append(f"价差{sp:.1f}%")
+    band = r.get("iv_band")
+    if band in ("C", "D"):          # 扫描器的 IV 档位 (2026-09-24 起才有)
+        f.append(f"IV{band}档")
     return "⚠ " + " ".join(f) if f else "—"
 
 ASSIGNED_HDR = [("标的", 6, False), ("入手", 11, False), ("到期", 11, False),
