@@ -3887,6 +3887,37 @@ class TestCSPZoneFar(unittest.TestCase):
         self.assertTrue(row["zone_far"])
 
 
+class TestContractIvPlaceholder(unittest.TestCase):
+    """没有实时盘口时不认 Yahoo 的 IV 列 (2026-09-28 HOOD 105P: 占位 0.125 → delta 0.00)。"""
+
+    T = 18 / 365.0
+
+    def _row(self, px, yahoo_iv, live):
+        half = 0.05 if live else 0.0
+        return pd.Series({"strike": 105.0, "impliedVolatility": yahoo_iv,
+                          "bid": px - half if live else 0.0, "ask": px + half if live else 0.0,
+                          "lastPrice": px})
+
+    def test_live_quote_keeps_yahoo_column(self):
+        px = sc.bs_price(119.4, 105.0, self.T, sc.RATE, 0.64, False)
+        self.assertAlmostEqual(sc.contract_iv(self._row(px, 0.61, True), px, 119.4, self.T, False), 0.61)
+
+    def test_no_quote_ignores_placeholder_and_inverts(self):
+        px = sc.bs_price(119.4, 105.0, self.T, sc.RATE, 0.64, False)
+        iv = sc.contract_iv(self._row(px, 0.12501, False), px, 119.4, self.T, False)
+        self.assertAlmostEqual(iv, 0.64, places=3)
+
+    def test_zone_far_not_fooled_by_placeholder(self):
+        """整条链无盘口 + 占位 IV: 修之前每档 delta 都是 0, 会挑区内最高档 86。"""
+        cc = TestCSPTicketZoneCap()._cc(sigma=0.75)
+        puts = cc._chain.puts
+        puts["bid"], puts["ask"], puts["impliedVolatility"] = 0.0, 0.0, 0.12501
+        t = sc.csp_zone_far_ticket(cc, 100.0, "2026-11-20", [70.0, 86.0], sc.SETTINGS_DEFAULTS)
+        self.assertEqual(t["strike"], 80.5)
+        self.assertLessEqual(t["delta"], 0.10)
+        self.assertEqual(t["src"], "last")
+
+
 class TestCboeAtmIv(unittest.TestCase):
     """LEAP 平值 IV 先取 CBOE, 不可用时退回 Yahoo 并写明原因 (2026-09-28)。"""
 
