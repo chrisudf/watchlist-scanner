@@ -3807,5 +3807,35 @@ class TestReviewLeapByBand(unittest.TestCase):
         self.assertIn("满 6 个月", m)
 
 
+class TestSpreadEarningsBuffer(unittest.TestCase):
+    """回踩 spread 的财报缓冲 (2026-09-28): 与 LEAP 同口径, 被拦的回踩不烧标记。"""
+
+    class _CC:
+        def expiries(self):
+            return [("2027-01-15", 113)]
+
+        def chain(self, exp):
+            raise AssertionError("财报缓冲内不该去取链")
+
+    def _days(self, n):
+        return (sc.datetime.now(sc.ET).date() + timedelta(days=n)).isoformat()
+
+    def test_inside_buffer_skips_with_marker(self):
+        t = sc.call_spread_ticket(self._CC(), 100.0, sc.SETTINGS_DEFAULTS, self._days(9))
+        self.assertTrue(t["earnings_buffer"])
+        self.assertIn("财报前 <=14 天不开回踩 spread", t["skip_reason"])
+
+    def test_outside_buffer_goes_on_to_the_chain(self):
+        with self.assertRaises(AssertionError):     # 走到了取链 = 没被财报拦
+            sc.call_spread_ticket(self._CC(), 100.0, sc.SETTINGS_DEFAULTS, self._days(42))
+
+    def test_deferred_retest_does_not_burn_one_shot_flag(self):
+        prev = {"state": "TREND", "since": "2026-09-21"}
+        r = {"state": "TREND", "retest": True, "retest_deferred": True}
+        self.assertNotIn("retested", sc.next_persisted_state(prev, r, "2026-09-28"))
+        r = {"state": "TREND", "retest": True}
+        self.assertTrue(sc.next_persisted_state(prev, r, "2026-09-28")["retested"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

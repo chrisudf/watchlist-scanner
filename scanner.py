@@ -125,6 +125,10 @@ SETTINGS_DEFAULTS = {
     "spread_dte": [80, 200],
     "spread_long_delta": 0.60, "spread_short_delta": 0.30,
     "spread_min_reward_risk": 0.6,  # 0.60/0.30 价差正常 ~1:1 — 低于此=报价失真
+    # 回踩 spread 的财报缓冲 (2026-09-28, 与 LEAP 同口径): spread 净买 vega,
+    # 财报前开仓会吃 IV crush。9/24 COHR 那张 113 天就跨了 11/05 财报 (当时 42 天
+    # 外, 不在缓冲内, 只提示); 缓冲内被拦的回踩不烧一次性标记, 财报后再回踩再提示
+    "spread_earnings_buffer_days": 14,
     "trend_middle_days": 30,     # TREND 持续 N 天 -> 2x/PMCC 工具切换提示
     "two_x_vix_max": 25.0,       # 波动收敛门: VIX 低于此才提示 2x/PMCC
     # LEAP
@@ -525,9 +529,9 @@ def next_persisted_state(prev: dict, r: dict, today: str) -> dict:
             and prev.get("state") not in ("CONFIRMED", "TREND"):
         retested = False                # 新一轮确认: 一次性提示重新计数
         retest_pending = False
-    if r.get("retest"):                 # 回踩已提示 = 显式消耗
-        retested = True
-        retest_pending = False
+    if r.get("retest") and not r.get("retest_deferred"):
+        retested = True                 # 回踩已提示 = 显式消耗
+        retest_pending = False          # (财报缓冲拦下的不算: 财报后再回踩再提示)
     if retested:
         entry["retested"] = True
     if retest_pending and entry["state"] in ("CONFIRMED", "TREND"):
@@ -2244,9 +2248,21 @@ def stock_ladder(zone, s: dict) -> list[float]:
     return [hi, lo, round(lo * (1 - s["ladder_panic_discount"]), 2)]
 
 
-def call_spread_ticket(cc: ChainCache, spot: float, s: dict) -> dict:
+def call_spread_ticket(cc: ChainCache, spot: float, s: dict,
+                       earnings_iso: str | None = None) -> dict:
     """突破后首次回踩的 3-6 个月 call spread (剧本工具切换表):
-    买 ~0.60 delta / 卖 ~0.30 delta 同到期."""
+    买 ~0.60 delta / 卖 ~0.30 delta 同到期.
+
+    财报在 spread_earnings_buffer_days 内不出票 (skip_reason 带 earnings_buffer
+    标记, 调用方据此不消耗一次性回踩标记)。"""
+    if earnings_iso:
+        days = (date.fromisoformat(earnings_iso) - datetime.now(ET).date()).days
+        if 0 <= days <= s["spread_earnings_buffer_days"]:
+            return {"skip_reason": (
+                f"财报 {earnings_iso} 就在 {days} 天后 — 财报前 <="
+                f"{s['spread_earnings_buffer_days']} 天不开回踩 spread (净买 vega, "
+                "财报后 IV 回落吃亏); 财报后再回踩 20 日线不破会重新提示"),
+                "earnings_buffer": True}
     lo, hi = s["spread_dte"]
     exps = [(e, d) for e, d in cc.expiries() if lo <= d <= hi]
     if not exps:
@@ -2671,7 +2687,9 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
                 if not emitted and stage == "NORMAL":
                     r["leap_pending"] = True
         if r.get("retest"):  # STAGE1 已在回踩检测处拦掉
-            r["spread"] = call_spread_ticket(cc, tech["close"], s)
+            r["spread"] = call_spread_ticket(cc, tech["close"], s, r["earnings"])
+            if r["spread"].get("earnings_buffer"):
+                r["retest_deferred"] = True     # 财报缓冲: 不消耗一次性回踩标记
             if "skip_reason" not in r["spread"]:
                 # 剧本工具切换表: 止损放回踩低点下方
                 r["spread"]["retest_low"] = tech["low_today"]
