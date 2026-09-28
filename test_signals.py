@@ -3750,6 +3750,9 @@ class TestActionBlockLeapIvBand(unittest.TestCase):
         index = "\n".join(sc.action_block([self._r("C", index=True)]))
         self.assertIn("IV C 档: 只做深度实值", index)
         self.assertNotIn("仓位减半", index)
+        etf = self._r("C")
+        etf["leap"]["iv_gauge"]["kind"] = "etf"          # GLD / DRAM: 不叫"个股"
+        self.assertIn("只做深度实值, ETF仓位减半", "\n".join(sc.action_block([etf])))
 
     def test_d_band_says_no_leap(self):
         text = "\n".join(sc.action_block([self._r("D")]))

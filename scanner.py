@@ -2297,7 +2297,8 @@ def leap_atm_iv_sourced(cc, ticket: dict, spot: float, s: dict,
 
 
 def attach_leap_iv_band(ticket: dict, cc: ChainCache, spot: float, s: dict,
-                        index: bool = False, as_of: str | None = None) -> None:
+                        index: bool = False, as_of: str | None = None,
+                        kind: str = "stock") -> None:
     """给已出的 LEAP 真票挂上 iv_gauge 与一条档位 note (原地修改)。
 
     多一次 10 年日线请求, 只在真票发出时才付。取不到就明说, 不回落到
@@ -2328,7 +2329,8 @@ def attach_leap_iv_band(ticket: dict, cc: ChainCache, spot: float, s: dict,
             + (f" → IV 超过近 1-2 年实际波动的 {g['bump']:g} 倍, 升一档"
                if g["bumped"] else "")
             + f" — {IV_BAND_TEXT[g['band']]}"
-            + ("; 个股未经回测, 仓位减半" if g["band"] == "C" and not index else ""))
+            + (f"; {'ETF' if kind == 'etf' else '个股'}未经回测, 仓位减半"
+               if g["band"] == "C" and not index else ""))
     extra = []
     if cboe_why:
         extra.append(f"CBOE 不可用, 平值 IV 退回 Yahoo: {cboe_why}")
@@ -2345,6 +2347,7 @@ def attach_leap_iv_band(ticket: dict, cc: ChainCache, spot: float, s: dict,
         extra.append(f"平值 IV 贴近 {s['leap_iv_abs_gate']:.0%} 绝对门 "
                      f"(±{s['leap_iv_edge_abs'] * 100:.0f} 点内), 读数噪声就能进出 D 档")
     g["note"] = head + ("; " + "; ".join(extra) if extra else "")
+    g["kind"] = kind
     ticket["iv_gauge"] = g
     ticket["notes"].insert(0, g["note"])
 
@@ -2370,7 +2373,9 @@ def leap_band_tag(leap) -> str:
     g = (leap or {}).get("iv_gauge") or {}
     if g.get("band") != "C":
         return ""
-    return " · IV C 档: 只做深度实值" + ("" if g.get("index") else ", 个股仓位减半")
+    if g.get("index"):
+        return " · IV C 档: 只做深度实值"
+    return f" · IV C 档: 只做深度实值, {'ETF' if g.get('kind') == 'etf' else '个股'}仓位减半"
 
 
 def stock_ladder(zone, s: dict) -> list[float]:
@@ -2816,7 +2821,7 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
                     # 自建 IVP>60 的处理一致, 不影响 pending/窗口的生命周期
                     attach_leap_iv_band(r["leap"], cc, tech["close"], s,
                                         index=cfg["kind"] == "index",
-                                        as_of=tech["as_of"])
+                                        as_of=tech["as_of"], kind=cfg["kind"])
                 if emitted and stage == "STAGE2_WINDOW":
                     # 真票已发 — 现在才烧每窗口一次的 dedup key。ep_end
                     # 只在 STAGE2 分支里绑定, 由 stage 判断护住
@@ -3167,7 +3172,7 @@ def render_close(results, regime, ivdf, now_et) -> str:
     ordered = by_actionability(results)
     lines += ["## 概览 (按可操作性排序)", "",
               "| 标的 | 价值区 | 收盘 | 状态 | 操作 | Δ% | vs20日 "
-              "| 量比 | 三选二 | iv/rv | IVP |",
+              "| 量比 | 三选二 | iv/rv | IVP(30天) |",
               "|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in ordered:
         t = r["tech"]
