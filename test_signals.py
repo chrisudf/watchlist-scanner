@@ -3837,5 +3837,51 @@ class TestSpreadEarningsBuffer(unittest.TestCase):
         self.assertTrue(sc.next_persisted_state(prev, r, "2026-09-28")["retested"])
 
 
+class TestCSPZoneFar(unittest.TestCase):
+    """区内远档 CSP (2026-09-28): 价格在价值区上方较远时, 区内行权价 + delta <= 0.10
+    + 年化达标才出票, 并标记。合成链同 TestCSPTicketZoneCap (spot 100, 21 DTE)。"""
+
+    ZONE = [70.0, 86.0]          # 现价 100 在上沿上方 16%
+
+    def _cc(self, sigma):
+        return TestCSPTicketZoneCap()._cc(sigma=sigma)
+
+    def test_picks_highest_in_zone_strike_under_delta_cap(self):
+        # sigma 0.75: 86 档 delta ~0.17 超上限; 满足 <=0.10 的最高档是 80.5 (年化 ~19%)
+        t = sc.csp_zone_far_ticket(self._cc(0.75), 100.0, "2026-11-20", self.ZONE,
+                                   sc.SETTINGS_DEFAULTS)
+        self.assertTrue(t["zone_far"])
+        self.assertEqual(t["strike"], 80.5)
+        self.assertLessEqual(t["delta"], 0.10)
+        self.assertGreaterEqual(t["annualized_pct"], 10.0)
+        self.assertTrue(t["notes"][0].startswith("区内远档"))
+
+    def test_low_iv_stays_silent(self):
+        self.assertIsNone(sc.csp_zone_far_ticket(self._cc(0.20), 100.0, "2026-11-20",
+                                                 self.ZONE, sc.SETTINGS_DEFAULTS))
+
+    def test_expiry_across_earnings_stays_silent(self):
+        # 唯一到期 2026-10-02 跨财报 → 常规档是 ⏸ skip, 区内远档静默 None
+        self.assertIsNone(sc.csp_zone_far_ticket(self._cc(0.75), 100.0, "2026-09-30",
+                                                 self.ZONE, sc.SETTINGS_DEFAULTS))
+
+    def test_regular_csp_unchanged_by_refactor(self):
+        t = sc.csp_ticket(TestCSPTicketZoneCap()._cc(), 100.0, None, "2026-11-20",
+                          "NORMAL", [70.0, 87.0], sc.SETTINGS_DEFAULTS)
+        self.assertLessEqual(t["strike"], 87.0)
+        self.assertFalse(t.get("zone_far"))
+
+    def test_marker_in_label_action_line_and_journal(self):
+        csp = {"exp": "2026-10-16", "strike": 250.0, "mid": 1.2, "delta": 0.09,
+               "annualized_pct": 20.0, "zone_far": True}
+        r = {"symbol": "COHR", "error": None, "tech": {"close": 291.4}, "notes": [],
+             "state": "TREND", "leap": None, "csp": csp, "iv30": 0.7,
+             "cfg": {"value_zone": [220.0, 260.0], "options": True}}
+        self.assertEqual(sc.action_label(r), "区内CSP👇")
+        self.assertIn("CSP[区内远档]: SELL 2026-10-16 250P", "\n".join(sc.action_block([r])))
+        row = sc.journal_rows([r], "2026-09-28", "close", {})[0]
+        self.assertTrue(row["zone_far"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

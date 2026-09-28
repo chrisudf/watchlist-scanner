@@ -118,6 +118,12 @@ SETTINGS_DEFAULTS = {
     "csp_dte_panic": [4, 10],    # 恐慌期卖周权
     "csp_min_oi": 200, "csp_min_mid": 0.20,
     "csp_min_annualized": 10.0,  # 年化下限 % (moomoo 筛选器同口径 10~80)
+    # 区内远档 CSP (2026-09-28): 价格在价值区上方超过 near_zone_pct 时, 常规 CSP
+    # 不出票; 但高 IV 标的的区内行权价远在价外也有年化 (9/24 COHR 291, 手动卖了
+    # 区内的 250P)。区内行权价 + delta <= 此值 + 年化/权利金过常规下限才出票, 取
+    # 满足条件的最高行权价, 票上标"区内远档"。只在 NORMAL 期; 不达标静默不出
+    "csp_zone_far": True,
+    "csp_zone_far_max_delta": 0.10,
     "sixteen_rule_mult": 2.75,   # 距离 >= 2.5-3 x IV/16 x sqrt(DTE)
     # 正股分批 (剧本: 档位更深、间距更大、末档留给真正的恐慌价)
     "ladder_panic_discount": 0.18,   # 末档 = 区间下沿再打 18% 折扣
@@ -426,6 +432,7 @@ def journal_rows(results, d: str, mode: str, regime: dict) -> list[dict]:
                 "iv_band": (t.get("iv_gauge") or {}).get("band"),
                 "iv_ratio": (t.get("iv_gauge") or {}).get("ratio"),
                 "panic_mode": t.get("panic_mode"),
+                "zone_far": t.get("zone_far"),     # 区内远档 CSP (2026-09-28 起)
                 "zone": cfg.get("value_zone"), "zone_asof": cfg.get("zone_asof"),
                 "high_beta": cfg.get("high_beta"),
                 "ticker_state": r.get("state"), "stage": stage, "vix": vix,
@@ -1822,13 +1829,10 @@ def csp_window_open(zone, in_or_near_zone: bool, stage: str) -> bool:
         or stage == "STAGE2_WINDOW")
 
 
-def csp_ticket(cc: ChainCache, spot: float, iv30: float | None,
-               earnings_iso: str, stage: str, zone, s: dict) -> dict | None:
-    """One cash-secured-put suggestion. Normal: 12-31 DTE, delta 0.10-0.15.
-    Panic (stage 1): weekly, strike at the 16-rule distance. Expiries that
-    contain an earnings date are excluded outright (short 不跨财报)."""
-    panic = stage.startswith("STAGE1")
-    lo, hi = s["csp_dte_panic"] if panic else s["csp_dte_normal"]
+def _csp_expiry(cc: ChainCache, earnings_iso: str | None, lo: int, hi: int,
+                target_dte: int):
+    """CSP 的到期选择 (常规 / 恐慌 / 区内远档共用): 窗口内剔除跨财报的到期
+    (short 不跨财报), 取最接近 target_dte 的 -> (exp, dte, notes) 或 {"skip_reason"}。"""
     window = [(e, d) for e, d in cc.expiries() if lo <= d <= hi]
     blocked = []
     if earnings_iso:
@@ -1843,9 +1847,51 @@ def csp_ticket(cc: ChainCache, spot: float, iv30: float | None,
         notes.append("财报日期获取失败 — 下单前自查该到期日是否跨财报")
     if blocked:
         notes.append(f"财报 {earnings_iso}: 已剔除跨财报到期日 {', '.join(blocked)}")
-
-    target_dte = 7 if panic else 21
     exp, dte = min(window, key=lambda x: abs(x[1] - target_dte))
+    return exp, dte, notes
+
+
+def csp_zone_far_ticket(cc: ChainCache, spot: float, earnings_iso: str | None,
+                        zone, s: dict) -> dict | None:
+    """区内远档 CSP: 价格在价值区上方较远时, 区内行权价 + 低 delta + 年化达标才出。
+
+    与常规档的区别只在选行权价: 只看行权价 <= 价值区上沿且 |delta| <=
+    csp_zone_far_max_delta 的 put, 过年化/权利金下限后取最高行权价 (离现价最近、
+    delta 最接近上限、权利金最厚)。到期选择、财报剔除、票据 notes 与常规档共用。
+    不达标返回 None —— 这是机会型的票, 不每天挂一条 ⏸ 占版面。"""
+    picked = _csp_expiry(cc, earnings_iso, *s["csp_dte_normal"], 21)
+    if isinstance(picked, dict):
+        return None
+    exp, dte, notes = picked
+    ok = [c for c in _put_candidates(cc, exp, dte, spot)
+          if c["strike"] <= zone[1] and c["delta"] <= s["csp_zone_far_max_delta"]
+          and csp_annualized(c["mid"], c["strike"], c["dte"]) >= s["csp_min_annualized"]
+          and c["mid"] >= s["csp_min_mid"]]
+    if not ok:
+        return None
+    liquid = [c for c in ok if c["oi"] >= s["csp_min_oi"]]
+    pick = max(liquid or ok, key=lambda c: c["strike"])
+    above = (spot / zone[1] - 1) * 100
+    notes.insert(0, (
+        f"区内远档: 现价高于价值区上沿 {zone[1]:g} 约 {above:.0f}%, 常规档不出票; 行权价 "
+        f"{pick['strike']:g} 在区内、delta {pick['delta']:.2f} <= "
+        f"{s['csp_zone_far_max_delta']:.2f}, 靠 IV 撑起年化 —— IV 回落时这类票会消失"))
+    ticket = _finish_csp(dict(pick), spot, s, zone, False, notes)
+    ticket["zone_far"] = True
+    return ticket
+
+
+def csp_ticket(cc: ChainCache, spot: float, iv30: float | None,
+               earnings_iso: str, stage: str, zone, s: dict) -> dict | None:
+    """One cash-secured-put suggestion. Normal: 12-31 DTE, delta 0.10-0.15.
+    Panic (stage 1): weekly, strike at the 16-rule distance. Expiries that
+    contain an earnings date are excluded outright (short 不跨财报)."""
+    panic = stage.startswith("STAGE1")
+    lo, hi = s["csp_dte_panic"] if panic else s["csp_dte_normal"]
+    picked = _csp_expiry(cc, earnings_iso, lo, hi, 7 if panic else 21)
+    if isinstance(picked, dict):
+        return picked
+    exp, dte, notes = picked
     cands = _put_candidates(cc, exp, dte, spot)
     if not cands:
         return {"skip_reason": f"{exp} put 链无可用报价 (市场关闭/流动性)"}
@@ -2659,6 +2705,10 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
             else:
                 r["csp"] = csp_ticket(cc, tech["close"], r["iv30"],
                                       r["earnings"], stage, zone, s)
+        elif (s["csp_zone_far"] and zone is not None and not in_or_near_zone
+              and stage == "NORMAL" and not (stale_msg or regime.get("halt_csp"))):
+            # 区内远档: 机会型, 不达标/被拦都静默 (见 csp_zone_far_ticket)
+            r["csp"] = csp_zone_far_ticket(cc, tech["close"], r["earnings"], zone, s)
         if want_leap:
             if stale_msg or regime.get("halt_new_longs"):
                 r["leap"] = blocked_ticket(stale_msg,
@@ -2788,7 +2838,7 @@ def action_label(r: dict) -> str:
     if any("等阶段2" in n for n in r["notes"]):
         return "等阶段2"
     if csp and "skip_reason" not in csp:
-        return "CSP票👇"
+        return "区内CSP👇" if csp.get("zone_far") else "CSP票👇"
     if csp and "skip_reason" in csp:
         return "CSP被拦"
     spread = r.get("spread")
@@ -2870,7 +2920,8 @@ def action_block(results: list[dict]) -> list[str]:
         elif leap:
             items.append((sym, f"- ⏸ **{sym}** LEAP: {leap['skip_reason']}"))
         if csp and "skip_reason" not in csp:
-            items.append((sym, f"- 🔵 **{sym}** CSP: {floor_tag}SELL {csp['exp']} "
+            items.append((sym, f"- 🔵 **{sym}** CSP{'[区内远档]' if csp.get('zone_far') else ''}: "
+                               f"{floor_tag}SELL {csp['exp']} "
                                f"{csp['strike']:g}P @ ~{csp['mid']:.2f} "
                                f"(delta {csp['delta']:.2f}, 年化 "
                                f"~{csp['annualized_pct']:.0f}%, 详见下)"))
@@ -3098,7 +3149,8 @@ def render_close(results, regime, ivdf, now_et) -> str:
             if "skip_reason" in csp:
                 lines.append(ticket_skip_line("CSP", csp))
             else:
-                tag = "恐慌档" if csp["panic_mode"] else "常规"
+                tag = ("区内远档" if csp.get("zone_far")
+                       else "恐慌档" if csp["panic_mode"] else "常规")
                 lines.append(
                     f"- **CSP ({tag})**: SELL {r['symbol']} {csp['exp']} "
                     f"{csp['strike']:g}P @ ~{csp['mid']:.2f} — delta {csp['delta']:.2f}, "
