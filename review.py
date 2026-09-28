@@ -299,6 +299,7 @@ def resolve(rows: list[dict], today: date) -> list[dict]:
         else:  # leap —— 复盘窗口内没有结局, 只给未实现状态
             r["status"] = "open_unrealized"
             r["dte_left"] = (exp - today).days if exp else None
+            r["days_held"] = (today - date.fromisoformat(r["date"])).days
             if r["last_px"] is not None:
                 r["itm_now"] = r["last_px"] > r["strike"]
                 base = r.get("spot_at_rec")
@@ -500,7 +501,8 @@ def leap_flags(r: dict) -> str:
     if oi is not None and oi < LEAP_GATES["oi"]:
         f.append(f"OI{oi}")
     ex = r.get("extrinsic_pct")
-    if ex is not None and ex > LEAP_GATES["extrinsic_pct"]:
+    # 指数 2026-09-28 起不拿外在价值做门 (todo.md #4), 超了不算踩线
+    if ex is not None and ex > LEAP_GATES["extrinsic_pct"] and r.get("ticker_kind") != "index":
         f.append(f"外在{ex:.0f}%")
     be = r.get("be_pct_at_rec")
     if be is not None and be > LEAP_GATES["be_pct"]:
@@ -726,6 +728,44 @@ def delta_baseline(done: list[dict]) -> dict | None:
 
 
 
+BAND_ORDER = ("A", "B", "C", "D")
+BAND_MATURE_DAYS = 182      # todo.md #3 的关闭条件: 各档都有满 6 个月的样本
+
+
+def leap_band_rows(leap: list[dict]) -> list[tuple]:
+    """LEAP 按**开仓时**的 IV 档位分组 (纯函数) -> 行列表, 没有任何档位记录时为空。
+
+    这是 todo.md #3 阈值校准的前向验证: 档位 2026-09-24 起才写进流水账, 之前的
+    行归到"未记录"。行 = (档位, 笔数, 满 6 个月, 当前 ITM, 越过盈亏平衡,
+    正股涨跌中位 | None, 平均比值 | None)。LEAP 不计胜率, 这里只摆未实现状态,
+    比的是各档之间的差异, 不是绝对输赢。"""
+    if not any(r.get("iv_band") for r in leap):
+        return []
+    groups: dict[str, list[dict]] = {}
+    for r in leap:
+        groups.setdefault(r.get("iv_band") or "未记录", []).append(r)
+    out = []
+    for band in [*BAND_ORDER, "未记录"]:
+        g = groups.get(band)
+        if not g:
+            continue
+        rets = [r["underlying_ret"] for r in g if r.get("underlying_ret") is not None]
+        ratios = [r["iv_ratio"] for r in g if r.get("iv_ratio") is not None]
+        out.append((
+            band, len(g),
+            sum(1 for r in g if (r.get("days_held") or 0) >= BAND_MATURE_DAYS),
+            sum(1 for r in g if r.get("itm_now")),
+            sum(1 for r in g if r.get("last_px") is not None and r.get("strike") is not None
+                and r.get("mid") is not None and r["last_px"] > r["strike"] + r["mid"]),
+            float(pd.Series(rets).median()) if rets else None,
+            sum(ratios) / len(ratios) if ratios else None))
+    return out
+
+
+BAND_NOTE = ("持有期长短不一、每档样本少时别下结论 —— 校准要等各档都有满 6 个月的样本 "
+             "(todo.md #3); C 档 2026-09-25 起照出深度实值, D 档不出 LEAP")
+
+
 def compute_stats(res: list[dict]) -> dict:
     """所有口径**只在这里算一次** -> dict。文本与 markdown 两个渲染器共用。
 
@@ -782,6 +822,7 @@ def compute_stats(res: list[dict]) -> dict:
             st["leap_ret_avg"] = sum(rets) / len(rets)
             st["leap_ret_up"] = sum(1 for x in rets if x > 0)
             st["leap_ret_n"] = len(rets)
+        st["leap_by_band"] = leap_band_rows(leap)
     st["assigned_cells"] = assigned_cells(done)
     by = {}
     for r in done:
@@ -887,6 +928,12 @@ def summarize(res: list[dict]) -> str:
                      f"上涨 {st['leap_ret_up']}/{st['leap_ret_n']}")
         else:
             L.append("  (无法算正股涨跌 —— 回填记录没有推荐日现价)")
+        if st.get("leap_by_band"):
+            L.append("  按开仓 IV 档位:")
+            for b, n, mature, itm, be, med, ratio in st["leap_by_band"]:
+                L.append(f"    {b:<4} {n} 笔 (满6个月 {mature})  ITM {itm}  越过盈亏平衡 {be}  "
+                         f"正股中位 {_num(med, '{:+.1%}')}  平均比值 {_num(ratio)}")
+            L.append("    —— " + BAND_NOTE)
         L.append("")
         L += leap_table(leap)
 
@@ -997,6 +1044,13 @@ def summarize_md(res: list[dict], title="推荐复盘") -> str:
             M += ["", f"正股自推荐日涨跌：中位 {st['leap_ret_med']:+.1%} / "
                       f"均值 {st['leap_ret_avg']:+.1%} / "
                       f"上涨 {st['leap_ret_up']}/{st['leap_ret_n']}。"]
+        if st.get("leap_by_band"):
+            M += ["", "按开仓 IV 档位：", "",
+                  "| 档位 | 笔数 | 满 6 个月 | 当前 ITM | 越过盈亏平衡 | 正股涨跌中位 | 平均比值 |",
+                  "|---|--:|--:|--:|--:|--:|--:|"]
+            for b, n, mature, itm, be, med, ratio in st["leap_by_band"]:
+                M.append(f"| {b} | {n} | {mature} | {itm} | {be} | {_num(med, '{:+.1%}')} | {_num(ratio)} |")
+            M += ["", "> " + BAND_NOTE]
         M.append("")
         _c, _more = _capped(leap_cells(leap))
         M += _table_md(LEAP_HDR, _c)

@@ -42,6 +42,7 @@ import io
 import json
 import math
 import os
+import re
 import sys
 import tomllib
 import urllib.request
@@ -64,6 +65,16 @@ REPORTS = BASE / "reports"
 DATA = BASE / "data"
 STATE_FILE = DATA / "state.json"
 IV_HISTORY = DATA / "iv_history.csv"
+# iv_history.csv 里 iv30 的算法版本 (2026-09-28, lesson.md "30 天平值 IV 换算法")。
+# 自建 IVP 只拿同一版本的行排位, 旧版本的行留在文件里备查、不参与 —— 换算法
+# 等于重置 IVP 历史, 但不删数据。以后再换口径: 改这个值, 旧行自动退出排位。
+#   (无标记)  2026-09-04 ~ 09-25: contract_iv, Yahoo impliedVolatility 列优先
+#   "mid"     2026-09-28 起: mid_first_iv, bid/ask mid 按扫描器模型反解优先
+# 影子列 iv30_ycol: 同一次扫描按旧算法再算一遍, 只记录不排位 —— 新旧对比只有在
+# 收盘扫描 (15:45 ET, 实时盘口) 才成立: 盘外 Yahoo 会清空盘口, IV 列变成 1e-05,
+# 旧算法也退回反解, 两者恒等 (9/28 离线对比就撞上了)。攒够 20 个交易日用
+# research/iv30_method_compare.py --history 比较, 结论后删掉影子列 (todo.md #5)
+IV30_METHOD = "mid"
 # 推荐流水账 (复盘用): 只增不改, 每行一张真票。选 JSONL 的理由见 journal_rows
 JOURNAL = DATA / "recommendations.jsonl"
 CONFIG_FILE = BASE / "watchlist.toml"
@@ -118,6 +129,12 @@ SETTINGS_DEFAULTS = {
     "csp_dte_panic": [4, 10],    # 恐慌期卖周权
     "csp_min_oi": 200, "csp_min_mid": 0.20,
     "csp_min_annualized": 10.0,  # 年化下限 % (moomoo 筛选器同口径 10~80)
+    # 区内远档 CSP (2026-09-28): 价格在价值区上方超过 near_zone_pct 时, 常规 CSP
+    # 不出票; 但高 IV 标的的区内行权价远在价外也有年化 (9/24 COHR 291, 手动卖了
+    # 区内的 250P)。区内行权价 + delta <= 此值 + 年化/权利金过常规下限才出票, 取
+    # 满足条件的最高行权价, 票上标"区内远档"。只在 NORMAL 期; 不达标静默不出
+    "csp_zone_far": True,
+    "csp_zone_far_max_delta": 0.10,
     "sixteen_rule_mult": 2.75,   # 距离 >= 2.5-3 x IV/16 x sqrt(DTE)
     # 正股分批 (剧本: 档位更深、间距更大、末档留给真正的恐慌价)
     "ladder_panic_discount": 0.18,   # 末档 = 区间下沿再打 18% 折扣
@@ -125,6 +142,10 @@ SETTINGS_DEFAULTS = {
     "spread_dte": [80, 200],
     "spread_long_delta": 0.60, "spread_short_delta": 0.30,
     "spread_min_reward_risk": 0.6,  # 0.60/0.30 价差正常 ~1:1 — 低于此=报价失真
+    # 回踩 spread 的财报缓冲 (2026-09-28, 与 LEAP 同口径): spread 净买 vega,
+    # 财报前开仓会吃 IV crush。9/24 COHR 那张 113 天就跨了 11/05 财报 (当时 42 天
+    # 外, 不在缓冲内, 只提示); 缓冲内被拦的回踩不烧一次性标记, 财报后再回踩再提示
+    "spread_earnings_buffer_days": 14,
     "trend_middle_days": 30,     # TREND 持续 N 天 -> 2x/PMCC 工具切换提示
     "two_x_vix_max": 25.0,       # 波动收敛门: VIX 低于此才提示 2x/PMCC
     # LEAP
@@ -146,6 +167,13 @@ SETTINGS_DEFAULTS = {
     "leap_exp_dte_slack": 250, "leap_exp_depth_ratio": 10.0,
     "leap_exp_max_probe": 3,     # 最多多取 N 条链, 限住额外的行情请求
     "leap_max_extrinsic_pct": 40.0,
+    # 指数不拿外在价值做过滤, 只提示 (2026-09-28, todo.md #4): 指数 delta 带 0.70-0.80
+    # 与"外在 <= 40%"直接矛盾 —— 后者在 16 个月以上会把指数逼到 0.80+ (QQQ Jan'28:
+    # 0.70δ 外在 61% / 0.75δ 45% / 0.80δ 33%)。40% 是给高 IV 个股设的 vega 防线;
+    # 指数 IV ~20-25%, 0.70δ 折成保险费率 ~7.4%/年、IV 降 3 点亏权利金 ~7%, 代价适中。
+    # 以前没暴露是因为 Yahoo 列 IV 偏高把 delta 算低, 碰巧选到更深的档。
+    # 指数的成本看票上的保险费率 %/年 与 BE% (BE <= 12% 那道门照旧)
+    "leap_extrinsic_gate_index": False,
     # 到盈亏平衡 <= 12% (moomoo「Buy LEAP Call」筛选器同款, 0~12%)。ITM call
     # 有恒等式 BE = 现价 + 外在价值, 所以这条等价于"外在价值 <= 现价的 12%" ——
     # 和上面 leap_max_extrinsic_pct 量的是同一件事, 分母不同 (那条按权利金,
@@ -184,6 +212,13 @@ SETTINGS_DEFAULTS = {
     "leap_iv_edge_abs": 0.02,
     "leap_iv_abs_gate": 0.58,        # 合约 IV >= 此值 = D 档, 不用 LEAP 表达
     "leap_iv_hist_years": 10,        # 实际波动分布取多少年日线
+    # 平值 IV 的数据源 (2026-09-28): "cboe" = CBOE 免费延迟链 (与 stock-analysis 技能
+    # 和指数回测同口径), 取不到/报价日对不上/现价差太多/链上缺该到期时自动退回
+    # Yahoo mid 反解, 并在 note 里写明原因; "yahoo" = 只用 Yahoo。
+    # 之前 SOFI 的 CBOE 56.2% vs Yahoo 58.5% 正好压在 58% 绝对门两边
+    "leap_iv_source": "cboe",
+    "cboe_timeout_s": 20,
+    "cboe_max_spot_gap": 0.02,       # CBOE 现价与日线收盘差超此比例 = 不是同一时点
     "leap_iv_min_years": 5.0,        # 历史短于此, 中位数只代表一个 regime (带提示)
     # regime
     "stage2_window_bars": 10,    # trading days after inversion resolves
@@ -422,10 +457,13 @@ def journal_rows(results, d: str, mode: str, regime: dict) -> list[dict]:
                 "iv_band": (t.get("iv_gauge") or {}).get("band"),
                 "iv_ratio": (t.get("iv_gauge") or {}).get("ratio"),
                 "panic_mode": t.get("panic_mode"),
+                "zone_far": t.get("zone_far"),     # 区内远档 CSP (2026-09-28 起)
                 "zone": cfg.get("value_zone"), "zone_asof": cfg.get("zone_asof"),
                 "high_beta": cfg.get("high_beta"),
+                "ticker_kind": cfg.get("kind"),   # 复盘旗标要分指数/个股 (2026-09-28)
                 "ticker_state": r.get("state"), "stage": stage, "vix": vix,
                 "earnings": r.get("earnings"), "iv30": r.get("iv30"),
+                "iv30_src": IV30_METHOD,           # 2026-09-28 起; 旧行无此字段 = Yahoo 列口径
                 "notes": t.get("notes") or [],
                 "source": "scan",
             })
@@ -525,9 +563,9 @@ def next_persisted_state(prev: dict, r: dict, today: str) -> dict:
             and prev.get("state") not in ("CONFIRMED", "TREND"):
         retested = False                # 新一轮确认: 一次性提示重新计数
         retest_pending = False
-    if r.get("retest"):                 # 回踩已提示 = 显式消耗
-        retested = True
-        retest_pending = False
+    if r.get("retest") and not r.get("retest_deferred"):
+        retested = True                 # 回踩已提示 = 显式消耗
+        retest_pending = False          # (财报缓冲拦下的不算: 财报后再回踩再提示)
     if retested:
         entry["retested"] = True
     if retest_pending and entry["state"] in ("CONFIRMED", "TREND"):
@@ -1407,6 +1445,7 @@ class ChainCache:
     """One yf.Ticker per symbol; option chains fetched at most once."""
 
     def __init__(self, symbol: str):
+        self.symbol = symbol
         self.tk = yf.Ticker(symbol)
         self._chains: dict[str, object] = {}
         self._expiries: list[str] | None = None
@@ -1428,9 +1467,15 @@ class ChainCache:
         return self._chains[exp]
 
 
-def atm_iv30(cc: ChainCache, spot: float) -> float | None:
+def atm_iv30(cc: ChainCache, spot: float, legacy: bool = False) -> float | None:
     """ATM IV interpolated to 30 DTE from the two bracketing expiries
-    (nearest expiry alone when only one side exists in 7..90 DTE)."""
+    (nearest expiry alone when only one side exists in 7..90 DTE).
+
+    每腿先 mid 反解 (mid_first_iv), 2026-09-28 起; 之前用 contract_iv (Yahoo 列
+    优先)。9/25 收盘 60 张实测: Yahoo 列 − mid 中位 +0.3 点但四分位 [-1.1, +2.2],
+    73% 差 > 1 点; mid − CBOE 是稳定的 +1.4 点常数 [0.9, 2.0] —— 自建 IVP 是
+    自己跟自己比, 要的是稳定, 不是绝对水平 (research/yahoo_iv_bias.py)。
+    legacy=True 按旧算法算, 只供 iv_history 的影子列 iv30_ycol 做对照。"""
     usable = [(e, d) for e, d in cc.expiries() if 7 <= d <= 90]
     if not usable:
         return None
@@ -1449,7 +1494,10 @@ def atm_iv30(cc: ChainCache, spot: float) -> float | None:
             idx = (df["strike"] - spot).abs().idxmin()
             row = df.loc[idx]
             mid, _src = _mark(row, cutoff)
-            iv = contract_iv(row, mid, spot, T, is_call)
+            if legacy:
+                iv = contract_iv(row, mid, spot, T, is_call)
+            else:
+                iv, _iv_src = mid_first_iv(row, mid, spot, T, is_call)
             if iv:
                 ivs.append(iv)
         if ivs:
@@ -1818,13 +1866,10 @@ def csp_window_open(zone, in_or_near_zone: bool, stage: str) -> bool:
         or stage == "STAGE2_WINDOW")
 
 
-def csp_ticket(cc: ChainCache, spot: float, iv30: float | None,
-               earnings_iso: str, stage: str, zone, s: dict) -> dict | None:
-    """One cash-secured-put suggestion. Normal: 12-31 DTE, delta 0.10-0.15.
-    Panic (stage 1): weekly, strike at the 16-rule distance. Expiries that
-    contain an earnings date are excluded outright (short 不跨财报)."""
-    panic = stage.startswith("STAGE1")
-    lo, hi = s["csp_dte_panic"] if panic else s["csp_dte_normal"]
+def _csp_expiry(cc: ChainCache, earnings_iso: str | None, lo: int, hi: int,
+                target_dte: int):
+    """CSP 的到期选择 (常规 / 恐慌 / 区内远档共用): 窗口内剔除跨财报的到期
+    (short 不跨财报), 取最接近 target_dte 的 -> (exp, dte, notes) 或 {"skip_reason"}。"""
     window = [(e, d) for e, d in cc.expiries() if lo <= d <= hi]
     blocked = []
     if earnings_iso:
@@ -1839,9 +1884,51 @@ def csp_ticket(cc: ChainCache, spot: float, iv30: float | None,
         notes.append("财报日期获取失败 — 下单前自查该到期日是否跨财报")
     if blocked:
         notes.append(f"财报 {earnings_iso}: 已剔除跨财报到期日 {', '.join(blocked)}")
-
-    target_dte = 7 if panic else 21
     exp, dte = min(window, key=lambda x: abs(x[1] - target_dte))
+    return exp, dte, notes
+
+
+def csp_zone_far_ticket(cc: ChainCache, spot: float, earnings_iso: str | None,
+                        zone, s: dict) -> dict | None:
+    """区内远档 CSP: 价格在价值区上方较远时, 区内行权价 + 低 delta + 年化达标才出。
+
+    与常规档的区别只在选行权价: 只看行权价 <= 价值区上沿且 |delta| <=
+    csp_zone_far_max_delta 的 put, 过年化/权利金下限后取最高行权价 (离现价最近、
+    delta 最接近上限、权利金最厚)。到期选择、财报剔除、票据 notes 与常规档共用。
+    不达标返回 None —— 这是机会型的票, 不每天挂一条 ⏸ 占版面。"""
+    picked = _csp_expiry(cc, earnings_iso, *s["csp_dte_normal"], 21)
+    if isinstance(picked, dict):
+        return None
+    exp, dte, notes = picked
+    ok = [c for c in _put_candidates(cc, exp, dte, spot)
+          if c["strike"] <= zone[1] and c["delta"] <= s["csp_zone_far_max_delta"]
+          and csp_annualized(c["mid"], c["strike"], c["dte"]) >= s["csp_min_annualized"]
+          and c["mid"] >= s["csp_min_mid"]]
+    if not ok:
+        return None
+    liquid = [c for c in ok if c["oi"] >= s["csp_min_oi"]]
+    pick = max(liquid or ok, key=lambda c: c["strike"])
+    above = (spot / zone[1] - 1) * 100
+    notes.insert(0, (
+        f"区内远档: 现价高于价值区上沿 {zone[1]:g} 约 {above:.0f}%, 常规档不出票; 行权价 "
+        f"{pick['strike']:g} 在区内、delta {pick['delta']:.2f} <= "
+        f"{s['csp_zone_far_max_delta']:.2f}, 靠 IV 撑起年化 —— IV 回落时这类票会消失"))
+    ticket = _finish_csp(dict(pick), spot, s, zone, False, notes)
+    ticket["zone_far"] = True
+    return ticket
+
+
+def csp_ticket(cc: ChainCache, spot: float, iv30: float | None,
+               earnings_iso: str, stage: str, zone, s: dict) -> dict | None:
+    """One cash-secured-put suggestion. Normal: 12-31 DTE, delta 0.10-0.15.
+    Panic (stage 1): weekly, strike at the 16-rule distance. Expiries that
+    contain an earnings date are excluded outright (short 不跨财报)."""
+    panic = stage.startswith("STAGE1")
+    lo, hi = s["csp_dte_panic"] if panic else s["csp_dte_normal"]
+    picked = _csp_expiry(cc, earnings_iso, lo, hi, 7 if panic else 21)
+    if isinstance(picked, dict):
+        return picked
+    exp, dte, notes = picked
     cands = _put_candidates(cc, exp, dte, spot)
     if not cands:
         return {"skip_reason": f"{exp} put 链无可用报价 (市场关闭/流动性)"}
@@ -2020,9 +2107,11 @@ def leap_ticket(cc: ChainCache, spot: float, cfg: dict,
     if not rows:
         return {"skip_reason": f"{exp} 无可用 ITM call 报价"}
 
+    ext_gate = cfg["kind"] != "index" or s["leap_extrinsic_gate_index"]
+
     def passes(c):
         return (dlo <= c["delta"] <= dhi and c["oi"] >= s["leap_min_oi"]
-                and (c["extrinsic_pct"] is None
+                and (c["extrinsic_pct"] is None or not ext_gate
                      or c["extrinsic_pct"] <= s["leap_max_extrinsic_pct"])
                 and c["be_pct"] <= s["leap_max_be_pct"]
                 and (c["spread_pct"] is None
@@ -2050,7 +2139,14 @@ def leap_ticket(cc: ChainCache, spot: float, cfg: dict,
     if pick["spread_pct"] is not None and pick["spread_pct"] > s["leap_max_spread_pct"]:
         notes.append(f"价差 {pick['spread_pct']:.1f}% > {s['leap_max_spread_pct']}% — 挂 mid 磨或换行权价")
     if pick["extrinsic_pct"] is not None and pick["extrinsic_pct"] > s["leap_max_extrinsic_pct"]:
-        notes.append(f"外在价值 {pick['extrinsic_pct']:.0f}% > {s['leap_max_extrinsic_pct']}% — 深度不够")
+        if ext_gate:
+            notes.append(f"外在价值 {pick['extrinsic_pct']:.0f}% > {s['leap_max_extrinsic_pct']}% — 深度不够")
+        else:
+            notes.append(
+                f"⚠️ 外在价值 {pick['extrinsic_pct']:.0f}% (指数不设 "
+                f"{s['leap_max_extrinsic_pct']:g}% 门, 只提示) — 折成保险费率 "
+                f"~{pick['insurance_pct_yr']:.1f}%/年, 到盈亏平衡 {pick['be_pct']:+.1f}%; "
+                f"想更稳就取 delta 带上沿 ~{dhi:.2f}")
     if pick["src"] == "last":
         notes.append("盘口不可用, 按最近成交价估算 — 下单前实查")
     if pick["iv_src"] == "yahoo":
@@ -2163,14 +2259,89 @@ def leap_atm_iv(cc: ChainCache, exp: str, dte: int,
     return sum(v for v, _ in ivs) / len(ivs), src
 
 
+CBOE_CHAIN_URL = "https://cdn.cboe.com/api/global/delayed_quotes/options/{}.json"
+
+
+def fetch_cboe_chain(sym: str, timeout: float) -> dict:
+    """CBOE 免费延迟期权链 (15 分钟延迟; 盘后/周末给上一交易日收盘报价)。
+    非官方公开接口, 格式可能变 —— 调用方必须有 fallback。"""
+    req = urllib.request.Request(CBOE_CHAIN_URL.format(sym),
+                                 headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as f:
+        return json.load(f)["data"]
+
+
+def cboe_atm_iv(data: dict, sym: str, exp: str, spot: float,
+                as_of: str | None, s: dict) -> tuple[float | None, str]:
+    """CBOE 链 -> (平值 IV, "") 或 (None, 退回原因) (纯函数)。
+
+    每档行权价 call/put 的 CBOE IV 取均值; 现价两侧都有档位时按距离线性插值,
+    只有一侧时取最近一档 (须在现价 5% 以内)。任一校验不过就退回, 不硬凑:
+      - 报价日 != 日线日期 (不是同一时点, lesson.md 2026-09-25 "回放要用同一时点的报价")
+      - CBOE 现价与日线收盘差 > cboe_max_spot_gap
+      - 链上没有该到期的 IV; 两侧档位间隔 > 现价 25%; 只有一侧且最近一档离现价 > 5%"""
+    stamp = str(data.get("last_trade_time") or "")[:10]
+    if as_of and stamp != as_of:
+        return None, f"CBOE 报价日 {stamp or '?'} 与日线 {as_of} 不一致"
+    c_spot = data.get("current_price") or data.get("close")
+    if not c_spot or abs(c_spot / spot - 1) > s["cboe_max_spot_gap"]:
+        return None, f"CBOE 现价 {c_spot} 与日线收盘 {spot:.2f} 相差过大"
+    yymmdd = exp[2:4] + exp[5:7] + exp[8:10]
+    pat = re.compile(rf"{re.escape(sym)}{yymmdd}([CP])(\d{{8}})$")
+    by_k: dict[float, list[float]] = {}
+    for o in data.get("options") or []:
+        m = pat.match(str(o.get("option", "")))
+        iv = o.get("iv")
+        if m and iv and 0.01 < float(iv) < 3.0:
+            by_k.setdefault(int(m.group(2)) / 1000, []).append(float(iv))
+    if not by_k:
+        return None, f"CBOE 链上没有 {exp} 的 IV"
+    iv_at = {k: sum(v) / len(v) for k, v in by_k.items()}
+    below = [k for k in iv_at if k <= spot]
+    above = [k for k in iv_at if k >= spot]
+    if below and above:
+        # 现价两侧都有: 按距离线性插值。低价股 LEAP 行权价间隔大 (SOFI 16.58 两侧是
+        # 15 / 18), 只取最近一档会偏离 8% 以上; 两侧间隔过宽说明链不全, 不硬插
+        k1, k2 = max(below), min(above)
+        if k1 == k2:
+            return iv_at[k1], ""
+        if (k2 - k1) / spot > 0.25:
+            return None, f"CBOE {exp} 现价两侧的行权价 {k1:g} / {k2:g} 间隔过宽"
+        w = (spot - k1) / (k2 - k1)
+        return (1 - w) * iv_at[k1] + w * iv_at[k2], ""
+    k = min(iv_at, key=lambda x: abs(x - spot))
+    if abs(k / spot - 1) > 0.05:
+        return None, f"CBOE {exp} 离现价最近的行权价 {k:g} 偏离超过 5%"
+    return iv_at[k], ""
+
+
+def leap_atm_iv_sourced(cc, ticket: dict, spot: float, s: dict,
+                        as_of: str | None) -> tuple[float | None, str | None, str]:
+    """LEAP 平值 IV: 先 CBOE, 不行就退回 Yahoo -> (iv, 来源, CBOE 退回原因)。
+    来源: "cboe" / "mid" / "last" / "yahoo" (后三个见 leap_atm_iv)。"""
+    why = ""
+    sym = getattr(cc, "symbol", None)
+    if s["leap_iv_source"] == "cboe" and sym:
+        try:
+            iv, why = cboe_atm_iv(fetch_cboe_chain(sym, s["cboe_timeout_s"]), sym,
+                                  ticket["exp"], spot, as_of, s)
+            if iv:
+                return iv, "cboe", ""
+        except Exception as e:
+            why = f"CBOE 取数失败 ({type(e).__name__})"
+    atm, src = leap_atm_iv(cc, ticket["exp"], ticket["dte"], spot)
+    return atm, src, why
+
+
 def attach_leap_iv_band(ticket: dict, cc: ChainCache, spot: float, s: dict,
-                        index: bool = False) -> None:
+                        index: bool = False, as_of: str | None = None,
+                        kind: str = "stock") -> None:
     """给已出的 LEAP 真票挂上 iv_gauge 与一条档位 note (原地修改)。
 
     多一次 10 年日线请求, 只在真票发出时才付。取不到就明说, 不回落到
     30 天自建 IVP —— 那正是被这条规则取代的口径。"""
     try:
-        atm, atm_src = leap_atm_iv(cc, ticket["exp"], ticket["dte"], spot)
+        atm, atm_src, cboe_why = leap_atm_iv_sourced(cc, ticket, spot, s, as_of)
         hist = cc.tk.history(period=f"{s['leap_iv_hist_years']}y",
                              interval="1d", auto_adjust=True)
         g = leap_iv_band(atm, list(hist["Close"]), ticket["dte"], s, index=index)
@@ -2186,7 +2357,8 @@ def attach_leap_iv_band(ticket: dict, cc: ChainCache, spot: float, s: dict,
     # 两处口径标注 (lesson.md 2026-09-24): 指数用单独的升档线; 平值 IV 若有腿
     # 退回了 Yahoo 列要说出来 —— 以后重构时这两条是最容易被"统一"掉的
     head = (f"IV 档位 {g['band']}: 平值 IV {g['atm_iv'] * 100:.0f}%"
-            + {"mid": "", "last": " (含成交价)"}.get(atm_src, " (含 Yahoo 列)")
+            + {"cboe": " (CBOE)", "mid": " (Yahoo)", "last": " (Yahoo·含成交价)"
+               }.get(atm_src, " (Yahoo·含 Yahoo 列)")
             + f" = 自身{g['years']:.0f}年实际波动中位数 {g['med_rv'] * 100:.0f}% 的 "
             f"{g['ratio']:.2f} 倍 (近1年 {g['rv1y'] * 100:.0f}% / 近2年 "
             f"{g['rv2y'] * 100:.0f}%"
@@ -2194,8 +2366,11 @@ def attach_leap_iv_band(ticket: dict, cc: ChainCache, spot: float, s: dict,
             + (f" → IV 超过近 1-2 年实际波动的 {g['bump']:g} 倍, 升一档"
                if g["bumped"] else "")
             + f" — {IV_BAND_TEXT[g['band']]}"
-            + ("; 个股未经回测, 仓位减半" if g["band"] == "C" and not index else ""))
+            + (f"; {'ETF' if kind == 'etf' else '个股'}未经回测, 仓位减半"
+               if g["band"] == "C" and not index else ""))
     extra = []
+    if cboe_why:
+        extra.append(f"CBOE 不可用, 平值 IV 退回 Yahoo: {cboe_why}")
     if g["years"] < s["leap_iv_min_years"]:
         extra.append(f"历史只有 {g['years']:.1f} 年, 中位数只代表一个 regime, 比值仅供参考")
     if g["regime_up"] and g["band"] == "C":
@@ -2209,6 +2384,7 @@ def attach_leap_iv_band(ticket: dict, cc: ChainCache, spot: float, s: dict,
         extra.append(f"平值 IV 贴近 {s['leap_iv_abs_gate']:.0%} 绝对门 "
                      f"(±{s['leap_iv_edge_abs'] * 100:.0f} 点内), 读数噪声就能进出 D 档")
     g["note"] = head + ("; " + "; ".join(extra) if extra else "")
+    g["kind"] = kind
     ticket["iv_gauge"] = g
     ticket["notes"].insert(0, g["note"])
 
@@ -2234,7 +2410,9 @@ def leap_band_tag(leap) -> str:
     g = (leap or {}).get("iv_gauge") or {}
     if g.get("band") != "C":
         return ""
-    return " · IV C 档: 只做深度实值" + ("" if g.get("index") else ", 个股仓位减半")
+    if g.get("index"):
+        return " · IV C 档: 只做深度实值"
+    return f" · IV C 档: 只做深度实值, {'ETF' if g.get('kind') == 'etf' else '个股'}仓位减半"
 
 
 def stock_ladder(zone, s: dict) -> list[float]:
@@ -2244,9 +2422,21 @@ def stock_ladder(zone, s: dict) -> list[float]:
     return [hi, lo, round(lo * (1 - s["ladder_panic_discount"]), 2)]
 
 
-def call_spread_ticket(cc: ChainCache, spot: float, s: dict) -> dict:
+def call_spread_ticket(cc: ChainCache, spot: float, s: dict,
+                       earnings_iso: str | None = None) -> dict:
     """突破后首次回踩的 3-6 个月 call spread (剧本工具切换表):
-    买 ~0.60 delta / 卖 ~0.30 delta 同到期."""
+    买 ~0.60 delta / 卖 ~0.30 delta 同到期.
+
+    财报在 spread_earnings_buffer_days 内不出票 (skip_reason 带 earnings_buffer
+    标记, 调用方据此不消耗一次性回踩标记)。"""
+    if earnings_iso:
+        days = (date.fromisoformat(earnings_iso) - datetime.now(ET).date()).days
+        if 0 <= days <= s["spread_earnings_buffer_days"]:
+            return {"skip_reason": (
+                f"财报 {earnings_iso} 就在 {days} 天后 — 财报前 <="
+                f"{s['spread_earnings_buffer_days']} 天不开回踩 spread (净买 vega, "
+                "财报后 IV 回落吃亏); 财报后再回踩 20 日线不破会重新提示"),
+                "earnings_buffer": True}
     lo, hi = s["spread_dte"]
     exps = [(e, d) for e, d in cc.expiries() if lo <= d <= hi]
     if not exps:
@@ -2264,10 +2454,14 @@ def call_spread_ticket(cc: ChainCache, spot: float, s: dict) -> dict:
         if mid is None:
             continue
         strike = float(row["strike"])
-        iv = contract_iv(row, mid, spot, T, is_call=True)
+        # mid 优先 (2026-09-28, research/yahoo_iv_bias.py): ~135 天 call 上 Yahoo 列
+        # 比 mid 反解系统性高 +2.8 点 (222 张全部 > 1 点), 与 LEAP 同向; CSP 的
+        # 短期限 put 只差 -0.4 点、delta 几乎不变, 那边维持 contract_iv
+        iv, iv_src = mid_first_iv(row, mid, spot, T, is_call=True)
         if iv is None:
             continue
         rows.append({"strike": strike, "mid": mid, "src": src, "iv": iv,
+                     "iv_src": "last" if (iv_src == "mid" and src == "last") else iv_src,
                      "delta": bs_delta(spot, strike, T, RATE, iv, True),
                      "oi": _oi(row)})
     if len(rows) < 2:
@@ -2542,6 +2736,7 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
             return r
         try:
             r["iv30"] = atm_iv30(cc, tech["close"])
+            r["iv30_ycol"] = atm_iv30(cc, tech["close"], legacy=True)   # 影子列, 链已缓存
         except Exception as e:
             r["notes"].append(f"iv30 获取失败: {type(e).__name__}")
         # 25Δ RR 倒挂 = 每标的 froth 旗标 — 例外才报告 (正常 skew 沉默);
@@ -2639,6 +2834,10 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
             else:
                 r["csp"] = csp_ticket(cc, tech["close"], r["iv30"],
                                       r["earnings"], stage, zone, s)
+        elif (s["csp_zone_far"] and zone is not None and not in_or_near_zone
+              and stage == "NORMAL" and not (stale_msg or regime.get("halt_csp"))):
+            # 区内远档: 机会型, 不达标/被拦都静默 (见 csp_zone_far_ticket)
+            r["csp"] = csp_zone_far_ticket(cc, tech["close"], r["earnings"], zone, s)
         if want_leap:
             if stale_msg or regime.get("halt_new_longs"):
                 r["leap"] = blocked_ticket(stale_msg,
@@ -2659,7 +2858,8 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
                     # 算"已发" —— 票照出、由报告改写成 spread 提示, 和原来
                     # 自建 IVP>60 的处理一致, 不影响 pending/窗口的生命周期
                     attach_leap_iv_band(r["leap"], cc, tech["close"], s,
-                                        index=cfg["kind"] == "index")
+                                        index=cfg["kind"] == "index",
+                                        as_of=tech["as_of"], kind=cfg["kind"])
                 if emitted and stage == "STAGE2_WINDOW":
                     # 真票已发 — 现在才烧每窗口一次的 dedup key。ep_end
                     # 只在 STAGE2 分支里绑定, 由 stage 判断护住
@@ -2671,7 +2871,9 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
                 if not emitted and stage == "NORMAL":
                     r["leap_pending"] = True
         if r.get("retest"):  # STAGE1 已在回踩检测处拦掉
-            r["spread"] = call_spread_ticket(cc, tech["close"], s)
+            r["spread"] = call_spread_ticket(cc, tech["close"], s, r["earnings"])
+            if r["spread"].get("earnings_buffer"):
+                r["retest_deferred"] = True     # 财报缓冲: 不消耗一次性回踩标记
             if "skip_reason" not in r["spread"]:
                 # 剧本工具切换表: 止损放回踩低点下方
                 r["spread"]["retest_low"] = tech["low_today"]
@@ -2697,7 +2899,7 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
 def load_iv_history() -> pd.DataFrame:
     if IV_HISTORY.exists():
         return pd.read_csv(IV_HISTORY)
-    return pd.DataFrame(columns=["date", "symbol", "iv30", "rv30"])
+    return pd.DataFrame(columns=["date", "symbol", "iv30", "rv30", "iv_src", "iv30_ycol"])
 
 
 def append_iv_history(results: list[dict], scan_date: str) -> pd.DataFrame:
@@ -2713,7 +2915,10 @@ def append_iv_history(results: list[dict], scan_date: str) -> pd.DataFrame:
             rv = r["tech"]["rv30"] if r["tech"] else None
             rows.append({"date": scan_date, "symbol": r["symbol"],
                          "iv30": round(r["iv30"], 4),
-                         "rv30": round(rv, 4) if rv else None})
+                         "rv30": round(rv, 4) if rv else None,
+                         "iv_src": IV30_METHOD,
+                         "iv30_ycol": (round(r["iv30_ycol"], 4)
+                                       if r.get("iv30_ycol") else None)})
     if rows:
         df = pd.concat([df, pd.DataFrame(rows)], ignore_index=True)
         DATA.mkdir(exist_ok=True)
@@ -2722,7 +2927,9 @@ def append_iv_history(results: list[dict], scan_date: str) -> pd.DataFrame:
 
 
 def self_ivp(df: pd.DataFrame, symbol: str, iv30: float) -> float | None:
-    hist = df[(df["symbol"] == symbol) & df["iv30"].notna()]["iv30"]
+    """自建 30 天 IVP: 只拿与当前算法同版本 (IV30_METHOD) 的历史行排位, 满 60 条才出。"""
+    same = df["iv_src"] == IV30_METHOD if "iv_src" in df else pd.Series(False, index=df.index)
+    hist = df[(df["symbol"] == symbol) & df["iv30"].notna() & same]["iv30"]
     if len(hist) < 60:
         return None
     return float((hist < iv30).mean() * 100)
@@ -2766,7 +2973,7 @@ def action_label(r: dict) -> str:
     if any("等阶段2" in n for n in r["notes"]):
         return "等阶段2"
     if csp and "skip_reason" not in csp:
-        return "CSP票👇"
+        return "区内CSP👇" if csp.get("zone_far") else "CSP票👇"
     if csp and "skip_reason" in csp:
         return "CSP被拦"
     spread = r.get("spread")
@@ -2848,7 +3055,8 @@ def action_block(results: list[dict]) -> list[str]:
         elif leap:
             items.append((sym, f"- ⏸ **{sym}** LEAP: {leap['skip_reason']}"))
         if csp and "skip_reason" not in csp:
-            items.append((sym, f"- 🔵 **{sym}** CSP: {floor_tag}SELL {csp['exp']} "
+            items.append((sym, f"- 🔵 **{sym}** CSP{'[区内远档]' if csp.get('zone_far') else ''}: "
+                               f"{floor_tag}SELL {csp['exp']} "
                                f"{csp['strike']:g}P @ ~{csp['mid']:.2f} "
                                f"(delta {csp['delta']:.2f}, 年化 "
                                f"~{csp['annualized_pct']:.0f}%, 详见下)"))
@@ -3007,7 +3215,7 @@ def render_close(results, regime, ivdf, now_et) -> str:
     ordered = by_actionability(results)
     lines += ["## 概览 (按可操作性排序)", "",
               "| 标的 | 价值区 | 收盘 | 状态 | 操作 | Δ% | vs20日 "
-              "| 量比 | 三选二 | iv/rv | IVP |",
+              "| 量比 | 三选二 | iv/rv | IVP(30天) |",
               "|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in ordered:
         t = r["tech"]
@@ -3076,7 +3284,8 @@ def render_close(results, regime, ivdf, now_et) -> str:
             if "skip_reason" in csp:
                 lines.append(ticket_skip_line("CSP", csp))
             else:
-                tag = "恐慌档" if csp["panic_mode"] else "常规"
+                tag = ("区内远档" if csp.get("zone_far")
+                       else "恐慌档" if csp["panic_mode"] else "常规")
                 lines.append(
                     f"- **CSP ({tag})**: SELL {r['symbol']} {csp['exp']} "
                     f"{csp['strike']:g}P @ ~{csp['mid']:.2f} — delta {csp['delta']:.2f}, "

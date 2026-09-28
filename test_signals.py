@@ -3580,7 +3580,8 @@ class TestAttachLeapIvBand(unittest.TestCase):
         self.assertEqual(t["iv_gauge"]["atm_src"], "mid")
         self.assertTrue(t["notes"][0].startswith("IV 档位 A"))
         self.assertIn("实际波动中位数", t["notes"][0])
-        self.assertNotIn("Yahoo", t["notes"][0])
+        self.assertIn("平值 IV 30% (Yahoo)", t["notes"][0])   # 假链没有 symbol: 不走 CBOE
+        self.assertNotIn("CBOE 不可用", t["notes"][0])
         self.assertEqual(t["notes"][0], t["iv_gauge"]["note"])
         self.assertFalse(sc.leap_iv_over_gate(t))
 
@@ -3627,7 +3628,7 @@ class TestAttachLeapIvBand(unittest.TestCase):
         t = self._ticket()
         sc.attach_leap_iv_band(t, cc, 100.0, sc.SETTINGS_DEFAULTS)
         self.assertEqual(t["iv_gauge"]["atm_src"], "last")
-        self.assertIn("(含成交价)", t["notes"][0])
+        self.assertIn("(Yahoo·含成交价)", t["notes"][0])
 
     def test_failure_is_said_not_silently_fallen_back(self):
         t = self._ticket()
@@ -3749,6 +3750,9 @@ class TestActionBlockLeapIvBand(unittest.TestCase):
         index = "\n".join(sc.action_block([self._r("C", index=True)]))
         self.assertIn("IV C 档: 只做深度实值", index)
         self.assertNotIn("仓位减半", index)
+        etf = self._r("C")
+        etf["leap"]["iv_gauge"]["kind"] = "etf"          # GLD / DRAM: 不叫"个股"
+        self.assertIn("只做深度实值, ETF仓位减半", "\n".join(sc.action_block([etf])))
 
     def test_d_band_says_no_leap(self):
         text = "\n".join(sc.action_block([self._r("D")]))
@@ -3770,6 +3774,285 @@ class TestActionBlockLeapIvBand(unittest.TestCase):
         self.assertEqual(rows[0]["iv_src"], "mid")
         self.assertIn("IVC档", review.leap_flags(rows[0]))
         self.assertEqual(review.leap_flags({"iv_band": "B"}), "—")
+
+
+class TestReviewLeapByBand(unittest.TestCase):
+    """todo.md #3 的前向验证: 复盘按开仓 IV 档位分组 (2026-09-28)。"""
+
+    def _row(self, band, ret, days, itm=True, ratio=None):
+        return {"kind": "leap", "symbol": "X", "date": "2026-09-01", "strike": 80.0,
+                "mid": 15.0, "last_px": 100.0 if itm else 70.0, "itm_now": itm,
+                "underlying_ret": ret, "days_held": days, "iv_band": band,
+                "iv_ratio": ratio, "status": "open_unrealized", "source": "scan"}
+
+    def test_groups_in_band_order_with_legacy_last(self):
+        import review
+        rows = [self._row("C", 0.10, 200, ratio=1.4), self._row(None, 0.02, 400),
+                self._row("A", -0.05, 30, itm=False, ratio=0.9), self._row("C", 0.20, 10, ratio=1.3)]
+        out = review.leap_band_rows(rows)
+        self.assertEqual([x[0] for x in out], ["A", "C", "未记录"])
+        a, c, legacy = out
+        self.assertEqual(c[1:5], (2, 1, 2, 2))            # 笔数 / 满6个月 / ITM / 越过BE
+        self.assertAlmostEqual(c[5], 0.15)                 # 正股涨跌中位
+        self.assertAlmostEqual(c[6], 1.35)                 # 平均比值
+        self.assertEqual(a[3], 0)                          # A 档那张不在 ITM
+        self.assertIsNone(legacy[6])
+
+    def test_silent_until_any_band_recorded(self):
+        import review
+        self.assertEqual(review.leap_band_rows([self._row(None, 0.1, 100)]), [])
+
+    def test_both_renderers_show_the_breakdown(self):
+        import review
+        res = [self._row("B", 0.05, 190, ratio=1.1)]
+        t, m = review.summarize(res), review.summarize_md(res)
+        self.assertIn("按开仓 IV 档位", t)
+        self.assertIn("| B | 1 | 1 |", m)
+        self.assertIn("满 6 个月", m)
+
+
+class TestSpreadEarningsBuffer(unittest.TestCase):
+    """回踩 spread 的财报缓冲 (2026-09-28): 与 LEAP 同口径, 被拦的回踩不烧标记。"""
+
+    class _CC:
+        def expiries(self):
+            return [("2027-01-15", 113)]
+
+        def chain(self, exp):
+            raise AssertionError("财报缓冲内不该去取链")
+
+    def _days(self, n):
+        return (sc.datetime.now(sc.ET).date() + timedelta(days=n)).isoformat()
+
+    def test_inside_buffer_skips_with_marker(self):
+        t = sc.call_spread_ticket(self._CC(), 100.0, sc.SETTINGS_DEFAULTS, self._days(9))
+        self.assertTrue(t["earnings_buffer"])
+        self.assertIn("财报前 <=14 天不开回踩 spread", t["skip_reason"])
+
+    def test_outside_buffer_goes_on_to_the_chain(self):
+        with self.assertRaises(AssertionError):     # 走到了取链 = 没被财报拦
+            sc.call_spread_ticket(self._CC(), 100.0, sc.SETTINGS_DEFAULTS, self._days(42))
+
+    def test_deferred_retest_does_not_burn_one_shot_flag(self):
+        prev = {"state": "TREND", "since": "2026-09-21"}
+        r = {"state": "TREND", "retest": True, "retest_deferred": True}
+        self.assertNotIn("retested", sc.next_persisted_state(prev, r, "2026-09-28"))
+        r = {"state": "TREND", "retest": True}
+        self.assertTrue(sc.next_persisted_state(prev, r, "2026-09-28")["retested"])
+
+
+class TestCSPZoneFar(unittest.TestCase):
+    """区内远档 CSP (2026-09-28): 价格在价值区上方较远时, 区内行权价 + delta <= 0.10
+    + 年化达标才出票, 并标记。合成链同 TestCSPTicketZoneCap (spot 100, 21 DTE)。"""
+
+    ZONE = [70.0, 86.0]          # 现价 100 在上沿上方 16%
+
+    def _cc(self, sigma):
+        return TestCSPTicketZoneCap()._cc(sigma=sigma)
+
+    def test_picks_highest_in_zone_strike_under_delta_cap(self):
+        # sigma 0.75: 86 档 delta ~0.17 超上限; 满足 <=0.10 的最高档是 80.5 (年化 ~19%)
+        t = sc.csp_zone_far_ticket(self._cc(0.75), 100.0, "2026-11-20", self.ZONE,
+                                   sc.SETTINGS_DEFAULTS)
+        self.assertTrue(t["zone_far"])
+        self.assertEqual(t["strike"], 80.5)
+        self.assertLessEqual(t["delta"], 0.10)
+        self.assertGreaterEqual(t["annualized_pct"], 10.0)
+        self.assertTrue(t["notes"][0].startswith("区内远档"))
+
+    def test_low_iv_stays_silent(self):
+        self.assertIsNone(sc.csp_zone_far_ticket(self._cc(0.20), 100.0, "2026-11-20",
+                                                 self.ZONE, sc.SETTINGS_DEFAULTS))
+
+    def test_expiry_across_earnings_stays_silent(self):
+        # 唯一到期 2026-10-02 跨财报 → 常规档是 ⏸ skip, 区内远档静默 None
+        self.assertIsNone(sc.csp_zone_far_ticket(self._cc(0.75), 100.0, "2026-09-30",
+                                                 self.ZONE, sc.SETTINGS_DEFAULTS))
+
+    def test_regular_csp_unchanged_by_refactor(self):
+        t = sc.csp_ticket(TestCSPTicketZoneCap()._cc(), 100.0, None, "2026-11-20",
+                          "NORMAL", [70.0, 87.0], sc.SETTINGS_DEFAULTS)
+        self.assertLessEqual(t["strike"], 87.0)
+        self.assertFalse(t.get("zone_far"))
+
+    def test_marker_in_label_action_line_and_journal(self):
+        csp = {"exp": "2026-10-16", "strike": 250.0, "mid": 1.2, "delta": 0.09,
+               "annualized_pct": 20.0, "zone_far": True}
+        r = {"symbol": "COHR", "error": None, "tech": {"close": 291.4}, "notes": [],
+             "state": "TREND", "leap": None, "csp": csp, "iv30": 0.7,
+             "cfg": {"value_zone": [220.0, 260.0], "options": True}}
+        self.assertEqual(sc.action_label(r), "区内CSP👇")
+        self.assertIn("CSP[区内远档]: SELL 2026-10-16 250P", "\n".join(sc.action_block([r])))
+        row = sc.journal_rows([r], "2026-09-28", "close", {})[0]
+        self.assertTrue(row["zone_far"])
+
+
+class TestCboeAtmIv(unittest.TestCase):
+    """LEAP 平值 IV 先取 CBOE, 不可用时退回 Yahoo 并写明原因 (2026-09-28)。"""
+
+    S = sc.SETTINGS_DEFAULTS
+
+    def _data(self, stamp="2026-09-25T16:00:00", spot=100.0, ivs=None):
+        ivs = ivs or {("C", 100): 0.30, ("P", 100): 0.34, ("C", 90): 0.33}
+        return {"last_trade_time": stamp, "current_price": spot, "options": [
+            {"option": f"XYZ280121{r}{int(k * 1000):08d}", "iv": v} for (r, k), v in ivs.items()]}
+
+    def test_atm_average_of_nearest_strike(self):
+        iv, why = sc.cboe_atm_iv(self._data(), "XYZ", "2028-01-21", 100.4, "2026-09-25", self.S)
+        self.assertAlmostEqual(iv, 0.32)
+        self.assertEqual(why, "")
+
+    def test_interpolates_between_bracketing_strikes(self):
+        """SOFI 型: 低价股 LEAP 行权价间隔大, 现价 16.58 两侧是 15 / 18。"""
+        data = self._data(spot=16.58, ivs={("C", 15): 0.60, ("P", 15): 0.62,
+                                           ("C", 18): 0.54, ("P", 18): 0.56})
+        iv, why = sc.cboe_atm_iv(data, "XYZ", "2028-01-21", 16.58, "2026-09-25", self.S)
+        w = (16.58 - 15) / 3
+        self.assertAlmostEqual(iv, (1 - w) * 0.61 + w * 0.55)
+        self.assertEqual(why, "")
+        wide = self._data(spot=16.58, ivs={("C", 10): 0.6, ("C", 25): 0.5})
+        self.assertIn("间隔过宽", sc.cboe_atm_iv(wide, "XYZ", "2028-01-21", 16.58,
+                                               "2026-09-25", self.S)[1])
+
+    def test_rejects_other_day_spot_gap_missing_expiry_and_far_strike(self):
+        cases = [
+            (self._data(stamp="2026-09-24T16:00:00"), "2028-01-21", 100.0, "报价日"),
+            (self._data(spot=104.0), "2028-01-21", 100.0, "相差过大"),
+            (self._data(), "2029-01-19", 100.0, "没有 2029-01-19"),
+            (self._data(ivs={("C", 80): 0.3}), "2028-01-21", 100.0, "偏离超过 5%"),
+        ]
+        for data, exp, spot, reason in cases:
+            iv, why = sc.cboe_atm_iv(data, "XYZ", exp, spot, "2026-09-25", self.S)
+            self.assertIsNone(iv, reason)
+            self.assertIn(reason, why)
+
+    def _cc_with_symbol(self):
+        cc = TestAttachLeapIvBand()._cc(iv=0.30)
+        cc.symbol = "XYZ"
+        return cc
+
+    def _ticket(self):
+        return {"exp": "2028-01-21", "dte": 486, "notes": []}
+
+    def test_attach_uses_cboe_when_it_passes(self):
+        orig = sc.fetch_cboe_chain
+        sc.fetch_cboe_chain = lambda sym, timeout: self._data()
+        try:
+            t = self._ticket()
+            sc.attach_leap_iv_band(t, self._cc_with_symbol(), 100.0, self.S, as_of="2026-09-25")
+        finally:
+            sc.fetch_cboe_chain = orig
+        self.assertEqual(t["iv_gauge"]["atm_src"], "cboe")
+        self.assertIn("(CBOE)", t["notes"][0])
+
+    def test_attach_falls_back_to_yahoo_and_says_why(self):
+        def boom(sym, timeout):
+            raise TimeoutError("slow")
+        orig = sc.fetch_cboe_chain
+        sc.fetch_cboe_chain = boom
+        try:
+            t = self._ticket()
+            sc.attach_leap_iv_band(t, self._cc_with_symbol(), 100.0, self.S, as_of="2026-09-25")
+        finally:
+            sc.fetch_cboe_chain = orig
+        self.assertEqual(t["iv_gauge"]["atm_src"], "mid")
+        self.assertIn("(Yahoo)", t["notes"][0])
+        self.assertIn("CBOE 不可用, 平值 IV 退回 Yahoo: CBOE 取数失败 (TimeoutError)", t["notes"][0])
+
+    def test_yahoo_only_setting_skips_cboe(self):
+        def never(sym, timeout):
+            raise AssertionError("leap_iv_source=yahoo 不该取 CBOE")
+        orig = sc.fetch_cboe_chain
+        sc.fetch_cboe_chain = never
+        try:
+            t = self._ticket()
+            sc.attach_leap_iv_band(t, self._cc_with_symbol(), 100.0,
+                                   {**self.S, "leap_iv_source": "yahoo"}, as_of="2026-09-25")
+        finally:
+            sc.fetch_cboe_chain = orig
+        self.assertNotIn("CBOE", t["notes"][0])
+
+
+class TestIndexExtrinsicWarning(unittest.TestCase):
+    """指数不拿外在价值做过滤, 只提示 (2026-09-28, todo.md #4)。
+    合成链同 TestLeapExpiryMaturity (spot 100, 486 DTE); sigma 0.20 时带内
+    0.75δ 附近的档外在 ~51%, 旧规则会让指数落进"无合约同时满足"。"""
+
+    def _t(self, kind, s=sc.SETTINGS_DEFAULTS):
+        cc = TestLeapExpiryMaturity()._cc(sigma=0.20)
+        return sc.leap_ticket(cc, 100.0, {"kind": kind, "high_beta": False}, None, s)
+
+    def test_index_is_warned_not_filtered(self):
+        t = self._t("index")
+        self.assertGreater(t["extrinsic_pct"], 40.0)
+        self.assertTrue(0.70 <= t["delta"] <= 0.80)
+        self.assertFalse(any("无合约同时满足" in n for n in t["notes"]))
+        warn = [n for n in t["notes"] if n.startswith("⚠️ 外在价值")]
+        self.assertEqual(len(warn), 1)
+        self.assertIn(f"{t['extrinsic_pct']:.0f}%", warn[0])
+        self.assertIn("保险费率", warn[0])
+        self.assertIn("到盈亏平衡", warn[0])
+
+    def test_stocks_keep_the_40pct_gate(self):
+        t = self._t("stock")
+        self.assertLessEqual(t["extrinsic_pct"], 40.0)
+        self.assertFalse(any(n.startswith("⚠️ 外在价值") for n in t["notes"]))
+
+    def test_review_does_not_flag_index_extrinsic(self):
+        import review
+        row = {"oi": 3000, "extrinsic_pct": 55.0, "be_pct_at_rec": 0.09}
+        self.assertIn("外在55%", review.leap_flags(row))                  # 旧行 / 个股
+        self.assertEqual(review.leap_flags({**row, "ticker_kind": "index"}), "—")
+
+    def test_gate_can_be_turned_back_on_for_index(self):
+        t = self._t("index", {**sc.SETTINGS_DEFAULTS, "leap_extrinsic_gate_index": True})
+        self.assertTrue(any("深度不够" in n for n in t["notes"]))
+
+
+class TestIv30Method(unittest.TestCase):
+    """30 天平值 IV 换成 mid 优先 + iv_history 打版本号 (2026-09-28)。"""
+
+    def _row(self, strike, px, yahoo_iv, days=1):
+        traded = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days)
+        return {"strike": strike, "bid": px - 0.05, "ask": px + 0.05, "lastPrice": px,
+                "lastTradeDate": traded, "openInterest": 500, "impliedVolatility": yahoo_iv}
+
+    def test_atm_iv30_inverts_mid_not_yahoo_column(self):
+        T = 30 / 365.0
+        c = sc.bs_price(100.0, 100.0, T, sc.RATE, 0.30, True)
+        p = sc.bs_price(100.0, 100.0, T, sc.RATE, 0.30, False)
+        chain = _FakeChain(pd.DataFrame([self._row(100.0, c, 0.45)]),
+                           pd.DataFrame([self._row(100.0, p, 0.25)]))
+        cc = _FakeCC(chain, expiries=[("2026-10-28", 30)])
+        self.assertAlmostEqual(sc.atm_iv30(cc, 100.0), 0.30, places=3)
+        # 影子列: 旧算法用 Yahoo 列 (0.45 / 0.25 的均值)
+        self.assertAlmostEqual(sc.atm_iv30(cc, 100.0, legacy=True), 0.35, places=3)
+
+    def test_self_ivp_ignores_other_method_rows(self):
+        old = [{"date": f"d{i}", "symbol": "X", "iv30": 0.10 + i / 1000, "rv30": 0.2}
+               for i in range(80)]                                   # 旧口径, 无 iv_src
+        df = pd.DataFrame(old)
+        self.assertIsNone(sc.self_ivp(df, "X", 0.2))                 # 旧行不参与
+        new = [{"date": f"n{i}", "symbol": "X", "iv30": 0.20 + i / 1000, "rv30": 0.2,
+                "iv_src": sc.IV30_METHOD} for i in range(60)]
+        df = pd.concat([df, pd.DataFrame(new)], ignore_index=True)
+        self.assertAlmostEqual(sc.self_ivp(df, "X", 0.23), 50.0)     # 只在新 60 行里排位
+
+    def test_append_tags_rows_with_method_and_keeps_old_rows(self):
+        with tempfile.TemporaryDirectory() as d:
+            orig_data, orig_hist = sc.DATA, sc.IV_HISTORY
+            sc.DATA, sc.IV_HISTORY = Path(d), Path(d) / "iv_history.csv"
+            try:
+                pd.DataFrame([{"date": "2026-09-25", "symbol": "X", "iv30": 0.3, "rv30": 0.2}]
+                             ).to_csv(sc.IV_HISTORY, index=False)
+                r = {"symbol": "X", "iv30": 0.31, "iv30_ycol": 0.33, "tech": {"rv30": 0.21}}
+                df = sc.append_iv_history([r], "2026-09-28")
+            finally:
+                sc.DATA, sc.IV_HISTORY = orig_data, orig_hist
+        self.assertEqual(len(df), 2)
+        self.assertTrue(pd.isna(df.iloc[0]["iv_src"]))               # 旧行原样保留
+        self.assertEqual(df.iloc[1]["iv_src"], sc.IV30_METHOD)
+        self.assertAlmostEqual(df.iloc[1]["iv30_ycol"], 0.33)             # 影子列只记录
 
 
 if __name__ == "__main__":
