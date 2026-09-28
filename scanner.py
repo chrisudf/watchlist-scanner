@@ -1410,9 +1410,16 @@ def _oi(row) -> int:
 
 
 def contract_iv(row, mid, spot, T, is_call):
-    """Yahoo's impliedVolatility column when sane, else invert from mid."""
+    """Yahoo's impliedVolatility column when the row has a live quote, else invert from mid.
+
+    没有实时盘口 (bid/ask 为 0) 时 Yahoo 的 IV 列是占位值, 不止 1e-05, 还有
+    0.125 / 0.0625 这类 2 的负幂, 能穿过 0.01 的下限 (2026-09-28 实测 HOOD
+    10/16 105P: 列 12.5%, 按成交价 1.57 反解 64%, delta 0.00 vs 0.16 —— 区内远档
+    的 delta <= 0.10 只设上限, 这张票就这样混了过去, lesson.md 同日)。
+    Yahoo 的列是按它自己的盘口算的, 没盘口就不认。"""
     iv = row.get("impliedVolatility")
-    if iv is not None and not pd.isna(iv) and 0.01 < float(iv) < 5.0:
+    bid, ask = float(row.get("bid") or 0), float(row.get("ask") or 0)
+    if 0 < bid <= ask and iv is not None and not pd.isna(iv) and 0.01 < float(iv) < 5.0:
         return float(iv)
     if mid is not None:
         return implied_vol(mid, spot, float(row["strike"]), T, RATE, is_call)
