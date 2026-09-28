@@ -222,7 +222,12 @@ SETTINGS_DEFAULTS = {
     "leap_iv_min_years": 5.0,        # 历史短于此, 中位数只代表一个 regime (带提示)
     # regime
     "stage2_window_bars": 10,    # trading days after inversion resolves
-    "episode_min_days": 3, "episode_min_peak": 1.10,
+    # 解除窗口只按持续天数筛 (2026-09-28, 与 TV 指标 VIX_VIX3M 同定义): 2009 年以来
+    # 持续 >=3 日的 29 次, 解除当日买 SPX 21日 +2.97%/79%, 63日 +6.32%/86%, 2009-17
+    # 与 2018-26 两段都成立; 再加峰值 >=1.10 只剩 11 次且两段结论相反 (+0.17%/50%
+    # vs +3.37%/86%)。倒挂定义是 >1.0, 所以 episode_min_peak=1.0 即不设峰值条件。
+    "episode_min_days": 3, "episode_min_peak": 1.0,
+    "episode_milestones": [5, 10, 15],   # 持续倒挂满这些天数时市场状态段给提示
     # 倒挂门控矩阵 (2026-09-02 研究: VIX 系族横评 + 回测证据实查)
     "vx_full_backwardation_halt": True,  # VX 全曲线倒挂 = 停开新票 (21/22 crash filter)
     "vx_curve_contracts": 5,             # 曲线形态看前 N 个月度合约
@@ -696,10 +701,13 @@ def expected_report_modes(day: str) -> tuple[list[str], str]:
 # --------------------------------------------------------------------------
 
 def inversion_episodes(ratio: pd.Series) -> list[dict]:
-    """Contiguous runs of ratio >= 1.0 -> [{start, end, days, peak, ongoing}]."""
+    """Contiguous runs of ratio > 1.0 -> [{start, end, days, peak, ongoing}].
+
+    恰好 1.0 不算倒挂, 与 CBOE / thetrading.tools / TV 指标同口径 (2009 年以来
+    只有 2015-09-17 一天正好等于 1.0)。"""
     episodes, cur = [], None
     for ts, val in ratio.items():
-        if val >= 1.0:
+        if val > 1.0:
             if cur is None:
                 cur = {"start": ts, "end": ts, "days": 0, "peak": float(val)}
             cur["days"] += 1
@@ -713,27 +721,45 @@ def inversion_episodes(ratio: pd.Series) -> list[dict]:
     return episodes
 
 
+def qualifying_episode(episodes: list[dict], s: dict) -> dict | None:
+    """最近一轮已结束、够格开解除窗口的倒挂 (持续 >= episode_min_days)。"""
+    qual = [e for e in episodes if not e["ongoing"]
+            and e["days"] >= s["episode_min_days"]
+            and e["peak"] >= s["episode_min_peak"]]
+    return qual[-1] if qual else None
+
+
+def relief_window_day(ratio: pd.Series, episodes: list[dict],
+                      s: dict) -> int | None:
+    """解除窗口第几日 (1 = 第一个 <=1.0 的收盘); 不在窗口里返回 None。
+
+    从合格那轮的最后一个倒挂日起算 stage2_window_bars 个交易日: 期间再
+    短暂倒挂时是 STAGE1 (窗口让位), 结束后仍在这 N 日内就恢复。"""
+    if float(ratio.iloc[-1]) > 1.0:
+        return None
+    ep = qualifying_episode(episodes, s)
+    if ep is None:
+        return None
+    day = len(ratio) - 1 - ratio.index.get_loc(ep["end"])
+    return day if day <= s["stage2_window_bars"] else None
+
+
 def classify_regime(ratio: pd.Series, s: dict) -> tuple[str, list[dict]]:
     """-> (stage, episodes). Stages:
-    STAGE1_DEEP  ratio >= 1.10 (历史级恐慌区: CSP 第二/三档)
-    STAGE1       ratio >= 1.0  (倒挂: 只做卖方, 右侧停)
-    STAGE2_WINDOW inversion (>=3d, peak >=1.10) resolved within N bars
+    STAGE1_DEEP  ratio > 1.10 (显著压力: CSP 第二/三档)
+    STAGE1       ratio > 1.0  (倒挂: 只做卖方, 右侧停)
+    STAGE2_WINDOW inversion lasting >= 3d resolved within N bars
                  (解除窗口: LEAP/risk-reversal 允许)
     NORMAL       everything else
     """
     episodes = inversion_episodes(ratio)
     r = float(ratio.iloc[-1])
-    if r >= 1.10:
+    if r > 1.10:
         return "STAGE1_DEEP", episodes
-    if r >= 1.0:
+    if r > 1.0:
         return "STAGE1", episodes
-    qual = [e for e in episodes if not e["ongoing"]
-            and e["days"] >= s["episode_min_days"]
-            and e["peak"] >= s["episode_min_peak"]]
-    if qual:
-        bars_since = len(ratio) - 1 - ratio.index.get_loc(qual[-1]["end"])
-        if bars_since <= s["stage2_window_bars"]:
-            return "STAGE2_WINDOW", episodes
+    if relief_window_day(ratio, episodes, s) is not None:
+        return "STAGE2_WINDOW", episodes
     return "NORMAL", episodes
 
 
@@ -1035,9 +1061,14 @@ def fetch_regime(s: dict) -> dict:
         "gate_lines": {"vvix_halt": s["vvix_halt"],
                        "move_divergence": s["move_divergence"]},
         "ratio": cur, "ratio_prev": prev,
-        "crossed_up": prev < 1.0 <= cur, "crossed_down": prev >= 1.0 > cur,
+        "crossed_up": prev <= 1.0 < cur, "crossed_down": prev > 1.0 >= cur,
         "stage": stage,
         "last_episode": episodes[-1] if episodes else None,
+        "window_day": relief_window_day(ratio, episodes, s),
+        "window_bars": s["stage2_window_bars"],
+        "qual_episode": qualifying_episode(episodes, s),
+        "episode_min_days": s["episode_min_days"],
+        "episode_milestones": s["episode_milestones"],
         "as_of": as_of,
         "source": source, "stale_days": age_days, "intraday": intraday,
         "intraday_date": intraday_date,
@@ -1048,13 +1079,30 @@ def fetch_regime(s: dict) -> dict:
     }
 
 
+# 解除窗口的依据 (2009-09 起 CBOE 日收盘, 解除当日收盘买 SPX, 只用当天已知的信息)。
+# 旧文案的 "5日 +3.04%/88%, 21日 +4.38%/91%" (options.cafe 43 次事件) 以"最后一个
+# 倒挂日"为买点, 当天无法知道 —— 未来数据, 见 lesson.md 2026-09-28。
+RELIEF_EVIDENCE = ("2009 年以来持续 ≥3 日的倒挂 29 次, 解除当日买 SPX 21日 +2.97%/79%, "
+                   "63日 +6.32%/86% (基线 +1.07%/68%, +3.17%/75%)")
+RELIEF_RISK = ("21 日内回撤 ≥5% 的概率 17%, 与平时相当 — 优势在方向和权利金, 不是更安全; "
+               "约一半在 10 日内再倒挂")
+
+# 持续倒挂里程碑 (2009-09 起 105 次倒挂, 与 TV 指标 VIX_VIX3M 同口径)
+EPISODE_MILESTONE_NOTES = {
+    5: "不是单日噪音, 状态已转换 (105 次里 52 次只有 1 天, 走到 5 日的 15 次)",
+    10: ("约两周: 只有 5 次走到这里 (2011-07 / 2011-09 / 2018-12 / 2020-02 / "
+         "2025-04), 其中 3 次持续到 15 日 — 准备修正预案"),
+    15: ("约三周: 按标普至少 5-10% 修正管理仓位, 抄底轻仓等止跌 "
+         "(只有 2011-07 / 2020-02 / 2025-04 走到这里)"),
+}
+
 REGIME_NOTES = {
     "NORMAL": "正常结构 — 左侧看个股价值区, 右侧按确认信号走",
     "STAGE1": "倒挂 (阶段1) — 剧本: 只做卖方 (CSP 第一档), 不加右侧仓",
-    "STAGE1_DEEP": "倒挂 >1.1 (历史级恐慌区) — 剧本: CSP 加第二/三档, 周权+16法则, 右侧仍停",
+    "STAGE1_DEEP": "倒挂 >1.1 (显著压力) — 剧本: CSP 加第二/三档, 周权+16法则, 右侧仍停",
     "STAGE2_WINDOW": ("倒挂解除窗口 (阶段2) — 剧本: buy the relief — 价格确认后 "
-                      "LEAP/risk reversal; CSP 常规档解锁 (解除窗 = 统计最强"
-                      "卖权入场窗: 解除日起 SPX 5日 +3.04%/88%, 21日 +4.38%/91%)"),
+                      "LEAP/risk reversal; CSP 常规档解锁 (解除当日起 SPX 21日 "
+                      "+2.97%/79% vs 基线 +1.07%/68%; 回撤风险与平时相当)"),
 }
 
 
@@ -1828,7 +1876,7 @@ def stage2_leap_gate(price_ok: bool, prev_leap_window, ep_end: str) -> bool:
     - 票据级临时 skip (财报缓冲/无可用到期/无报价): 之前在门口就烧 key,
       leap_ticket 一句\"财报 5 天后\"就让整个 10 天解除窗的补发静默丢失
       — NORMAL 路径的 leap_pending 补偿明确 gate 在 stage==NORMAL, 从
-      不护这里, 而阶段2恰是全剧本统计最强的入场窗 (五轮评审)。
+      不护这里, 而阶段2是剧本里方向占优的入场窗 (五轮评审)。
     代价是永久性 skip (标的没有 LEAP) 在窗口内每天重复一条 ⏸ 行 —
     与 NORMAL 路径对非 emitted 票的现状一致, 可见的重复好过静默丢失。"""
     return price_ok and prev_leap_window != ep_end
@@ -1862,12 +1910,12 @@ def retest_gate(state: str, touched_20dma: bool, prev_retested: bool,
 def csp_window_open(zone, in_or_near_zone: bool, stage: str) -> bool:
     """CSP 出票窗口: 有接货价, 且 (价格在/近区 或 恐慌档 或 阶段2解除窗口)。
 
-    阶段2 加入依据 (2026-09-02 研究, options.cafe 2009 年以来 43 次倒挂
-    事件): 解除日买入 SPX 前瞻 5日 +3.04%/胜率88%, 21日 +4.38%/91%,
-    63日 +6.93%/88%, 每个周期都碾压基线 (+0.26%/60%, +1.07%/68%,
-    +3.10%/75%) — 解除窗口是全数据里胜率最高的卖权入场窗, 且 IV 尚未
-    塌完时权利金最肥。倒挂开始日反而无短期边际 (5日 -0.15%/51%,
-    74% 的 episode 期间继续跌) — 所以加成给解除, 不给开始。"""
+    阶段2 加入依据 (2026-09-28 用 CBOE 日收盘重算, 只用当天已知的信息):
+    持续 >=3 日的倒挂 2009 年以来 29 次, 解除当日买 SPX 21日 +2.97%/79%,
+    63日 +6.32%/86%, 好于基线 (+1.07%/68%, +3.17%/75%), 且 IV 尚未塌完时
+    权利金厚。但 21 日内回撤 >=5% 的概率 17%, 与平时 (16%) 相当 — 解除窗
+    的优势在方向和权利金, 不是更安全。(此前引用的 options.cafe "5日
+    +3.04%/88%" 以最后一个倒挂日为买点, 属未来数据, 见 lesson.md。)"""
     return zone is not None and (
         in_or_near_zone or stage.startswith("STAGE1")
         or stage == "STAGE2_WINDOW")
@@ -2791,13 +2839,12 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
         if stage == "STAGE2_WINDOW":
             if want_csp and not in_or_near_zone:
                 r["notes"].append(
-                    "阶段2解除窗口 = 统计最强卖权入场窗 (解除日起 SPX 5日 "
-                    "+3.04%/88%, 21日 +4.38%/91% — options.cafe 2009-2025 "
-                    "43 次事件): 价格虽在接货带上方仍试出 CSP 常规档, "
+                    "阶段2解除窗口 (方向占优、权利金厚, 回撤风险与平时相当): "
+                    "价格虽在接货带上方仍试出 CSP 常规档, "
                     "行权价仍卡接货带上沿, 年化不过线自然拦")
             elif zone is None and not r.get("zone_invalid"):
                 r["notes"].append(
-                    "阶段2解除窗口 (统计最强卖权窗: 解除日起 5日 +3.04%/88%) "
+                    "阶段2解除窗口 (方向占优、权利金厚) "
                     "但未设价值区 — 设好 value_zone 才出 CSP 票")
 
         fresh_confirm = state == "CONFIRMED" and prev not in ("CONFIRMED", "TREND")
@@ -3181,18 +3228,37 @@ def regime_block(regime: dict) -> list[str]:
                      "阶段判定不可信, 手动核对 CBOE/moomoo")
     if regime["crossed_up"]:
         lines.append("- ⚠️ **ratio 上穿 1.0** — 新一轮倒挂开始: CSP 第一档启动, 右侧停")
+    min_days = regime.get("episode_min_days", SETTINGS_DEFAULTS["episode_min_days"])
     if regime["crossed_down"]:
-        lines.append(
-            "- ⚠️ **ratio 下穿 1.0** — 倒挂解除: 历史上是统计最强入场窗 "
-            "(2009 年以来解除日买 SPX: 5日 +3.04%/88%, 21日 +4.38%/91% vs "
-            "基线 +0.26%/60%); 达标 episode (≥3日, 峰值≥1.10) 进阶段2 → "
-            "CSP 常规档 + LEAP 窗口, 浅倒挂解除无加成")
+        if regime["stage"] == "STAGE2_WINDOW":
+            lines.append(
+                f"- ⚠️ **ratio 下穿 1.0** — 倒挂解除, 进入阶段2解除窗口: CSP 常规档 + "
+                f"价格确认后 LEAP。{RELIEF_EVIDENCE}; {RELIEF_RISK}")
+        else:
+            lines.append(
+                f"- ⚠️ **ratio 下穿 1.0** — 短倒挂 (< {min_days} 日) 解除, 不开阶段2"
+                "窗口; 右侧照常按确认信号走")
     ep = regime["last_episode"]
-    if ep and (ep["ongoing"] or regime["stage"] == "STAGE2_WINDOW"):
+    if ep and ep["ongoing"]:
         lines.append(
             f"- 最近倒挂: {ep['start'].date()} → {ep['end'].date()}"
-            f" ({ep['days']} 日, 峰值 {ep['peak']:.3f}"
-            f"{', 进行中' if ep['ongoing'] else ''})")
+            f" ({ep['days']} 日, 峰值 {ep['peak']:.3f}, 进行中)")
+        milestones = regime.get("episode_milestones",
+                                SETTINGS_DEFAULTS["episode_milestones"])
+        reached = [m for m in milestones if ep["days"] >= m]
+        if reached:
+            m = max(reached)
+            when = f"今日满 {m} 日" if ep["days"] == m else f"已过 {m} 日线"
+            note = EPISODE_MILESTONE_NOTES.get(m, "持续倒挂")
+            lines.append(f"- ⚠️ **持续倒挂第 {ep['days']} 日** ({when}) — {note}")
+    window_day = regime.get("window_day")
+    if regime["stage"] == "STAGE2_WINDOW" and window_day:
+        qe = regime.get("qual_episode")
+        src = (f" — 来自 {qe['start'].date()} → {qe['end'].date()} 那轮 "
+               f"({qe['days']} 日, 峰值 {qe['peak']:.3f})" if qe else "")
+        lines.append(f"- 解除窗口: 第 **{window_day} / "
+                     f"{regime.get('window_bars', SETTINGS_DEFAULTS['stage2_window_bars'])}**"
+                     f" 日{src}")
     lines.append("")
     return lines
 

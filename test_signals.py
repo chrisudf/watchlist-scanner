@@ -267,10 +267,100 @@ class TestRegime(unittest.TestCase):
         stage, _ = sc.classify_regime(
             self._ratio([0.9] * 20 + [1.05, 1.12, 1.08, 1.11] + [0.95] * 15), s)
         self.assertEqual(stage, "NORMAL")
-        # shallow inversion (peak < 1.10) never opens a stage-2 window
+        # 2026-09-28: 窗口只看持续天数 — 浅倒挂 (峰值 <1.10) 持续 >=3 日也开窗
         stage, _ = sc.classify_regime(
             self._ratio([0.9] * 30 + [1.02, 1.03, 1.04, 1.05] + [0.95] * 5), s)
+        self.assertEqual(stage, "STAGE2_WINDOW")
+        # 只有 2 日的尖峰, 峰值再高也不开窗
+        stage, _ = sc.classify_regime(
+            self._ratio([0.9] * 30 + [1.20, 1.25] + [0.95] * 5), s)
         self.assertEqual(stage, "NORMAL")
+
+    def test_exactly_one_is_not_inversion(self):
+        s = sc.SETTINGS_DEFAULTS
+        self.assertEqual(sc.inversion_episodes(self._ratio([0.9, 1.0, 0.9])), [])
+        stage, _ = sc.classify_regime(self._ratio([0.9] * 39 + [1.0]), s)
+        self.assertEqual(stage, "NORMAL")
+        stage, _ = sc.classify_regime(self._ratio([0.9] * 39 + [1.10]), s)
+        self.assertEqual(stage, "STAGE1")          # 1.10 本身不算 >1.1
+        stage, _ = sc.classify_regime(self._ratio([0.9] * 39 + [1.1001]), s)
+        self.assertEqual(stage, "STAGE1_DEEP")
+
+    def test_window_day_counts_from_last_inverted_day(self):
+        s = sc.SETTINGS_DEFAULTS
+        base = [0.9] * 30 + [1.02, 1.03, 1.04]
+        for after, expect in ((1, 1), (10, 10), (11, None)):
+            ratio = self._ratio(base + [0.95] * after)
+            eps = sc.inversion_episodes(ratio)
+            self.assertEqual(sc.relief_window_day(ratio, eps, s), expect, after)
+
+    def test_window_pauses_on_short_reinversion_then_resumes(self):
+        # 合格倒挂 (3 日) 解除 -> 第 4 日单日再倒挂 -> 次日回到窗口, 按合格那轮计数
+        s = sc.SETTINGS_DEFAULTS
+        head = [0.9] * 30 + [1.02, 1.03, 1.04, 0.95, 0.96, 0.97]
+        stage, _ = sc.classify_regime(self._ratio(head + [1.01]), s)
+        self.assertEqual(stage, "STAGE1")
+        ratio = self._ratio(head + [1.01, 0.98])
+        eps = sc.inversion_episodes(ratio)
+        self.assertEqual(sc.classify_regime(ratio, s)[0], "STAGE2_WINDOW")
+        self.assertEqual(sc.relief_window_day(ratio, eps, s), 5)
+        self.assertEqual(sc.qualifying_episode(eps, s)["days"], 3)
+
+
+class TestRegimeBlock(unittest.TestCase):
+    """市场状态段: 解除提示不再引用未来数据, 持续倒挂里程碑, 解除窗口第几日。"""
+
+    def _ep(self, start, end, days, peak, ongoing):
+        return {"start": pd.Timestamp(start), "end": pd.Timestamp(end),
+                "days": days, "peak": peak, "ongoing": ongoing}
+
+    def _regime(self, **kw):
+        base = {"vix": 20.0, "vix3m": 19.0, "ratio": 1.05, "vxn": None,
+                "as_of": "2026-09-25", "source": "CBOE", "stage": "STAGE1",
+                "vx": {}, "vvix": {}, "move": {}, "stale_days": 0,
+                "last_episode": None, "crossed_up": False, "crossed_down": False}
+        base.update(kw)
+        return "\n".join(sc.regime_block(base))
+
+    def test_relief_text_uses_clean_numbers(self):
+        ep = self._ep("2026-03-26", "2026-03-30", 3, 1.061, False)
+        text = self._regime(stage="STAGE2_WINDOW", ratio=0.988, crossed_down=True,
+                            last_episode=ep, qual_episode=ep, window_day=1)
+        self.assertIn("+2.97%/79%", text)
+        self.assertIn("回撤", text)
+        for stale in ("3.04", "4.38", "统计最强", "历史级"):
+            self.assertNotIn(stale, text)
+        self.assertIn("解除窗口: 第 **1 / 10** 日", text)
+
+    def test_short_inversion_relief_opens_no_window(self):
+        ep = self._ep("2026-04-07", "2026-04-07", 1, 1.008, False)
+        text = self._regime(stage="NORMAL", ratio=0.928, crossed_down=True,
+                            last_episode=ep)
+        self.assertIn("短倒挂 (< 3 日)", text)
+        self.assertNotIn("解除窗口: 第", text)
+
+    def test_milestones(self):
+        cases = ((4, None), (5, "今日满 5 日"), (7, "已过 5 日线"),
+                 (10, "今日满 10 日"), (16, "已过 15 日线"))
+        for days, expect in cases:
+            ep = self._ep("2025-04-02", "2025-04-24", days, 1.274, True)
+            text = self._regime(last_episode=ep)
+            if expect is None:
+                self.assertNotIn("持续倒挂第", text)
+            else:
+                self.assertIn(f"持续倒挂第 {days} 日** ({expect})", text)
+
+    def test_window_line_names_qualifying_episode(self):
+        qual = self._ep("2026-03-26", "2026-03-30", 3, 1.061, False)
+        last = self._ep("2026-04-07", "2026-04-07", 1, 1.008, False)
+        text = self._regime(stage="STAGE2_WINDOW", ratio=0.93, last_episode=last,
+                            qual_episode=qual, window_day=6)
+        self.assertIn("第 **6 / 10** 日 — 来自 2026-03-26 → 2026-03-30 那轮", text)
+
+    def test_notes_have_no_lookahead_numbers(self):
+        for note in sc.REGIME_NOTES.values():
+            self.assertNotIn("3.04", note)
+            self.assertNotIn("历史级", note)
 
 
 class TestActionLabel(unittest.TestCase):
