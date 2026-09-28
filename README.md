@@ -127,6 +127,11 @@ droplet 的出站 SMTP (25/465/587/2525 一律静默超时, 443 正常), Gmail S
 - `data/iv_history.csv` — 每日 iv30/rv30 自建历史; 累计 60 个交易日后
   报告开始显示自建 IVP。它是 **30 天口径, 只供 CSP 参考**; LEAP 的 IV
   贵不贵看票据里的 IV 档位 (见下文「LEAP 的 IV 档位」)。
+  **版本列 `iv_src`** (2026-09-28): iv30 从"Yahoo 列优先"换成"mid 反解优先",
+  自建 IVP 只拿同版本 (`IV30_METHOD`) 的行排位, 旧行保留不参与 —— 所以自建 IVP
+  第一次出现推迟到 ~12 月中旬。**影子列 `iv30_ycol`** 暂存旧算法的值做对照,
+  攒够 20 个交易日用 `research/iv30_method_compare.py --history` 比较后删除
+  (todo.md #5, lesson.md 2026-09-28)。
 
 ## 状态机 (每标的, 收盘推进)
 

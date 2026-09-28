@@ -65,6 +65,16 @@ REPORTS = BASE / "reports"
 DATA = BASE / "data"
 STATE_FILE = DATA / "state.json"
 IV_HISTORY = DATA / "iv_history.csv"
+# iv_history.csv 里 iv30 的算法版本 (2026-09-28, lesson.md "30 天平值 IV 换算法")。
+# 自建 IVP 只拿同一版本的行排位, 旧版本的行留在文件里备查、不参与 —— 换算法
+# 等于重置 IVP 历史, 但不删数据。以后再换口径: 改这个值, 旧行自动退出排位。
+#   (无标记)  2026-09-04 ~ 09-25: contract_iv, Yahoo impliedVolatility 列优先
+#   "mid"     2026-09-28 起: mid_first_iv, bid/ask mid 按扫描器模型反解优先
+# 影子列 iv30_ycol: 同一次扫描按旧算法再算一遍, 只记录不排位 —— 新旧对比只有在
+# 收盘扫描 (15:45 ET, 实时盘口) 才成立: 盘外 Yahoo 会清空盘口, IV 列变成 1e-05,
+# 旧算法也退回反解, 两者恒等 (9/28 离线对比就撞上了)。攒够 20 个交易日用
+# research/iv30_method_compare.py --history 比较, 结论后删掉影子列 (todo.md #5)
+IV30_METHOD = "mid"
 # 推荐流水账 (复盘用): 只增不改, 每行一张真票。选 JSONL 的理由见 journal_rows
 JOURNAL = DATA / "recommendations.jsonl"
 CONFIG_FILE = BASE / "watchlist.toml"
@@ -453,6 +463,7 @@ def journal_rows(results, d: str, mode: str, regime: dict) -> list[dict]:
                 "ticker_kind": cfg.get("kind"),   # 复盘旗标要分指数/个股 (2026-09-28)
                 "ticker_state": r.get("state"), "stage": stage, "vix": vix,
                 "earnings": r.get("earnings"), "iv30": r.get("iv30"),
+                "iv30_src": IV30_METHOD,           # 2026-09-28 起; 旧行无此字段 = Yahoo 列口径
                 "notes": t.get("notes") or [],
                 "source": "scan",
             })
@@ -1456,9 +1467,15 @@ class ChainCache:
         return self._chains[exp]
 
 
-def atm_iv30(cc: ChainCache, spot: float) -> float | None:
+def atm_iv30(cc: ChainCache, spot: float, legacy: bool = False) -> float | None:
     """ATM IV interpolated to 30 DTE from the two bracketing expiries
-    (nearest expiry alone when only one side exists in 7..90 DTE)."""
+    (nearest expiry alone when only one side exists in 7..90 DTE).
+
+    每腿先 mid 反解 (mid_first_iv), 2026-09-28 起; 之前用 contract_iv (Yahoo 列
+    优先)。9/25 收盘 60 张实测: Yahoo 列 − mid 中位 +0.3 点但四分位 [-1.1, +2.2],
+    73% 差 > 1 点; mid − CBOE 是稳定的 +1.4 点常数 [0.9, 2.0] —— 自建 IVP 是
+    自己跟自己比, 要的是稳定, 不是绝对水平 (research/yahoo_iv_bias.py)。
+    legacy=True 按旧算法算, 只供 iv_history 的影子列 iv30_ycol 做对照。"""
     usable = [(e, d) for e, d in cc.expiries() if 7 <= d <= 90]
     if not usable:
         return None
@@ -1477,7 +1494,10 @@ def atm_iv30(cc: ChainCache, spot: float) -> float | None:
             idx = (df["strike"] - spot).abs().idxmin()
             row = df.loc[idx]
             mid, _src = _mark(row, cutoff)
-            iv = contract_iv(row, mid, spot, T, is_call)
+            if legacy:
+                iv = contract_iv(row, mid, spot, T, is_call)
+            else:
+                iv, _iv_src = mid_first_iv(row, mid, spot, T, is_call)
             if iv:
                 ivs.append(iv)
         if ivs:
@@ -2716,6 +2736,7 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
             return r
         try:
             r["iv30"] = atm_iv30(cc, tech["close"])
+            r["iv30_ycol"] = atm_iv30(cc, tech["close"], legacy=True)   # 影子列, 链已缓存
         except Exception as e:
             r["notes"].append(f"iv30 获取失败: {type(e).__name__}")
         # 25Δ RR 倒挂 = 每标的 froth 旗标 — 例外才报告 (正常 skew 沉默);
@@ -2878,7 +2899,7 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
 def load_iv_history() -> pd.DataFrame:
     if IV_HISTORY.exists():
         return pd.read_csv(IV_HISTORY)
-    return pd.DataFrame(columns=["date", "symbol", "iv30", "rv30"])
+    return pd.DataFrame(columns=["date", "symbol", "iv30", "rv30", "iv_src", "iv30_ycol"])
 
 
 def append_iv_history(results: list[dict], scan_date: str) -> pd.DataFrame:
@@ -2894,7 +2915,10 @@ def append_iv_history(results: list[dict], scan_date: str) -> pd.DataFrame:
             rv = r["tech"]["rv30"] if r["tech"] else None
             rows.append({"date": scan_date, "symbol": r["symbol"],
                          "iv30": round(r["iv30"], 4),
-                         "rv30": round(rv, 4) if rv else None})
+                         "rv30": round(rv, 4) if rv else None,
+                         "iv_src": IV30_METHOD,
+                         "iv30_ycol": (round(r["iv30_ycol"], 4)
+                                       if r.get("iv30_ycol") else None)})
     if rows:
         df = pd.concat([df, pd.DataFrame(rows)], ignore_index=True)
         DATA.mkdir(exist_ok=True)
@@ -2903,7 +2927,9 @@ def append_iv_history(results: list[dict], scan_date: str) -> pd.DataFrame:
 
 
 def self_ivp(df: pd.DataFrame, symbol: str, iv30: float) -> float | None:
-    hist = df[(df["symbol"] == symbol) & df["iv30"].notna()]["iv30"]
+    """自建 30 天 IVP: 只拿与当前算法同版本 (IV30_METHOD) 的历史行排位, 满 60 条才出。"""
+    same = df["iv_src"] == IV30_METHOD if "iv_src" in df else pd.Series(False, index=df.index)
+    hist = df[(df["symbol"] == symbol) & df["iv30"].notna() & same]["iv30"]
     if len(hist) < 60:
         return None
     return float((hist < iv30).mean() * 100)

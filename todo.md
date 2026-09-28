@@ -226,13 +226,24 @@ Yahoo 的 impliedVolatility 列、Yahoo 盘口 mid 按扫描器模型反解、CB
 **结论**：
 - **回踩 spread 已改成 mid 优先**（`mid_first_iv`）。Yahoo 列和 LEAP 一样系统性偏高，只是幅度小。
 - **CSP 维持 `contract_iv`**。偏差 < 1 点且对 delta 几乎没有影响；ISRG 是个例（+3.4 点），不值得为它改口径。
-- **30 天平值暂不改**。偏差没有方向、但噪声大（±1–2 点）；mid 反解对 CBOE 的偏差更稳定（IQR 更窄）。
-  它是自建 IVP 历史 `iv_history.csv` 的来源，换算法会让序列断档。
-  等决定要不要重置 IVP 历史时再一起改；它只影响 CSP 的 30 天 IVP 参考和恐慌期 16 法则的距离。
+- **30 天平值已改成 mid 优先**（2026-09-28，详见 lesson.md 同日"30 天平值 IV 换算法"）。
+  `iv_history.csv` 加版本列 `iv_src`，自建 IVP 只拿同版本排位；旧的 15 天保留、不参与。
+  自建 IVP 第一次出现推迟到 ~12 月中旬。
+
+### 待验证：30 天平值新旧算法的生产对比
+
+离线对比在盘外做不成（Yahoo 清空盘口后两种算法恒等），所以在生产里加了影子列 `iv30_ycol`：
+每天收盘扫描按旧算法再算一遍，只记录、不排位。
+
+- [ ] 攒够 20 个交易日（约 2026-10-26）后，从 droplet 取 `data/iv_history.csv`，跑
+      `.venv/Scripts/python.exe research/iv30_method_compare.py --history <文件>`。
+- [ ] 判读：旧算法的日间跳动明显更大 → 保留新算法；两者相当 → 也保留新算法（和 LEAP/spread
+      口径一致）；新算法反而更大 → 退回（`IV30_METHOD` 改回，旧行重新参与排位）。
+- [ ] 结论定了之后删掉影子列 `iv30_ycol` 和 `atm_iv30(legacy=True)`。
 
 ### 关闭条件
 
-30 天平值是否改口径的决定做出后删掉这一节，结论并入 lesson.md。
+上面三项做完，结论并入 lesson.md，删掉这一节。
 
 ---
 

@@ -4009,5 +4009,51 @@ class TestIndexExtrinsicWarning(unittest.TestCase):
         self.assertTrue(any("深度不够" in n for n in t["notes"]))
 
 
+class TestIv30Method(unittest.TestCase):
+    """30 天平值 IV 换成 mid 优先 + iv_history 打版本号 (2026-09-28)。"""
+
+    def _row(self, strike, px, yahoo_iv, days=1):
+        traded = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days)
+        return {"strike": strike, "bid": px - 0.05, "ask": px + 0.05, "lastPrice": px,
+                "lastTradeDate": traded, "openInterest": 500, "impliedVolatility": yahoo_iv}
+
+    def test_atm_iv30_inverts_mid_not_yahoo_column(self):
+        T = 30 / 365.0
+        c = sc.bs_price(100.0, 100.0, T, sc.RATE, 0.30, True)
+        p = sc.bs_price(100.0, 100.0, T, sc.RATE, 0.30, False)
+        chain = _FakeChain(pd.DataFrame([self._row(100.0, c, 0.45)]),
+                           pd.DataFrame([self._row(100.0, p, 0.25)]))
+        cc = _FakeCC(chain, expiries=[("2026-10-28", 30)])
+        self.assertAlmostEqual(sc.atm_iv30(cc, 100.0), 0.30, places=3)
+        # 影子列: 旧算法用 Yahoo 列 (0.45 / 0.25 的均值)
+        self.assertAlmostEqual(sc.atm_iv30(cc, 100.0, legacy=True), 0.35, places=3)
+
+    def test_self_ivp_ignores_other_method_rows(self):
+        old = [{"date": f"d{i}", "symbol": "X", "iv30": 0.10 + i / 1000, "rv30": 0.2}
+               for i in range(80)]                                   # 旧口径, 无 iv_src
+        df = pd.DataFrame(old)
+        self.assertIsNone(sc.self_ivp(df, "X", 0.2))                 # 旧行不参与
+        new = [{"date": f"n{i}", "symbol": "X", "iv30": 0.20 + i / 1000, "rv30": 0.2,
+                "iv_src": sc.IV30_METHOD} for i in range(60)]
+        df = pd.concat([df, pd.DataFrame(new)], ignore_index=True)
+        self.assertAlmostEqual(sc.self_ivp(df, "X", 0.23), 50.0)     # 只在新 60 行里排位
+
+    def test_append_tags_rows_with_method_and_keeps_old_rows(self):
+        with tempfile.TemporaryDirectory() as d:
+            orig_data, orig_hist = sc.DATA, sc.IV_HISTORY
+            sc.DATA, sc.IV_HISTORY = Path(d), Path(d) / "iv_history.csv"
+            try:
+                pd.DataFrame([{"date": "2026-09-25", "symbol": "X", "iv30": 0.3, "rv30": 0.2}]
+                             ).to_csv(sc.IV_HISTORY, index=False)
+                r = {"symbol": "X", "iv30": 0.31, "iv30_ycol": 0.33, "tech": {"rv30": 0.21}}
+                df = sc.append_iv_history([r], "2026-09-28")
+            finally:
+                sc.DATA, sc.IV_HISTORY = orig_data, orig_hist
+        self.assertEqual(len(df), 2)
+        self.assertTrue(pd.isna(df.iloc[0]["iv_src"]))               # 旧行原样保留
+        self.assertEqual(df.iloc[1]["iv_src"], sc.IV30_METHOD)
+        self.assertAlmostEqual(df.iloc[1]["iv30_ycol"], 0.33)             # 影子列只记录
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
