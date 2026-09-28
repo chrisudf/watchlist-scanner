@@ -3772,5 +3772,40 @@ class TestActionBlockLeapIvBand(unittest.TestCase):
         self.assertEqual(review.leap_flags({"iv_band": "B"}), "—")
 
 
+class TestReviewLeapByBand(unittest.TestCase):
+    """todo.md #3 的前向验证: 复盘按开仓 IV 档位分组 (2026-09-28)。"""
+
+    def _row(self, band, ret, days, itm=True, ratio=None):
+        return {"kind": "leap", "symbol": "X", "date": "2026-09-01", "strike": 80.0,
+                "mid": 15.0, "last_px": 100.0 if itm else 70.0, "itm_now": itm,
+                "underlying_ret": ret, "days_held": days, "iv_band": band,
+                "iv_ratio": ratio, "status": "open_unrealized", "source": "scan"}
+
+    def test_groups_in_band_order_with_legacy_last(self):
+        import review
+        rows = [self._row("C", 0.10, 200, ratio=1.4), self._row(None, 0.02, 400),
+                self._row("A", -0.05, 30, itm=False, ratio=0.9), self._row("C", 0.20, 10, ratio=1.3)]
+        out = review.leap_band_rows(rows)
+        self.assertEqual([x[0] for x in out], ["A", "C", "未记录"])
+        a, c, legacy = out
+        self.assertEqual(c[1:5], (2, 1, 2, 2))            # 笔数 / 满6个月 / ITM / 越过BE
+        self.assertAlmostEqual(c[5], 0.15)                 # 正股涨跌中位
+        self.assertAlmostEqual(c[6], 1.35)                 # 平均比值
+        self.assertEqual(a[3], 0)                          # A 档那张不在 ITM
+        self.assertIsNone(legacy[6])
+
+    def test_silent_until_any_band_recorded(self):
+        import review
+        self.assertEqual(review.leap_band_rows([self._row(None, 0.1, 100)]), [])
+
+    def test_both_renderers_show_the_breakdown(self):
+        import review
+        res = [self._row("B", 0.05, 190, ratio=1.1)]
+        t, m = review.summarize(res), review.summarize_md(res)
+        self.assertIn("按开仓 IV 档位", t)
+        self.assertIn("| B | 1 | 1 |", m)
+        self.assertIn("满 6 个月", m)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
