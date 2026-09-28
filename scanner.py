@@ -2280,10 +2280,14 @@ def call_spread_ticket(cc: ChainCache, spot: float, s: dict,
         if mid is None:
             continue
         strike = float(row["strike"])
-        iv = contract_iv(row, mid, spot, T, is_call=True)
+        # mid 优先 (2026-09-28, research/yahoo_iv_bias.py): ~135 天 call 上 Yahoo 列
+        # 比 mid 反解系统性高 +2.8 点 (222 张全部 > 1 点), 与 LEAP 同向; CSP 的
+        # 短期限 put 只差 -0.4 点、delta 几乎不变, 那边维持 contract_iv
+        iv, iv_src = mid_first_iv(row, mid, spot, T, is_call=True)
         if iv is None:
             continue
         rows.append({"strike": strike, "mid": mid, "src": src, "iv": iv,
+                     "iv_src": "last" if (iv_src == "mid" and src == "last") else iv_src,
                      "delta": bs_delta(spot, strike, T, RATE, iv, True),
                      "oi": _oi(row)})
     if len(rows) < 2:
