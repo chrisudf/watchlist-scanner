@@ -3580,7 +3580,8 @@ class TestAttachLeapIvBand(unittest.TestCase):
         self.assertEqual(t["iv_gauge"]["atm_src"], "mid")
         self.assertTrue(t["notes"][0].startswith("IV 档位 A"))
         self.assertIn("实际波动中位数", t["notes"][0])
-        self.assertNotIn("Yahoo", t["notes"][0])
+        self.assertIn("平值 IV 30% (Yahoo)", t["notes"][0])   # 假链没有 symbol: 不走 CBOE
+        self.assertNotIn("CBOE 不可用", t["notes"][0])
         self.assertEqual(t["notes"][0], t["iv_gauge"]["note"])
         self.assertFalse(sc.leap_iv_over_gate(t))
 
@@ -3627,7 +3628,7 @@ class TestAttachLeapIvBand(unittest.TestCase):
         t = self._ticket()
         sc.attach_leap_iv_band(t, cc, 100.0, sc.SETTINGS_DEFAULTS)
         self.assertEqual(t["iv_gauge"]["atm_src"], "last")
-        self.assertIn("(含成交价)", t["notes"][0])
+        self.assertIn("(Yahoo·含成交价)", t["notes"][0])
 
     def test_failure_is_said_not_silently_fallen_back(self):
         t = self._ticket()
@@ -3881,6 +3882,92 @@ class TestCSPZoneFar(unittest.TestCase):
         self.assertIn("CSP[区内远档]: SELL 2026-10-16 250P", "\n".join(sc.action_block([r])))
         row = sc.journal_rows([r], "2026-09-28", "close", {})[0]
         self.assertTrue(row["zone_far"])
+
+
+class TestCboeAtmIv(unittest.TestCase):
+    """LEAP 平值 IV 先取 CBOE, 不可用时退回 Yahoo 并写明原因 (2026-09-28)。"""
+
+    S = sc.SETTINGS_DEFAULTS
+
+    def _data(self, stamp="2026-09-25T16:00:00", spot=100.0, ivs=None):
+        ivs = ivs or {("C", 100): 0.30, ("P", 100): 0.34, ("C", 90): 0.33}
+        return {"last_trade_time": stamp, "current_price": spot, "options": [
+            {"option": f"XYZ280121{r}{int(k * 1000):08d}", "iv": v} for (r, k), v in ivs.items()]}
+
+    def test_atm_average_of_nearest_strike(self):
+        iv, why = sc.cboe_atm_iv(self._data(), "XYZ", "2028-01-21", 100.4, "2026-09-25", self.S)
+        self.assertAlmostEqual(iv, 0.32)
+        self.assertEqual(why, "")
+
+    def test_interpolates_between_bracketing_strikes(self):
+        """SOFI 型: 低价股 LEAP 行权价间隔大, 现价 16.58 两侧是 15 / 18。"""
+        data = self._data(spot=16.58, ivs={("C", 15): 0.60, ("P", 15): 0.62,
+                                           ("C", 18): 0.54, ("P", 18): 0.56})
+        iv, why = sc.cboe_atm_iv(data, "XYZ", "2028-01-21", 16.58, "2026-09-25", self.S)
+        w = (16.58 - 15) / 3
+        self.assertAlmostEqual(iv, (1 - w) * 0.61 + w * 0.55)
+        self.assertEqual(why, "")
+        wide = self._data(spot=16.58, ivs={("C", 10): 0.6, ("C", 25): 0.5})
+        self.assertIn("间隔过宽", sc.cboe_atm_iv(wide, "XYZ", "2028-01-21", 16.58,
+                                               "2026-09-25", self.S)[1])
+
+    def test_rejects_other_day_spot_gap_missing_expiry_and_far_strike(self):
+        cases = [
+            (self._data(stamp="2026-09-24T16:00:00"), "2028-01-21", 100.0, "报价日"),
+            (self._data(spot=104.0), "2028-01-21", 100.0, "相差过大"),
+            (self._data(), "2029-01-19", 100.0, "没有 2029-01-19"),
+            (self._data(ivs={("C", 80): 0.3}), "2028-01-21", 100.0, "偏离超过 5%"),
+        ]
+        for data, exp, spot, reason in cases:
+            iv, why = sc.cboe_atm_iv(data, "XYZ", exp, spot, "2026-09-25", self.S)
+            self.assertIsNone(iv, reason)
+            self.assertIn(reason, why)
+
+    def _cc_with_symbol(self):
+        cc = TestAttachLeapIvBand()._cc(iv=0.30)
+        cc.symbol = "XYZ"
+        return cc
+
+    def _ticket(self):
+        return {"exp": "2028-01-21", "dte": 486, "notes": []}
+
+    def test_attach_uses_cboe_when_it_passes(self):
+        orig = sc.fetch_cboe_chain
+        sc.fetch_cboe_chain = lambda sym, timeout: self._data()
+        try:
+            t = self._ticket()
+            sc.attach_leap_iv_band(t, self._cc_with_symbol(), 100.0, self.S, as_of="2026-09-25")
+        finally:
+            sc.fetch_cboe_chain = orig
+        self.assertEqual(t["iv_gauge"]["atm_src"], "cboe")
+        self.assertIn("(CBOE)", t["notes"][0])
+
+    def test_attach_falls_back_to_yahoo_and_says_why(self):
+        def boom(sym, timeout):
+            raise TimeoutError("slow")
+        orig = sc.fetch_cboe_chain
+        sc.fetch_cboe_chain = boom
+        try:
+            t = self._ticket()
+            sc.attach_leap_iv_band(t, self._cc_with_symbol(), 100.0, self.S, as_of="2026-09-25")
+        finally:
+            sc.fetch_cboe_chain = orig
+        self.assertEqual(t["iv_gauge"]["atm_src"], "mid")
+        self.assertIn("(Yahoo)", t["notes"][0])
+        self.assertIn("CBOE 不可用, 平值 IV 退回 Yahoo: CBOE 取数失败 (TimeoutError)", t["notes"][0])
+
+    def test_yahoo_only_setting_skips_cboe(self):
+        def never(sym, timeout):
+            raise AssertionError("leap_iv_source=yahoo 不该取 CBOE")
+        orig = sc.fetch_cboe_chain
+        sc.fetch_cboe_chain = never
+        try:
+            t = self._ticket()
+            sc.attach_leap_iv_band(t, self._cc_with_symbol(), 100.0,
+                                   {**self.S, "leap_iv_source": "yahoo"}, as_of="2026-09-25")
+        finally:
+            sc.fetch_cboe_chain = orig
+        self.assertNotIn("CBOE", t["notes"][0])
 
 
 if __name__ == "__main__":

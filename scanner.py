@@ -42,6 +42,7 @@ import io
 import json
 import math
 import os
+import re
 import sys
 import tomllib
 import urllib.request
@@ -194,6 +195,13 @@ SETTINGS_DEFAULTS = {
     "leap_iv_edge_abs": 0.02,
     "leap_iv_abs_gate": 0.58,        # 合约 IV >= 此值 = D 档, 不用 LEAP 表达
     "leap_iv_hist_years": 10,        # 实际波动分布取多少年日线
+    # 平值 IV 的数据源 (2026-09-28): "cboe" = CBOE 免费延迟链 (与 stock-analysis 技能
+    # 和指数回测同口径), 取不到/报价日对不上/现价差太多/链上缺该到期时自动退回
+    # Yahoo mid 反解, 并在 note 里写明原因; "yahoo" = 只用 Yahoo。
+    # 之前 SOFI 的 CBOE 56.2% vs Yahoo 58.5% 正好压在 58% 绝对门两边
+    "leap_iv_source": "cboe",
+    "cboe_timeout_s": 20,
+    "cboe_max_spot_gap": 0.02,       # CBOE 现价与日线收盘差超此比例 = 不是同一时点
     "leap_iv_min_years": 5.0,        # 历史短于此, 中位数只代表一个 regime (带提示)
     # regime
     "stage2_window_bars": 10,    # trading days after inversion resolves
@@ -1418,6 +1426,7 @@ class ChainCache:
     """One yf.Ticker per symbol; option chains fetched at most once."""
 
     def __init__(self, symbol: str):
+        self.symbol = symbol
         self.tk = yf.Ticker(symbol)
         self._chains: dict[str, object] = {}
         self._expiries: list[str] | None = None
@@ -2213,14 +2222,88 @@ def leap_atm_iv(cc: ChainCache, exp: str, dte: int,
     return sum(v for v, _ in ivs) / len(ivs), src
 
 
+CBOE_CHAIN_URL = "https://cdn.cboe.com/api/global/delayed_quotes/options/{}.json"
+
+
+def fetch_cboe_chain(sym: str, timeout: float) -> dict:
+    """CBOE 免费延迟期权链 (15 分钟延迟; 盘后/周末给上一交易日收盘报价)。
+    非官方公开接口, 格式可能变 —— 调用方必须有 fallback。"""
+    req = urllib.request.Request(CBOE_CHAIN_URL.format(sym),
+                                 headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as f:
+        return json.load(f)["data"]
+
+
+def cboe_atm_iv(data: dict, sym: str, exp: str, spot: float,
+                as_of: str | None, s: dict) -> tuple[float | None, str]:
+    """CBOE 链 -> (平值 IV, "") 或 (None, 退回原因) (纯函数)。
+
+    每档行权价 call/put 的 CBOE IV 取均值; 现价两侧都有档位时按距离线性插值,
+    只有一侧时取最近一档 (须在现价 5% 以内)。任一校验不过就退回, 不硬凑:
+      - 报价日 != 日线日期 (不是同一时点, lesson.md 2026-09-25 "回放要用同一时点的报价")
+      - CBOE 现价与日线收盘差 > cboe_max_spot_gap
+      - 链上没有该到期的 IV; 两侧档位间隔 > 现价 25%; 只有一侧且最近一档离现价 > 5%"""
+    stamp = str(data.get("last_trade_time") or "")[:10]
+    if as_of and stamp != as_of:
+        return None, f"CBOE 报价日 {stamp or '?'} 与日线 {as_of} 不一致"
+    c_spot = data.get("current_price") or data.get("close")
+    if not c_spot or abs(c_spot / spot - 1) > s["cboe_max_spot_gap"]:
+        return None, f"CBOE 现价 {c_spot} 与日线收盘 {spot:.2f} 相差过大"
+    yymmdd = exp[2:4] + exp[5:7] + exp[8:10]
+    pat = re.compile(rf"{re.escape(sym)}{yymmdd}([CP])(\d{{8}})$")
+    by_k: dict[float, list[float]] = {}
+    for o in data.get("options") or []:
+        m = pat.match(str(o.get("option", "")))
+        iv = o.get("iv")
+        if m and iv and 0.01 < float(iv) < 3.0:
+            by_k.setdefault(int(m.group(2)) / 1000, []).append(float(iv))
+    if not by_k:
+        return None, f"CBOE 链上没有 {exp} 的 IV"
+    iv_at = {k: sum(v) / len(v) for k, v in by_k.items()}
+    below = [k for k in iv_at if k <= spot]
+    above = [k for k in iv_at if k >= spot]
+    if below and above:
+        # 现价两侧都有: 按距离线性插值。低价股 LEAP 行权价间隔大 (SOFI 16.58 两侧是
+        # 15 / 18), 只取最近一档会偏离 8% 以上; 两侧间隔过宽说明链不全, 不硬插
+        k1, k2 = max(below), min(above)
+        if k1 == k2:
+            return iv_at[k1], ""
+        if (k2 - k1) / spot > 0.25:
+            return None, f"CBOE {exp} 现价两侧的行权价 {k1:g} / {k2:g} 间隔过宽"
+        w = (spot - k1) / (k2 - k1)
+        return (1 - w) * iv_at[k1] + w * iv_at[k2], ""
+    k = min(iv_at, key=lambda x: abs(x - spot))
+    if abs(k / spot - 1) > 0.05:
+        return None, f"CBOE {exp} 离现价最近的行权价 {k:g} 偏离超过 5%"
+    return iv_at[k], ""
+
+
+def leap_atm_iv_sourced(cc, ticket: dict, spot: float, s: dict,
+                        as_of: str | None) -> tuple[float | None, str | None, str]:
+    """LEAP 平值 IV: 先 CBOE, 不行就退回 Yahoo -> (iv, 来源, CBOE 退回原因)。
+    来源: "cboe" / "mid" / "last" / "yahoo" (后三个见 leap_atm_iv)。"""
+    why = ""
+    sym = getattr(cc, "symbol", None)
+    if s["leap_iv_source"] == "cboe" and sym:
+        try:
+            iv, why = cboe_atm_iv(fetch_cboe_chain(sym, s["cboe_timeout_s"]), sym,
+                                  ticket["exp"], spot, as_of, s)
+            if iv:
+                return iv, "cboe", ""
+        except Exception as e:
+            why = f"CBOE 取数失败 ({type(e).__name__})"
+    atm, src = leap_atm_iv(cc, ticket["exp"], ticket["dte"], spot)
+    return atm, src, why
+
+
 def attach_leap_iv_band(ticket: dict, cc: ChainCache, spot: float, s: dict,
-                        index: bool = False) -> None:
+                        index: bool = False, as_of: str | None = None) -> None:
     """给已出的 LEAP 真票挂上 iv_gauge 与一条档位 note (原地修改)。
 
     多一次 10 年日线请求, 只在真票发出时才付。取不到就明说, 不回落到
     30 天自建 IVP —— 那正是被这条规则取代的口径。"""
     try:
-        atm, atm_src = leap_atm_iv(cc, ticket["exp"], ticket["dte"], spot)
+        atm, atm_src, cboe_why = leap_atm_iv_sourced(cc, ticket, spot, s, as_of)
         hist = cc.tk.history(period=f"{s['leap_iv_hist_years']}y",
                              interval="1d", auto_adjust=True)
         g = leap_iv_band(atm, list(hist["Close"]), ticket["dte"], s, index=index)
@@ -2236,7 +2319,8 @@ def attach_leap_iv_band(ticket: dict, cc: ChainCache, spot: float, s: dict,
     # 两处口径标注 (lesson.md 2026-09-24): 指数用单独的升档线; 平值 IV 若有腿
     # 退回了 Yahoo 列要说出来 —— 以后重构时这两条是最容易被"统一"掉的
     head = (f"IV 档位 {g['band']}: 平值 IV {g['atm_iv'] * 100:.0f}%"
-            + {"mid": "", "last": " (含成交价)"}.get(atm_src, " (含 Yahoo 列)")
+            + {"cboe": " (CBOE)", "mid": " (Yahoo)", "last": " (Yahoo·含成交价)"
+               }.get(atm_src, " (Yahoo·含 Yahoo 列)")
             + f" = 自身{g['years']:.0f}年实际波动中位数 {g['med_rv'] * 100:.0f}% 的 "
             f"{g['ratio']:.2f} 倍 (近1年 {g['rv1y'] * 100:.0f}% / 近2年 "
             f"{g['rv2y'] * 100:.0f}%"
@@ -2246,6 +2330,8 @@ def attach_leap_iv_band(ticket: dict, cc: ChainCache, spot: float, s: dict,
             + f" — {IV_BAND_TEXT[g['band']]}"
             + ("; 个股未经回测, 仓位减半" if g["band"] == "C" and not index else ""))
     extra = []
+    if cboe_why:
+        extra.append(f"CBOE 不可用, 平值 IV 退回 Yahoo: {cboe_why}")
     if g["years"] < s["leap_iv_min_years"]:
         extra.append(f"历史只有 {g['years']:.1f} 年, 中位数只代表一个 regime, 比值仅供参考")
     if g["regime_up"] and g["band"] == "C":
@@ -2729,7 +2815,8 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
                     # 算"已发" —— 票照出、由报告改写成 spread 提示, 和原来
                     # 自建 IVP>60 的处理一致, 不影响 pending/窗口的生命周期
                     attach_leap_iv_band(r["leap"], cc, tech["close"], s,
-                                        index=cfg["kind"] == "index")
+                                        index=cfg["kind"] == "index",
+                                        as_of=tech["as_of"])
                 if emitted and stage == "STAGE2_WINDOW":
                     # 真票已发 — 现在才烧每窗口一次的 dedup key。ep_end
                     # 只在 STAGE2 分支里绑定, 由 stage 判断护住
