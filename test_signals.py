@@ -3973,5 +3973,41 @@ class TestCboeAtmIv(unittest.TestCase):
         self.assertNotIn("CBOE", t["notes"][0])
 
 
+class TestIndexExtrinsicWarning(unittest.TestCase):
+    """指数不拿外在价值做过滤, 只提示 (2026-09-28, todo.md #4)。
+    合成链同 TestLeapExpiryMaturity (spot 100, 486 DTE); sigma 0.20 时带内
+    0.75δ 附近的档外在 ~51%, 旧规则会让指数落进"无合约同时满足"。"""
+
+    def _t(self, kind, s=sc.SETTINGS_DEFAULTS):
+        cc = TestLeapExpiryMaturity()._cc(sigma=0.20)
+        return sc.leap_ticket(cc, 100.0, {"kind": kind, "high_beta": False}, None, s)
+
+    def test_index_is_warned_not_filtered(self):
+        t = self._t("index")
+        self.assertGreater(t["extrinsic_pct"], 40.0)
+        self.assertTrue(0.70 <= t["delta"] <= 0.80)
+        self.assertFalse(any("无合约同时满足" in n for n in t["notes"]))
+        warn = [n for n in t["notes"] if n.startswith("⚠️ 外在价值")]
+        self.assertEqual(len(warn), 1)
+        self.assertIn(f"{t['extrinsic_pct']:.0f}%", warn[0])
+        self.assertIn("保险费率", warn[0])
+        self.assertIn("到盈亏平衡", warn[0])
+
+    def test_stocks_keep_the_40pct_gate(self):
+        t = self._t("stock")
+        self.assertLessEqual(t["extrinsic_pct"], 40.0)
+        self.assertFalse(any(n.startswith("⚠️ 外在价值") for n in t["notes"]))
+
+    def test_review_does_not_flag_index_extrinsic(self):
+        import review
+        row = {"oi": 3000, "extrinsic_pct": 55.0, "be_pct_at_rec": 0.09}
+        self.assertIn("外在55%", review.leap_flags(row))                  # 旧行 / 个股
+        self.assertEqual(review.leap_flags({**row, "ticker_kind": "index"}), "—")
+
+    def test_gate_can_be_turned_back_on_for_index(self):
+        t = self._t("index", {**sc.SETTINGS_DEFAULTS, "leap_extrinsic_gate_index": True})
+        self.assertTrue(any("深度不够" in n for n in t["notes"]))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

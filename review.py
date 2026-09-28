@@ -501,7 +501,8 @@ def leap_flags(r: dict) -> str:
     if oi is not None and oi < LEAP_GATES["oi"]:
         f.append(f"OI{oi}")
     ex = r.get("extrinsic_pct")
-    if ex is not None and ex > LEAP_GATES["extrinsic_pct"]:
+    # 指数 2026-09-28 起不拿外在价值做门 (todo.md #4), 超了不算踩线
+    if ex is not None and ex > LEAP_GATES["extrinsic_pct"] and r.get("ticker_kind") != "index":
         f.append(f"外在{ex:.0f}%")
     be = r.get("be_pct_at_rec")
     if be is not None and be > LEAP_GATES["be_pct"]:

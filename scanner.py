@@ -157,6 +157,13 @@ SETTINGS_DEFAULTS = {
     "leap_exp_dte_slack": 250, "leap_exp_depth_ratio": 10.0,
     "leap_exp_max_probe": 3,     # 最多多取 N 条链, 限住额外的行情请求
     "leap_max_extrinsic_pct": 40.0,
+    # 指数不拿外在价值做过滤, 只提示 (2026-09-28, todo.md #4): 指数 delta 带 0.70-0.80
+    # 与"外在 <= 40%"直接矛盾 —— 后者在 16 个月以上会把指数逼到 0.80+ (QQQ Jan'28:
+    # 0.70δ 外在 61% / 0.75δ 45% / 0.80δ 33%)。40% 是给高 IV 个股设的 vega 防线;
+    # 指数 IV ~20-25%, 0.70δ 折成保险费率 ~7.4%/年、IV 降 3 点亏权利金 ~7%, 代价适中。
+    # 以前没暴露是因为 Yahoo 列 IV 偏高把 delta 算低, 碰巧选到更深的档。
+    # 指数的成本看票上的保险费率 %/年 与 BE% (BE <= 12% 那道门照旧)
+    "leap_extrinsic_gate_index": False,
     # 到盈亏平衡 <= 12% (moomoo「Buy LEAP Call」筛选器同款, 0~12%)。ITM call
     # 有恒等式 BE = 现价 + 外在价值, 所以这条等价于"外在价值 <= 现价的 12%" ——
     # 和上面 leap_max_extrinsic_pct 量的是同一件事, 分母不同 (那条按权利金,
@@ -443,6 +450,7 @@ def journal_rows(results, d: str, mode: str, regime: dict) -> list[dict]:
                 "zone_far": t.get("zone_far"),     # 区内远档 CSP (2026-09-28 起)
                 "zone": cfg.get("value_zone"), "zone_asof": cfg.get("zone_asof"),
                 "high_beta": cfg.get("high_beta"),
+                "ticker_kind": cfg.get("kind"),   # 复盘旗标要分指数/个股 (2026-09-28)
                 "ticker_state": r.get("state"), "stage": stage, "vix": vix,
                 "earnings": r.get("earnings"), "iv30": r.get("iv30"),
                 "notes": t.get("notes") or [],
@@ -2079,9 +2087,11 @@ def leap_ticket(cc: ChainCache, spot: float, cfg: dict,
     if not rows:
         return {"skip_reason": f"{exp} 无可用 ITM call 报价"}
 
+    ext_gate = cfg["kind"] != "index" or s["leap_extrinsic_gate_index"]
+
     def passes(c):
         return (dlo <= c["delta"] <= dhi and c["oi"] >= s["leap_min_oi"]
-                and (c["extrinsic_pct"] is None
+                and (c["extrinsic_pct"] is None or not ext_gate
                      or c["extrinsic_pct"] <= s["leap_max_extrinsic_pct"])
                 and c["be_pct"] <= s["leap_max_be_pct"]
                 and (c["spread_pct"] is None
@@ -2109,7 +2119,14 @@ def leap_ticket(cc: ChainCache, spot: float, cfg: dict,
     if pick["spread_pct"] is not None and pick["spread_pct"] > s["leap_max_spread_pct"]:
         notes.append(f"价差 {pick['spread_pct']:.1f}% > {s['leap_max_spread_pct']}% — 挂 mid 磨或换行权价")
     if pick["extrinsic_pct"] is not None and pick["extrinsic_pct"] > s["leap_max_extrinsic_pct"]:
-        notes.append(f"外在价值 {pick['extrinsic_pct']:.0f}% > {s['leap_max_extrinsic_pct']}% — 深度不够")
+        if ext_gate:
+            notes.append(f"外在价值 {pick['extrinsic_pct']:.0f}% > {s['leap_max_extrinsic_pct']}% — 深度不够")
+        else:
+            notes.append(
+                f"⚠️ 外在价值 {pick['extrinsic_pct']:.0f}% (指数不设 "
+                f"{s['leap_max_extrinsic_pct']:g}% 门, 只提示) — 折成保险费率 "
+                f"~{pick['insurance_pct_yr']:.1f}%/年, 到盈亏平衡 {pick['be_pct']:+.1f}%; "
+                f"想更稳就取 delta 带上沿 ~{dhi:.2f}")
     if pick["src"] == "last":
         notes.append("盘口不可用, 按最近成交价估算 — 下单前实查")
     if pick["iv_src"] == "yahoo":
