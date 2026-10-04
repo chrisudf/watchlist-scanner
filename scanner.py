@@ -55,6 +55,8 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+import insider
+
 # ETFs have no earnings calendar — silence yfinance's 404 chatter
 import logging
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
@@ -433,6 +435,14 @@ def journal_rows(results, d: str, mode: str, regime: dict) -> list[dict]:
             continue
         spot = r["tech"]["close"]
         cfg = r.get("cfg") or {}
+        # 内部人买入快照 (2026-10-05 起): 只做提示、不进门控, 记下来是为了
+        # 以后 review.py 能按"开仓前 90 天有没有内部人买入"分组复盘, 样本
+        # 够了再决定要不要升级成信号。None = 没查/查不全 (ETF、指数、取数
+        # 失败、本次没拉全), 0 = 查全了、确实没有 —— 两者不能混
+        ins = r.get("insider") or {}
+        ins_ok = ("cik" in ins and not ins.get("missing")
+                  and not ins.get("partial_history"))
+        s90 = ins.get("summary90")
         for kind in ("csp", "leap"):
             t = r.get(kind)
             if not t or "skip_reason" in t:
@@ -470,6 +480,10 @@ def journal_rows(results, d: str, mode: str, regime: dict) -> list[dict]:
                 "earnings": r.get("earnings"), "iv30": r.get("iv30"),
                 "iv30_src": IV30_METHOD,           # 2026-09-28 起; 旧行无此字段 = Yahoo 列口径
                 "notes": t.get("notes") or [],
+                "insider_buyers_90d": ((s90["n_buyers"] if s90 else 0)
+                                       if ins_ok else None),
+                "insider_buy_usd_90d": ((round(s90["value"]) if s90 else 0)
+                                        if ins_ok else None),
                 "source": "scan",
             })
     return rows
@@ -2993,6 +3007,163 @@ def self_ivp(df: pd.DataFrame, symbol: str, iv30: float) -> float | None:
 # Reports
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# 内部人公开市场买入 (insider.py) — 只做提示, 不进状态机/门控/票据
+# --------------------------------------------------------------------------
+
+def _close_lookup(hist):
+    """交易日 -> 当天 (或之前最近一个交易日) 的收盘价, 给 insider 校验价格
+    单位用。没有日线 = 一律 None —— 宁可不比价值区, 也不能拿 TSM 的台股
+    普通股价去比 ADR 的接货带。"""
+    if hist is None or hist.empty:
+        return lambda d: None
+    close = hist["Close"].dropna()
+    tz = getattr(close.index, "tz", None)
+
+    def at(d: str):
+        ts = pd.Timestamp(d)
+        if tz is not None:
+            ts = ts.tz_localize(tz)
+        sub = close[close.index <= ts]
+        return float(sub.iloc[-1]) if len(sub) else None
+    return at
+
+
+def attach_insider(results, tickers, hist, today: date) -> dict:
+    """给每个个股结果挂上 r["insider"] (ETF/指数 = None), 返回运行概况.
+
+    整段包在 try 里: 内部人数据是附加信息, 它自己出 bug 也只能降级成
+    报告里一行 ⚠️, 不能拖垮扫描。"""
+    stocks = [r["symbol"] for r in results
+              if tickers[r["symbol"]]["kind"] == "stock"]
+    try:
+        meta = insider.run(
+            stocks, today, data_dir=DATA,
+            ref_closes={s_: _close_lookup(hist.get(s_)) for s_ in stocks})
+    except Exception as e:      # noqa: BLE001
+        meta = {"enabled": True, "reason": None, "requests": 0,
+                "by_symbol": {s_: {"error": f"内部人模块异常: "
+                                            f"{type(e).__name__}: {e}"}
+                              for s_ in stocks}}
+    for r in results:
+        r["insider"] = meta["by_symbol"].get(r["symbol"])
+    return meta
+
+
+def usd_short(v) -> str:
+    """$25.1万 / $5,530万 / $1.55亿 —— 报告是中文, 金额按万/亿读得快。"""
+    if v is None:
+        return "—"
+    if v >= 1e8:
+        return f"${v / 1e8:.2f}亿"
+    if v >= 1e4:
+        w = v / 1e4
+        return f"${w:,.1f}万" if w < 100 else f"${w:,.0f}万"
+    return f"${v:,.0f}"
+
+
+def _live_zone(r):
+    """作废的 zone 不能拿来给内部人买入定位 (同概览表的处理)。"""
+    return None if r.get("zone_invalid") else (r.get("cfg") or {}).get("value_zone")
+
+
+def insider_event_line(sym: str, e: dict, zone) -> str:
+    """一份新申报 = 一行。"""
+    when = (e["date_hi"][5:] if e["date_lo"] == e["date_hi"]
+            else f"{e['date_lo'][5:]}~{e['date_hi'][5:]}")
+    px = f" @{e['avg_price']:.2f}" if e["avg_price"] else ""
+    via = ""
+    if e["indirect"]:
+        via = f" (间接: {e['nature']})" if e["nature"] else " (间接持有)"
+    line = (f"- 🆕 **{sym}** 内部人买入: {e['owner']} ({e['role']}) "
+            f"{e['shares']:,.0f} 股{px} ≈ {usd_short(e['value'])}{via} · "
+            f"成交 {when} · 申报 {e['filed'][5:]}")
+    if e["plan"]:
+        line += " · 10b5-1 计划内"
+    if e["avg_price"] and zone is not None:
+        if e["units_ok"]:
+            line += (f" · 价值区 {zone[0]:g}-{zone[1]:g}: "
+                     f"{zone_position(e['avg_price'], zone)}")
+        else:
+            line += " · 成交价与美股报价单位不同 (如台股普通股 vs ADR), 不对比价值区"
+    return line
+
+
+def insider_digest_line(sym: str, s: dict, zone) -> str:
+    """近 180 天汇总 = 一行。"""
+    parts = [f"{s['n_buyers']} 人 {s['n']} 笔 {usd_short(s['value'])}"]
+    if s["avg_price"]:
+        rng = (f" ({s['lo']:.2f}-{s['hi']:.2f})"
+               if s["lo"] is not None and s["hi"] - s["lo"] > 0.005 else "")
+        avg = f"均价 {s['avg_price']:.2f}{rng}"
+        if zone is not None:
+            avg += (f", 价值区 {zone[0]:g}-{zone[1]:g}: "
+                    f"{zone_position(s['avg_price'], zone)}")
+        parts.append(avg)
+        if s["units_mixed"]:
+            parts.append("部分成交单位不同, 未计入均价")
+    elif s["units_mixed"]:
+        parts.append("成交价与美股报价单位不同, 不算均价")
+    last = s["last"]
+    parts.append(f"最近 {last['date_hi'][5:]} {last['owner']} ({last['role']}) "
+                 f"{usd_short(last['value'])}")
+    if s["cluster"]:
+        parts.append("30 天内多人买入")
+    return f"- **{sym}** " + " · ".join(parts)
+
+
+def insider_status_lines(results, meta) -> list[str]:
+    """取数失败 / 不完整 / 未启用 —— 失败不等于没有买入, 必须写出来。"""
+    if meta is None:
+        return []
+    if not meta.get("enabled"):
+        return [f"- ⚠️ 内部人数据未启用 ({meta.get('reason')})"]
+    failed: dict[str, list[str]] = {}
+    partial = []
+    for r in results:
+        info = r.get("insider") or {}
+        if info.get("error"):
+            failed.setdefault(info["error"], []).append(r["symbol"])
+        elif info.get("missing") or info.get("partial_history"):
+            partial.append(r["symbol"])
+    lines = [f"- ⚠️ 内部人数据获取失败: {', '.join(syms)} — {why}; "
+             "不等于没有买入, 下次扫描重试" for why, syms in failed.items()]
+    if partial:
+        lines.append(f"- ⚠️ 内部人数据不完整: {', '.join(partial)} — "
+                     "有申报本次没拉到, 下次扫描补齐")
+    return lines
+
+
+def insider_new_lines(results) -> list[str]:
+    out = []
+    for r in results:
+        for e in (r.get("insider") or {}).get("new", []):
+            out.append(insider_event_line(r["symbol"], e, _live_zone(r)))
+    return out
+
+
+def insider_block(results, meta) -> list[str]:
+    """尾盘报告的内部人段: 新申报 → 各标的 180 天汇总 → 失败/不完整。
+    meta=None (--no-insider) 整段不出。"""
+    if meta is None:
+        return []
+    lines = [f"## 内部人买入 (公开市场, 近 {insider.WINDOW_DAYS} 天)", ""]
+    news = insider_new_lines(results)
+    summ = [(r, (r.get("insider") or {}).get("summary")) for r in results]
+    summ = sorted([(r, s_) for r, s_ in summ if s_], key=lambda x: -x[1]["value"])
+    digest = [insider_digest_line(r["symbol"], s_, _live_zone(r)) for r, s_ in summ]
+    status = insider_status_lines(results, meta)
+    lines += news + digest + status
+    if not (news or digest or status):
+        lines.append("- 无")
+    lines += ["",
+              f"> 只统计公开市场买入 (Form 4 代码 P), 单笔或同一人同一周合计 "
+              f"≥{usd_short(insider.FLOOR_USD)}, 已剔除员工购股计划; 卖出不统计。"
+              "🆕 = 上次扫描以来的新申报。只做参考, 不影响任何信号和票据。",
+              ""]
+    return lines
+
+
 def fmt(x, spec=".2f", suffix=""):
     if x is None or (isinstance(x, float) and math.isnan(x)):
         return "—"
@@ -3278,7 +3449,7 @@ def zone_position(close: float, zone) -> str:
     return "区内"
 
 
-def render_close(results, regime, ivdf, now_et) -> str:
+def render_close(results, regime, ivdf, now_et, insider_meta=None) -> str:
     d = now_et.strftime("%Y-%m-%d")
     lines = [f"# 左右侧 watchlist 扫描 — {d} 尾盘 "
              f"({now_et:%H:%M} ET)", ""]
@@ -3323,6 +3494,7 @@ def render_close(results, regime, ivdf, now_et) -> str:
         "≥2个✓且有真实回调前提才算确认。价值区: 上方+X% = 现价高于接货带"
         "上沿X%(等回落), 区内 = 可接货, 破下沿 = 检查论点。",
         ""]
+    lines += insider_block(results, insider_meta)
 
     detail = [r for r in ordered
               if r["state"] in ("CONFIRMED", "TREND", "LEFT_ZONE", "NEAR_ZONE")
@@ -3459,7 +3631,7 @@ def render_close(results, regime, ivdf, now_et) -> str:
     return "\n".join(lines)
 
 
-def render_open(results, regime, now_et, s: dict) -> str:
+def render_open(results, regime, now_et, s: dict, insider_meta=None) -> str:
     d = now_et.strftime("%Y-%m-%d")
     lines = [f"# 开盘异动 — {d} ({now_et:%H:%M} ET)", ""]
     lines += regime_block(regime)
@@ -3498,7 +3670,13 @@ def render_open(results, regime, now_et, s: dict) -> str:
                 when = "今天" if days == 0 else f"{days} 天内"
                 alerts.append(f"- **{sym}** 财报 {when} ({r['earnings']}) — "
                               f"short option 不跨财报; LEAP 等财报后")
-    lines += alerts or ["- 无异动 (gap/波动/价值区/财报 均未触发)"]
+    if insider_meta is not None:
+        # 新申报的内部人买入: Form 4 大多在美东收盘后提交, 开盘报告正好接上
+        alerts += insider_new_lines(results)
+        alerts += insider_status_lines(results, insider_meta)
+    lines += alerts or [("- 无异动 (gap/波动/价值区/财报/内部人买入 均未触发)"
+                         if insider_meta is not None else
+                         "- 无异动 (gap/波动/价值区/财报 均未触发)")]
     lines += ["", "---",
               "开盘扫描只做提醒 — 右侧确认以收盘为准, 见尾盘报告。数据 ~15min 延迟。"]
     return "\n".join(lines)
@@ -3528,6 +3706,7 @@ _MARK_COLORS = {
     "🟢": ("#f0fdf4", "#16a34a"),   # LEAP 票 — 绿
     "🔵": ("#eff6ff", "#2563eb"),   # CSP 票 — 蓝
     "👀": ("#f5f3ff", "#7c3aed"),   # 关注 — 紫
+    "🆕": ("#ecfeff", "#0891b2"),   # 内部人买入新申报 — 青
 }
 
 
@@ -3946,6 +4125,8 @@ def main() -> int:
                     help="skip option chains (fast technicals-only pass)")
     ap.add_argument("--email", action="store_true",
                     help="email the report after writing it (SCAN_SMTP_* env)")
+    ap.add_argument("--no-insider", action="store_true",
+                    help="skip SEC Form 4 insider-buy fetch")
     ap.add_argument("--workers", type=int, default=4)
     args = ap.parse_args()
 
@@ -4017,6 +4198,15 @@ def main() -> int:
                     e = ""
                 results_by_sym[sym]["earnings"] = e
 
+    # 内部人买入: 两个模式都拉 (新申报哪次扫描先看到就哪次报), 顺序请求遵守
+    # SEC 限速; 缓存后每次只有十几个请求。"已报过"在报告写盘后才记 (见下)
+    insider_meta = None
+    if not args.no_insider:
+        insider_meta = attach_insider(results, tickers, hist, now_et.date())
+        print(f"  insider: {insider_meta.get('requests', 0)} SEC 请求"
+              + ("" if insider_meta.get("enabled")
+                 else f" (未启用: {insider_meta.get('reason')})"))
+
     ivdf = load_iv_history()
     if mode == "close":
         if manual:
@@ -4045,12 +4235,20 @@ def main() -> int:
             _n = append_journal(journal_rows(results, d, mode, regime))
             if _n:
                 print(f"  journal: +{_n} 条推荐记录 -> {JOURNAL.name}")
-        report = render_close(results, regime, ivdf, now_et)
+        report = render_close(results, regime, ivdf, now_et, insider_meta)
     else:
-        report = render_open(results, regime, now_et, settings)
+        report = render_open(results, regime, now_et, settings, insider_meta)
 
     REPORTS.mkdir(exist_ok=True)
     report_path.write_text(report + "\n", encoding="utf-8")
+    # 报告落盘之后才记内部人买入"已报过"; 手工跑不记 —— 与 state/iv history
+    # 同一个 manual 闸, 免得定时扫描把真正的新申报当旧的吞掉
+    if insider_meta and insider_meta.get("enabled") and not manual:
+        try:
+            insider.mark_seen(insider_meta, now_et.date(), DATA)
+        except OSError as e:
+            print(f"  insider: 记录已报过失败 ({e}) — 下次扫描会重报",
+                  file=sys.stderr)
     latest = {
         "mode": mode, "generated_et": now_et.isoformat(), "regime": regime,
         "results": [{k: v for k, v in r.items() if k != "cfg"} for r in results],

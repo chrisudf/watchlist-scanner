@@ -63,6 +63,8 @@ launchd 每天在 8 个固定布里斯班时点触发 (23:45/00:45/01:30 开盘�
 .venv/bin/python scanner.py --mode open --force           # 开盘异动
 .venv/bin/python scanner.py --mode close --force --tickers NVDA,MSFT
 .venv/bin/python scanner.py --mode close --force --no-options   # 只看技术面(快)
+.venv/bin/python scanner.py --mode close --force --no-insider   # 不拉内部人数据
+.venv/bin/python insider.py SOFI HOOD                          # 单看内部人买入 (也用来预热缓存)
 ```
 
 加 `--email` 会在写完报告后推送 (环境变量配置, 见 droplet 节; 邮件失败
@@ -72,7 +74,7 @@ droplet 的出站 SMTP (25/465/587/2525 一律静默超时, 443 正常), Gmail S
 在那种机器上永远连不上。
 
 `--force` 或 `--tickers` 视为手动测试运行: 报告写到 `*-manual.md`,
-**不推进状态机、不写 IV 历史** — 盘中随便试跑, 不会污染当天真正的
+**不推进状态机、不写 IV 历史、不记内部人买入"已报过"** — 盘中随便试跑, 不会污染当天真正的
 定时扫描 (定时扫描的去重只看正式报告名)。盘外跑时合约价来自最近成交
 (报告会标注), 仅供参考。
 
@@ -247,6 +249,9 @@ python3 -m venv .venv && .venv/bin/pip install yfinance pandas numpy
 
 # 2. 邮件配置: 复制模板并填 Resend api key (云上) 或 SMTP 凭据 (本机)
 cp deploy/.env.example .env && chmod 600 .env && vi .env
+#    内部人买入要 SEC_EMAIL=你的邮箱 (SEC 要求 User-Agent 带联系方式);
+#    第一次先预热缓存 (约 900 份 Form 4, 单次上限 400 份, 跑到没有"未拉全")
+SEC_EMAIL=... .venv/bin/python insider.py
 
 # 3. 先手动验证一封
 .venv/bin/python scanner.py --mode close --force --email
@@ -325,6 +330,35 @@ zone 建议同时填 `zone_asof = 2026-09-05` (校准日期); 收盘扫描会盯
 归零重新观察); 提示首发 + 每 7 天重复, 不刷屏。阈值都在 `[settings]`
 (`zone_asof_stale_days` / `zone_drift_*` / `zone_floor_instant_pct` /
 `zone_flag_repeat_days`)。
+
+## 内部人买入 (SEC Form 4, 2026-10)
+
+watchlist 里的个股 (ETF/指数跳过) 出现**公开市场买入**时提示。只做参考,
+不进状态机、不当门控、不改任何票据。
+
+- **开盘报告**: 新申报的买入一份一行 (🆕), 带成交价相对价值区的位置。
+  Form 4 大多在美东收盘后提交, 第二天开盘报告正好接上; 白天提交的由
+  尾盘报告接。每份申报只报一次 (`data/insider_seen.json`, 手动跑不记)。
+- **尾盘报告**: 概览表后面一段"内部人买入 (近 180 天)": 先列新申报,
+  再按金额列各标的汇总 (人数/笔数/金额/均价与价值区/最近一笔/30 天内
+  多人买入)。
+- **推荐流水账**: CSP/LEAP 每张票带 `insider_buyers_90d` /
+  `insider_buy_usd_90d` (None = 没查全, 0 = 查全了确实没有), 留给以后
+  `review.py` 按"开仓前有没有内部人买入"分组复盘 —— 样本够了再决定要不要
+  升级成信号。
+
+**口径** (2026-10-05 定): 只看买入 (代码 P), 卖出不统计 —— 大票的计划
+卖出/扣税/行权几乎天天有, 推了只剩噪音。单笔或同一人同一周合计 ≥ $2.5 万。
+剔除员工购股计划 (脚注/持有方式写 ESPP, 或同日同价 ≥5 人)。
+
+**数据源**: SEC EDGAR 一手 (openinsider / secform4 是它的二次加工; SOFI 近
+一年 7 笔买入逐条对上)。环境变量 `SEC_EMAIL` 没设 = 整段降级成一行"未启用"。
+解析结果按申报编号缓存在 `data/form4_cache.json`, 稳态每次扫描十几个请求。
+取数失败会在报告里写出来 —— **失败不等于没有买入**。
+
+**成交价单位**: 拿成交当天收盘价校验, 比值超出 1.5 倍就不和价值区比。TSM
+高管买的是台股普通股 (价格由新台币折算, 1 ADR = 5 股), 拆股前的旧价格同理
+(日线是复权的, Form 4 不是)。
 
 ## 推荐复盘 / 胜率 (`review.py`)
 
@@ -703,4 +737,7 @@ LEAP 段除了聚合数还给**逐笔明细**: 标的 / 入手日期 / 到期日
   (旗标已设 −1.0 pts 噪声地板) — 倒挂旗标亮了先在
   moomoo/IBKR vol lab 实查 risk reversal 再行动; 链稀疏 (|Δ−0.25|>0.10
   无行权价) 时宁可无读数也不硬凑。
+- 内部人买入只看 submissions 的 recent 列表 (约最近 1000 份申报), 覆盖
+  不到 200 天窗口时报告标"不完整"而不去拉分页文件; 10% 股东 (基金) 的
+  买入照报, 但身份标签只写"10%股东"。
 - 建议只做建议, 不碰下单。合约价是 mid 估算, 下单前实查盘口。
