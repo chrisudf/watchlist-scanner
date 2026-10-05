@@ -9,11 +9,13 @@ import io
 import json
 import math
 import re
+import sys
 import tempfile
 import unittest
 import urllib.error as _urlerr
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -4743,6 +4745,168 @@ class TestScannerInsider(unittest.TestCase):
         self.assertIn("内部人模块异常", rs[0]["insider"]["error"])
         self.assertIsNone(rs[1]["insider"])
         self.assertTrue(meta["enabled"])
+
+class TestInsiderEvening(unittest.TestCase):
+    """晚间内部人检查 (--mode insider): cron 时点 / 窗口、zone 作废、发信与"已报过"。"""
+
+    BNE = ZoneInfo("Australia/Brisbane")
+    UTC = ZoneInfo("UTC")
+
+    def _fires_in_window(self, tz, hm_list, day):
+        """某个本地日期的几个 cron 时点里, 落进晚间窗口 (且美东是工作日) 的有几个。"""
+        n = 0
+        for h, m in hm_list:
+            et = datetime(day.year, day.month, day.day, h, m, tzinfo=tz).astimezone(sc.ET)
+            if et.weekday() < 5 and sc.in_window(et, sc.INSIDER_WINDOW):
+                n += 1
+        return n
+
+    def test_cron_pairs_fire_exactly_once_per_us_weekday(self):
+        # 布里斯班时钟 (droplet 实际): 12:15 / 13:15 周二到周六; UTC 模板: 02:15 / 03:15
+        for tz, hms in ((self.BNE, [(12, 15), (13, 15)]),
+                        (self.UTC, [(2, 15), (3, 15)])):
+            for start in (date(2026, 7, 14), date(2026, 1, 13),     # 美国夏令时 / 冬令时
+                          date(2026, 3, 10), date(2026, 11, 3)):    # 切换周前后
+                for k in range(5):                                  # 本地周二..周六
+                    day = start + timedelta(days=k)
+                    self.assertEqual(day.weekday() in (1, 2, 3, 4, 5), True)
+                    self.assertEqual(self._fires_in_window(tz, hms, day), 1,
+                                     f"{tz} {day}")
+                # 本地周日/周一 (= 美东周六/周日晚上) 一发都不跑
+                for k in (5, 6):
+                    day = start + timedelta(days=k)
+                    self.assertEqual(self._fires_in_window(tz, hms, day), 0,
+                                     f"{tz} {day}")
+
+    def test_crontab_example_matches_window(self):
+        text = (Path(sc.BASE) / "deploy" / "crontab.example").read_text(encoding="utf-8")
+        lines = [l for l in text.splitlines() if "run_scan.sh insider" in l]
+        self.assertEqual([l.split()[:5] for l in lines],
+                         [["15", "2", "*", "*", "2-6"], ["15", "3", "*", "*", "2-6"]])
+
+    def test_zone_invalid_for(self):
+        cfg = {"value_zone": [13.0, 16.0], "zone_asof": "2026-09-05"}
+        sig = sc.zone_sig(cfg["value_zone"], cfg["zone_asof"])
+        self.assertIsNone(sc.zone_invalid_for(cfg, None, {}))
+        sticky = {"zone_split": {"sig": sig, "info": "拆股 2:1 @ 2026-09-20"}}
+        self.assertEqual(sc.zone_invalid_for(cfg, None, sticky), "拆股 2:1 @ 2026-09-20")
+        # 重锚过 (sig 变了) = 旧的作废记录不再生效
+        old = {"zone_split": {"sig": "other", "info": "x"}}
+        self.assertIsNone(sc.zone_invalid_for(cfg, None, old))
+        idx = pd.to_datetime(["2026-09-04", "2026-09-21"])
+        hist = pd.DataFrame({"Close": [18.0, 9.0], "Stock Splits": [0.0, 2.0]}, index=idx)
+        self.assertEqual(sc.zone_invalid_for(cfg, hist, {}), "拆股 2:1 @ 2026-09-21")
+        self.assertIsNone(sc.zone_invalid_for({"value_zone": None}, hist, {}))
+
+    # ---- run_insider_check ------------------------------------------------------
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.reports, self.data = root / "reports", root / "data"
+        self.sent, self.runs = [], 0
+        self.fail_email = False
+        self.news = True
+        ev = TestScannerInsider._event(TestScannerInsider())
+        self.summary = ins.summarize([_b("2026-10-05", 13888, 18.06)], date(2026, 10, 5))
+
+        def fake_run(symbols, today, **kw):
+            self.runs += 1
+            return {"enabled": True, "reason": None, "requests": 2, "by_symbol": {
+                "SOFI": {"cik": SOFI, "summary": self.summary, "summary90": None,
+                         "new": [dict(ev, acc="acc-1")] if self.news else [],
+                         "missing": 0, "partial_history": False},
+                # HOOD 有汇总但没有新申报 —— 晚间邮件不该提它
+                "HOOD": {"cik": 1, "summary": self.summary, "summary90": None, "new": [],
+                         "missing": 0, "partial_history": False}}}
+
+        def fake_send(path, subject):
+            if self.fail_email:
+                raise RuntimeError("smtp down")
+            self.sent.append((path.name, subject))
+
+        cfg = lambda zone: {**sc.TICKER_DEFAULTS, "value_zone": zone}
+        tickers = {"SOFI": cfg([13.0, 16.0]), "HOOD": cfg([85.0, 105.0]),
+                   "QQQ": {**sc.TICKER_DEFAULTS, "kind": "index"}}
+        self.patches = [mock_attr(sc, "REPORTS", self.reports), mock_attr(sc, "DATA", self.data),
+                        mock_attr(sc, "load_config", lambda: (dict(sc.SETTINGS_DEFAULTS), tickers)),
+                        mock_attr(sc, "batch_history", lambda syms: {s_: None for s_ in syms}),
+                        mock_attr(sc, "load_state", lambda: {}),
+                        mock_attr(sc.insider, "run", fake_run),
+                        mock_attr(sc, "send_email_report", fake_send)]
+        for p_ in self.patches:
+            p_.__enter__()
+
+    def tearDown(self):
+        for p_ in reversed(self.patches):
+            p_.__exit__()
+        self.tmp.cleanup()
+
+    def _args(self, **kw):
+        import argparse
+        return argparse.Namespace(**{"force": False, "tickers": None, "email": True, **kw})
+
+    MON_2215 = datetime(2026, 10, 5, 22, 15, tzinfo=sc.ET)
+
+    def _check(self, args, t):
+        import contextlib
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            return sc.run_insider_check(args, t)
+
+    def _seen(self):
+        p_ = self.data / ins.SEEN_NAME
+        return json.loads(p_.read_text(encoding="utf-8")) if p_.exists() else {}
+
+    def test_outside_window_and_weekend_skip_without_fetching(self):
+        for t in (datetime(2026, 10, 5, 21, 59, tzinfo=sc.ET),
+                  datetime(2026, 10, 5, 23, 0, tzinfo=sc.ET),
+                  datetime(2026, 10, 10, 22, 15, tzinfo=sc.ET)):     # 周六
+            self.assertEqual(self._check(self._args(), t), sc.SKIP)
+        self.assertEqual(self.runs, 0)
+
+    def test_no_news_is_silent(self):
+        self.news = False
+        self.assertEqual(self._check(self._args(), self.MON_2215), sc.SKIP)
+        self.assertEqual(self.sent, [])
+        self.assertFalse(self.reports.exists() and any(self.reports.iterdir()))
+
+    def test_news_emailed_then_marked_seen(self):
+        self.assertEqual(self._check(self._args(), self.MON_2215), 0)
+        self.assertEqual(self.sent, [("2026-10-05-insider.md",
+                                      "[watchlist] 2026-10-05 内部人买入 — SOFI")])
+        self.assertTrue((self.reports / "2026-10-05-insider.sent").exists())
+        self.assertIn("acc-1", self._seen())
+        text = (self.reports / "2026-10-05-insider.md").read_text(encoding="utf-8")
+        self.assertIn("🆕 **SOFI** 内部人买入", text)
+        self.assertIn("## 这几只近 180 天的汇总", text)
+        self.assertNotIn("**HOOD**", text)         # 没有新申报的标的不进晚间邮件
+
+    def test_email_failure_leaves_it_for_the_open_report(self):
+        self.fail_email = True
+        self.assertEqual(self._check(self._args(), self.MON_2215), 1)
+        self.assertEqual(self._seen(), {})
+        self.assertFalse((self.reports / "2026-10-05-insider.sent").exists())
+
+    def test_manual_run_never_marks_seen(self):
+        self.assertEqual(self._check(self._args(force=True), self.MON_2215), 0)
+        self.assertEqual(self.sent[0][0], "2026-10-05-insider-manual.md")
+        self.assertTrue(self.sent[0][1].endswith(" manual"))
+        self.assertEqual(self._seen(), {})
+
+    def test_without_email_nothing_is_marked(self):
+        self.assertEqual(self._check(self._args(email=False), self.MON_2215), 0)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self._seen(), {})
+
+    def test_main_routes_insider_mode(self):
+        calls = []
+        with mock_attr(sc, "run_insider_check", lambda a, t: calls.append(a.mode) or 42), \
+                mock_attr(sc, "resend_pending_reports", lambda d, t: calls.append("resend")), \
+                mock_attr(sys, "argv", ["scanner.py", "--mode", "insider", "--email"]):
+            self.assertEqual(sc.main(), 42)
+        # 晚间这发也当 open/close 的补发班车
+        self.assertEqual(calls, ["resend", "insider"])
 
 
 if __name__ == "__main__":

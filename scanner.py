@@ -89,6 +89,10 @@ SKIP = 3                         # exit code for intentional no-op runs
 # a window runs, the rest exit SKIP. Duplicates are caught by report-exists.
 OPEN_WINDOW = ((9, 40), (10, 50))
 CLOSE_WINDOW = ((15, 30), (16, 5))
+# 晚间内部人检查 (--mode insider)。EDGAR 每天美东 22:00 停止收件, 当天的
+# Form 4 到这时已经齐了 (实测 71% 在收盘后 16:00-22:00 提交)。cron 在布里斯班
+# 12:15 / 13:15 各一发 (= 22:15 EDT / 22:15 EST), 窗口只放过 22 点那一发
+INSIDER_WINDOW = ((22, 5), (22, 59))
 
 MAX_STALE_TRADE_DAYS = 5         # option lastPrice older than this = unusable
 
@@ -3164,6 +3168,108 @@ def insider_block(results, meta) -> list[str]:
     return lines
 
 
+def zone_invalid_for(cfg: dict, hist, prev_state: dict | None) -> str | None:
+    """晚间检查用的 zone 作废判定 —— 与 analyze_ticker 同一口径 (state 里
+    的粘性作废 + zone_asof 之后的拆股), 只读不写: 晚间不推进任何状态。"""
+    zone = cfg.get("value_zone")
+    if zone is None:
+        return None
+    prev_split = (prev_state or {}).get("zone_split")
+    if prev_split and prev_split.get("sig") == zone_sig(zone, cfg.get("zone_asof")):
+        return prev_split["info"]
+    split = split_after(hist, cfg.get("zone_asof"))
+    if split:
+        sd, ratio = split
+        return (f"拆股 {ratio:g}:1 @ {sd}" if ratio >= 1
+                else f"合股 1:{1 / ratio:g} @ {sd}")
+    return None
+
+
+def render_insider_evening(results, meta, now_et) -> str:
+    """晚间邮件: 只在有新买入时才发, 所以正文就是新申报 + 这几只的汇总。"""
+    d = now_et.strftime("%Y-%m-%d")
+    lines = [f"# 内部人买入 — {d} 晚间 ({now_et:%H:%M} ET)", ""]
+    lines += insider_new_lines(results)
+    lines += insider_status_lines(results, meta)
+    digest = [insider_digest_line(r["symbol"], r["insider"]["summary"], _live_zone(r))
+              for r in results
+              if (r.get("insider") or {}).get("new") and r["insider"].get("summary")]
+    if digest:
+        lines += ["", f"## 这几只近 {insider.WINDOW_DAYS} 天的汇总", ""] + digest
+    lines += ["",
+              f"> SEC 每天美东 22:00 停止收件, 以上是今天新收到的公开市场买入 "
+              f"(单笔或同一人同一周合计 ≥{usd_short(insider.FLOOR_USD)}, 已剔除员工"
+              "购股计划)。明早开盘报告不再重复。只做参考, 不影响任何信号和票据。"]
+    return "\n".join(lines)
+
+
+def run_insider_check(args, now_et: datetime) -> int:
+    """--mode insider: 晚间只查内部人买入, 有新买入才写报告、发邮件.
+
+    比次日开盘报告早约 11 小时 (布里斯班中午), 赶在盘前。没有新买入 = SKIP,
+    不发信; 取数失败也只进日志 —— 次日开盘报告会照常重试并写出失败。
+
+    "已报过"只在邮件**发送成功之后**才记: 发信失败时这几条留给次日开盘报告
+    再报一次 (补发只管 open/close, 晚间报告靠这条兜底)。手工 --force /
+    --tickers 不记, 理由同扫描。"""
+    if not args.force and (now_et.weekday() >= 5
+                           or not in_window(now_et, INSIDER_WINDOW)):
+        print(f"outside insider window ({now_et:%a %H:%M} ET) — skip")
+        return SKIP
+    manual = args.force or bool(args.tickers)
+    d = now_et.strftime("%Y-%m-%d")
+    settings, tickers = load_config()
+    if args.tickers:
+        keep = {t.strip().upper() for t in args.tickers.split(",")}
+        tickers = {k: v for k, v in tickers.items() if k in keep}
+    stocks = [s_ for s_, c in tickers.items() if c["kind"] == "stock"]
+    hist = batch_history(stocks) if stocks else {}
+    state = load_state()
+    results = []
+    for s_ in stocks:
+        r = {"symbol": s_, "cfg": tickers[s_]}
+        why = zone_invalid_for(tickers[s_], hist.get(s_), state.get(s_))
+        if why:
+            r["zone_invalid"] = why
+        results.append(r)
+
+    meta = attach_insider(results, tickers, hist, now_et.date())
+    print(f"insider {d} {now_et:%H:%M} ET — {len(stocks)} tickers, "
+          f"{meta.get('requests', 0)} SEC 请求"
+          + ("" if meta.get("enabled") else f" (未启用: {meta.get('reason')})"))
+    hits = [r["symbol"] for r in results if (r.get("insider") or {}).get("new")]
+    if not hits:
+        for line in insider_status_lines(results, meta):
+            print(line)
+        print("no new insider buys — skip")
+        return SKIP
+
+    report_path = REPORTS / f"{d}-insider{'-manual' if manual else ''}.md"
+    report = render_insider_evening(results, meta, now_et)
+    REPORTS.mkdir(exist_ok=True)
+    report_path.write_text(report + "\n", encoding="utf-8")
+    print(report)
+    print(f"\nREPORT {report_path}")
+    if not args.email:
+        return 0            # 没发信就不算报过, 明早开盘报告照常报
+    subject = (f"[watchlist] {d} 内部人买入 — {', '.join(hits)}"
+               + (" manual" if manual else ""))
+    try:
+        send_email_report(report_path, subject)
+        _sent_marker(report_path).write_text(now_et.isoformat(), encoding="utf-8")
+        print(f"email sent to {os.environ.get('SCAN_EMAIL_TO')}")
+    except Exception as e:
+        print(f"EMAIL FAILED: {e} — 未记已报过, 明早开盘报告会再报",
+              file=sys.stderr)
+        return 1
+    if not manual:
+        try:
+            insider.mark_seen(meta, now_et.date(), DATA)
+        except OSError as e:
+            print(f"  insider: 记录已报过失败 ({e}) — 明早会重报", file=sys.stderr)
+    return 0
+
+
 def fmt(x, spec=".2f", suffix=""):
     if x is None or (isinstance(x, float) and math.isnan(x)):
         return "—"
@@ -4117,7 +4223,9 @@ def batch_history(symbols: list[str]) -> dict[str, pd.DataFrame | None]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="左右侧 watchlist 扫描器")
-    ap.add_argument("--mode", choices=["open", "close", "auto"], default="auto")
+    ap.add_argument("--mode", choices=["open", "close", "auto", "insider"],
+                    default="auto",
+                    help="insider = 晚间只查内部人买入 (美东 22:05-22:59)")
     ap.add_argument("--force", action="store_true",
                     help="ignore window/duplicate/market-live gates")
     ap.add_argument("--tickers", help="comma-separated subset (testing)")
@@ -4136,6 +4244,8 @@ def main() -> int:
     # 报告名, manual 报告不补
     if args.email and not args.force and not args.tickers:
         resend_pending_reports(now_et.strftime("%Y-%m-%d"), now_et)
+    if args.mode == "insider":
+        return run_insider_check(args, now_et)
     mode = resolve_mode(args.mode, now_et)
     if mode is None:
         if args.force:

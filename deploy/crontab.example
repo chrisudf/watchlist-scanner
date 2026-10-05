@@ -16,6 +16,13 @@
 45 20 * * 1-5 /opt/watchlist-scanner/deploy/run_scan.sh   # 15:45 EST close (US winter; EDT=16:45, skip)
 30 22 * * 1-5 /opt/watchlist-scanner/deploy/run_scan.sh watchdog   # 报告缺失 -> 邮件报警
 
+# ---- 晚间内部人检查 ----
+# EDGAR 美东 22:00 停止收件; 22:15 查一次当天新申报的内部人买入, 有才发邮件。
+# 美东周一到周五晚上 = UTC 次日, 所以是 2-6。两条同样靠窗口门 (22:05-22:59 ET)
+# 挑对的一条。布里斯班时钟的机器上写成 "15 12 * * 2-6" 和 "15 13 * * 2-6"。
+15 2 * * 2-6 /opt/watchlist-scanner/deploy/run_scan.sh insider   # 22:15 EDT (US summer)
+15 3 * * 2-6 /opt/watchlist-scanner/deploy/run_scan.sh insider   # 22:15 EST (US winter; EDT=23:15, skip)
+
 # ---- 推荐复盘 (月度) ----
 # 每月 1 号跑一次, 出 markdown 并邮寄。为什么是月度不是周度: CSP 是 12-31 DTE,
 # 一笔要三周左右才结算; 按当前出票节奏一周只多出一两笔已结算样本, 而 delta 基准
