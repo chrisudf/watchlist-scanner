@@ -24,6 +24,15 @@ SEC 合规: User-Agent 必须带联系邮箱 (环境变量 SEC_EMAIL), 限速 10
      ADR 是 5 股一份 —— 成交价不能直接拿去对比价值区。用当天收盘价校验单位,
      顺带挡住拆股前的旧价格 (日线是复权的, Form 4 价格不是)。
 
+PR #23 评审补的两个 (2026-10-05, 用 EDGAR 全文检索拉真实申报核实):
+  5. 代码 P 的定义是"公开市场**或私下**购买": 私募认购、PIPE、直接向公司买、
+     IPO 定向配售 (同日几位董事按 $33 发行价认购)、SPAC 发起人私募单位都记 P。
+     6-9 月正文提到 "private placement" 的 Form 4 有 143 份。按交易本身的
+     脚注剔除, 脚注里写了 "open market" 的不剔。
+  6. 修正申报 4/A: 实测 6 份全是整份重报原申报再补漏/改错, 也有只重报改动
+     那一行的。按 (申报人, 交易日) 让更新的申报覆盖旧的, 不按数字去重 ——
+     改了股数/价格的修正按数字对不上, 会重复计。
+
 命令行 (部署时预热缓存 / 手工看一眼):
     SEC_EMAIL=you@example.com .venv/bin/python insider.py [SOFI HOOD ...]
 不带代码 = watchlist.toml 里全部个股。
@@ -51,7 +60,9 @@ REQUEST_GAP = 0.12          # SEC 限速 10 次/秒, 留余量
 TIMEOUT = 20
 # 缓存里的解析结果版本。改了 parse_form4 的输出 (比如以后要卖出) 就 +1,
 # 旧条目自动重拉, 不用手动清缓存
-PARSE_VERSION = 1
+#   1  2026-10-05 首版
+#   2  2026-10-05 加 txn_dates / orig_date (4/A 按交易日覆盖原申报)
+PARSE_VERSION = 2
 
 FLOOR_USD = 25_000          # 单笔或同一人同一 ISO 周合计 (用户 2026-10-05 拍板)
 WINDOW_DAYS = 180           # 报告里的汇总窗口 (按交易日)
@@ -76,6 +87,20 @@ PLAN_RE = re.compile(
     r"|dividend reinvest|\bDRIP\b|401\s*\(k\)", re.I)
 _TXN_PARTS = ("securityTitle", "transactionDate", "transactionCoding",
               "transactionAmounts")
+# 记成代码 P 的私下购买 (坑 5)。措辞取自 2026-06~09 的真实申报: 私募认购、
+# PIPE、"purchased ... directly from the Issuer"、Securities Purchase
+# Agreement、IPO 定向配售 (directed share program)、SPAC 私募单位、在承销
+# 发行里认购。同样只看交易本身的脚注和持有方式; 写了 "open market" 的照留
+# (OPEN_MARKET_RE) —— 宁可漏剔一笔私募, 不误杀真买入
+PRIVATE_RE = re.compile(
+    r"private placement|privately negotiated|\bPIPE\b|private units?\b"
+    r"|placement units?\b|securities purchase agreement|subscription agreement"
+    r"|directed share program|registered direct|rights offering"
+    r"|underwritten (?:public )?offering"
+    r"|\b(?:purchased|acquired|bought)\b[^.]{0,120}?\bfrom the (?:issuer|company)\b"
+    r"|\b(?:in|through|in connection with)\b[^.]{0,40}?\b(?:initial )?public offering",
+    re.I)
+OPEN_MARKET_RE = re.compile(r"open[- ]market", re.I)
 
 CACHE_NAME = "form4_cache.json"
 SEEN_NAME = "insider_seen.json"
@@ -158,8 +183,9 @@ def parse_form4(xml: bytes) -> dict:
             "ten_pct": _bool(_text(rel, "isTenPercentOwner")),
             "title": _text(rel, "officerTitle"),
         })
-    rows = []
+    rows, txn_dates = [], set()
     for t in root.findall("nonDerivativeTable/nonDerivativeTransaction"):
+        txn_dates.add(_text(t, "transactionDate/value")[:10])
         if _text(t, "transactionCoding/transactionCode") != "P":
             continue
         ids = set()
@@ -184,6 +210,10 @@ def parse_form4(xml: bytes) -> dict:
         "owners": owners,
         "plan": _bool(_text(root, "aff10b5One")),
         "rows": rows,
+        # 4/A 覆盖原申报用 (坑 6): 本份申报涉及的全部交易日 (任何代码 —— 4/A
+        # 可能把 A 改成 P, 也可能反过来), 以及它修正的是哪天提交的原申报
+        "txn_dates": sorted(d for d in txn_dates if d),
+        "orig_date": _text(root, "dateOfOriginalSubmission")[:10],
     }
 
 
@@ -241,20 +271,26 @@ def open_market_buys(filings: list[dict], issuer_cik: int,
                      ) -> list[dict]:
     """[{acc, filed, form, doc}] -> 合格的公开市场买入, 一行一笔交易.
 
-    过滤顺序: 发行人 (坑 1) → 代码 P + 取得 → 公司代买计划 (坑 2: 脚注/持有
-    方式, 再加同日同价 ≥5 人兜底) → 修正申报 4/A 重复报的同一笔去重 → 同一人
-    同一周合计 ≥ floor。价格缺失的行不计金额, 但同周其他行过线时一起保留。"""
+    过滤顺序: 发行人 (坑 1) → 被更新的 4/A 覆盖的行 (坑 6) → 代码 P + 取得 →
+    公司代买计划 (坑 2: 脚注/持有方式, 再加同日同价 ≥5 人兜底) → 私下购买
+    (坑 5) → 同一人同一周合计 ≥ floor。价格缺失的行不计金额, 但同周其他行
+    过线时一起保留。"""
+    mine = [f for f in filings
+            if f["doc"].get("issuer_cik") == issuer_cik and f["doc"].get("owners")]
     cand = []
-    for f in sorted(filings, key=lambda f: (f["filed"], f["acc"])):
+    for f in sorted(mine, key=lambda f: (f["filed"], f["acc"])):
         doc = f["doc"]
-        if doc.get("issuer_cik") != issuer_cik or not doc.get("owners"):
-            continue
         owners = doc["owners"]
-        key = owners[0]["cik"] or owners[0]["name"]
+        key = _owner_key(owners)
         for r in doc.get("rows", []):
             if r["ad"] != "A" or not r["shares"] or not r["date"]:
                 continue
-            if PLAN_RE.search(" ".join(r["notes"]) + " " + r["nature"]):
+            if _superseded(f, key, r["date"], mine):
+                continue
+            text = " ".join(r["notes"]) + " " + r["nature"]
+            if PLAN_RE.search(text):
+                continue
+            if PRIVATE_RE.search(text) and not OPEN_MARKET_RE.search(text):
                 continue
             value = r["shares"] * r["price"] if r["price"] else None
             close = ref_close(r["date"]) if ref_close else None
@@ -274,24 +310,45 @@ def open_market_buys(filings: list[dict], issuer_cik: int,
     cand = [c for c in cand
             if len(owners_at[(c["date"], c["price"])]) < ESPP_CLUSTER_MIN]
 
-    # 修正申报 (4/A) 常把原申报的交易整行重报一遍 —— 只拿 4/A 跟**别的**
-    # 申报比对去重。同一份申报里两行一模一样是真实的两笔: TSM 一份申报里
-    # 同日两笔 1,000 股 @77.09 (家庭成员名下), 按内容去重会吞掉一笔
-    accs_of = defaultdict(set)
-    deduped = []
-    for c in cand:
-        k = (c["owner_key"], c["date"], c["shares"], c["price"])
-        if c["form"] == "4/A" and accs_of[k] - {c["acc"]}:
-            continue
-        accs_of[k].add(c["acc"])
-        deduped.append(c)
-
     week_sum = defaultdict(float)
-    for c in deduped:
+    for c in cand:
         if c["value"]:
             week_sum[(c["owner_key"], _iso_week(c["date"]))] += c["value"]
-    return [c for c in deduped
+    return [c for c in cand
             if week_sum[(c["owner_key"], _iso_week(c["date"]))] >= floor]
+
+
+def _owner_key(owners: list[dict]) -> str:
+    return owners[0]["cik"] or owners[0]["name"]
+
+
+def _superseded(f: dict, owner_key: str, txn_date: str, filings: list[dict]) -> bool:
+    """f 里这一天的交易是否已被同一申报人更新的 4/A 覆盖 (坑 6).
+
+    4/A 通常整份重报原申报再补漏/改错 (实测 6 份全是), 也有只重报改动那一行
+    的, 所以按交易日覆盖而不是整份: 4/A 里出现的日期, 被它修正的申报里同一天
+    的行作废, 其他日期的行保留。被修正的申报靠 dateOfOriginalSubmission ==
+    原申报的申报日对上 (同一份原申报的多次修正, 最新的那份为准); 4/A 没写
+    原申报日就按"同一人更早的申报"处理。同一份申报内部两行一模一样是真实的
+    两笔 (TSM 同日两笔 1,000 股 @77.09, 家庭成员名下), 永不互相覆盖。改了
+    交易日期本身的修正对不上, 会重复计一次 —— 罕见, 接受。"""
+    for a in filings:
+        if a["form"] != "4/A" or a["acc"] == f["acc"]:
+            continue
+        if (a["filed"], a["acc"]) <= (f["filed"], f["acc"]):
+            continue                    # 只有更新的申报才能覆盖
+        if _owner_key(a["doc"]["owners"]) != owner_key:
+            continue
+        if txn_date not in a["doc"].get("txn_dates", ()):
+            continue
+        orig = a["doc"].get("orig_date")
+        if not orig:
+            return True
+        if f["form"] == "4/A" and f["doc"].get("orig_date") == orig:
+            return True                 # 同一份原申报的旧修正
+        if f["form"] != "4/A" and f["filed"] == orig:
+            return True
+    return False
 
 
 def filing_events(buys: list[dict]) -> list[dict]:
@@ -313,8 +370,9 @@ def filing_events(buys: list[dict]) -> list[dict]:
             "shares": sum(b["shares"] for b in rows),
             "value": value,
             "avg_price": value / shares_p if priced and shares_p else None,
-            # 全部同单位才拿去对比价值区; 有任何一笔单位不对就整条不比
-            "units_ok": all(b["units_ok"] for b in rows),
+            # 三态: 任何一笔单位不同 = False; 否则有一笔查不到收盘 = None
+            # (未知, 不比也不说"单位不同"); 全部同单位 = True
+            "units_ok": _units_all(b["units_ok"] for b in rows),
             "indirect": any(b["direct"] == "I" for b in rows),
             "nature": next((b["nature"] for b in rows if b["nature"]), ""),
             "plan": any(b["plan"] for b in rows),
@@ -322,6 +380,15 @@ def filing_events(buys: list[dict]) -> list[dict]:
         })
     out.sort(key=lambda e: (e["filed"], e["date_hi"], e["acc"]), reverse=True)
     return out
+
+
+def _units_all(flags) -> bool | None:
+    flags = list(flags)
+    if any(f is False for f in flags):
+        return False
+    if any(f is None for f in flags):
+        return None
+    return True
 
 
 def _has_cluster(rows: list[dict], days: int = CLUSTER_DAYS) -> bool:
@@ -338,8 +405,9 @@ def _has_cluster(rows: list[dict], days: int = CLUSTER_DAYS) -> bool:
 
 def summarize(buys: list[dict], today: date,
               window_days: int = WINDOW_DAYS) -> dict | None:
-    """窗口内 (按交易日) 的买入汇总; 没有买入 = None。均价只用与股价同单位
-    的成交 (坑 4), 全部不同单位时 avg_price = None。"""
+    """窗口内 (按交易日) 的买入汇总; 没有买入 = None。均价只用确认与股价
+    同单位的成交 (坑 4); 单位不同 (False) 和查不到当天收盘 (None) 分开记,
+    报告里措辞不同。都没有可用的成交时 avg_price = None。"""
     start = (today - timedelta(days=window_days)).isoformat()
     rows = [b for b in buys if b["date"] >= start]
     if not rows:
@@ -362,7 +430,8 @@ def summarize(buys: list[dict], today: date,
                       if comp and comp_sh else None),
         "lo": min((b["price"] for b in comp), default=None),
         "hi": max((b["price"] for b in comp), default=None),
-        "units_mixed": len(comp) < len([b for b in rows if b["price"]]),
+        "units_mismatch": any(b["price"] and b["units_ok"] is False for b in rows),
+        "units_unknown": any(b["price"] and b["units_ok"] is None for b in rows),
         "cluster": _has_cluster(rows),
         "buyers": sorted(by_owner, key=lambda k: -by_owner[k]),
         "last": last,

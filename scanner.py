@@ -3085,11 +3085,13 @@ def insider_event_line(sym: str, e: dict, zone) -> str:
     if e["plan"]:
         line += " · 10b5-1 计划内"
     if e["avg_price"] and zone is not None:
-        if e["units_ok"]:
+        if e["units_ok"] is True:
             line += (f" · 价值区 {zone[0]:g}-{zone[1]:g}: "
                      f"{zone_position(e['avg_price'], zone)}")
-        else:
+        elif e["units_ok"] is False:
             line += " · 成交价与美股报价单位不同 (如台股普通股 vs ADR), 不对比价值区"
+        else:
+            line += " · 查不到成交日收盘价, 无法确认价格单位, 不对比价值区"
     return line
 
 
@@ -3104,10 +3106,16 @@ def insider_digest_line(sym: str, s: dict, zone) -> str:
             avg += (f", 价值区 {zone[0]:g}-{zone[1]:g}: "
                     f"{zone_position(s['avg_price'], zone)}")
         parts.append(avg)
-        if s["units_mixed"]:
+        if s["units_mismatch"]:
             parts.append("部分成交单位不同, 未计入均价")
-    elif s["units_mixed"]:
+        if s["units_unknown"]:
+            parts.append("部分成交查不到当天收盘价, 未计入均价")
+    elif s["units_mismatch"] and not s["units_unknown"]:
         parts.append("成交价与美股报价单位不同, 不算均价")
+    elif s["units_unknown"] and not s["units_mismatch"]:
+        parts.append("查不到成交日收盘价, 不算均价")
+    elif s["units_mismatch"]:
+        parts.append("成交价单位不同或查不到当天收盘价, 不算均价")
     last = s["last"]
     parts.append(f"最近 {last['date_hi'][5:]} {last['owner']} ({last['role']}) "
                  f"{usd_short(last['value'])}")
@@ -3162,7 +3170,7 @@ def insider_block(results, meta) -> list[str]:
         lines.append("- 无")
     lines += ["",
               f"> 只统计公开市场买入 (Form 4 代码 P), 单笔或同一人同一周合计 "
-              f"≥{usd_short(insider.FLOOR_USD)}, 已剔除员工购股计划; 卖出不统计。"
+              f"≥{usd_short(insider.FLOOR_USD)}, 已剔除员工购股计划和私募/认购; 卖出不统计。"
               "🆕 = 上次扫描以来的新申报。只做参考, 不影响任何信号和票据。",
               ""]
     return lines
@@ -3199,7 +3207,7 @@ def render_insider_evening(results, meta, now_et) -> str:
     lines += ["",
               f"> SEC 每天美东 22:00 停止收件, 以上是今天新收到的公开市场买入 "
               f"(单笔或同一人同一周合计 ≥{usd_short(insider.FLOOR_USD)}, 已剔除员工"
-              "购股计划)。明早开盘报告不再重复。只做参考, 不影响任何信号和票据。"]
+              "购股计划和私募/认购)。明早开盘报告不再重复。只做参考, 不影响任何信号和票据。"]
     return "\n".join(lines)
 
 

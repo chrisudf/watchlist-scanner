@@ -4188,7 +4188,7 @@ class TestIv30Method(unittest.TestCase):
 
 
 def form4_xml(*, issuer="0001818874", owners=None, aff="0", rows=(),
-              footnotes=None) -> bytes:
+              footnotes=None, orig=None) -> bytes:
     owners = owners or [("0001613438", "Noto Anthony",
                          {"isDirector": "1", "isOfficer": "1",
                           "officerTitle": "Chief Executive Officer"})]
@@ -4225,7 +4225,8 @@ def form4_xml(*, issuer="0001818874", owners=None, aff="0", rows=(),
                    for k, v in (footnotes or {}).items())
     return (f"<ownershipDocument><schemaVersion>X0609</schemaVersion>"
             f"<issuer><issuerCik>{issuer}</issuerCik></issuer>{own}"
-            f"<aff10b5One>{aff}</aff10b5One>"
+            + (f"<dateOfOriginalSubmission>{orig}</dateOfOriginalSubmission>" if orig else "")
+            + f"<aff10b5One>{aff}</aff10b5One>"
             f"<nonDerivativeTable>{txns}</nonDerivativeTable>"
             f"<footnotes>{foot}</footnotes></ownershipDocument>").encode()
 
@@ -4279,6 +4280,15 @@ class TestForm4Parse(unittest.TestCase):
         notes = ins.parse_form4(x)["rows"][0]["notes"]
         self.assertEqual(notes, ["weighted average"])
 
+    def test_txn_dates_cover_every_code_and_orig_date(self):
+        x = form4_xml(orig="2026-07-29",
+                      rows=[dict(buy(3363, 1.49, date="2026-07-27"), code="A"),
+                            buy(100, 2.0, date="2026-07-28")])
+        d = ins.parse_form4(x)
+        self.assertEqual(d["txn_dates"], ["2026-07-27", "2026-07-28"])
+        self.assertEqual(d["orig_date"], "2026-07-29")
+        self.assertEqual(ins.parse_form4(form4_xml(rows=[buy(1, 1)]))["orig_date"], "")
+
     def test_missing_price_is_none_not_zero(self):
         d = ins.parse_form4(form4_xml(rows=[buy(100, "")]))
         self.assertIsNone(d["rows"][0]["price"])
@@ -4308,6 +4318,55 @@ class TestOpenMarketBuys(unittest.TestCase):
             rows=[buy(10_000, 20, post_fn=["F2"])],
             footnotes={"F2": "includes 512 shares acquired under the ESPP"}))
         self.assertEqual(len(ins.open_market_buys([f], SOFI)), 1)
+
+    PRIVATE_NOTES = [
+        "the Reporting Person also purchased 361,905 shares of common stock of the "
+        "Issuer in the Private Placement for an aggregate cash purchase price of $380,000",
+        "the Reporting Person purchased 115,965 shares of the Issuer's Class B common "
+        "stock directly from the Issuer for aggregate cash consideration of $81,176",
+        "The securities were acquired from the Issuer pursuant to a Securities Purchase "
+        "Agreement dated June 23, 2026",
+        "Represents shares of the Issuer's Class A Common Stock purchased directly from "
+        "the Issuer by the Reporting Purchaser in connection with the PIPE transaction",
+        "Reflects ordinary shares acquired through a directed share program conducted in "
+        "connection with the Issuer's initial public offering",
+        "Reflects the 181,750 Class A ordinary shares that are included in the 181,750 "
+        "private placement units of the Issuer purchased by the Sponsor",
+        "purchased in the Issuer's underwritten public offering at the public offering price",
+    ]
+    OPEN_NOTES = [
+        # SOFI / HOOD 的真实脚注 —— 这类加权均价说明不能被误杀
+        "The reported transactions were executed in multiple trades. The purchase price of "
+        "$18.0578 reported in Column 4 is the weighted average purchase price for the 13,888 "
+        "shares acquired by the Reporting Person within a range of $18.025 to $18.070 per "
+        "share. The Reporting Person hereby undertakes to provide to the Staff of the SEC, "
+        "the Issuer or any security holder of the Issuer, upon request, full information",
+        "These shares were purchased in multiple transactions at prices ranging from $80.07 "
+        "to $81.00, inclusive. The Reporting Person undertakes to provide to the Issuer",
+        "The price per share was translated from New Taiwan dollars, NT2,460",
+        # 提到发行但写明了公开市场 = 照留
+        "The shares were purchased in open market transactions following the initial "
+        "public offering",
+        "These shares were acquired on the open market in multiple transactions",
+    ]
+
+    def _one_note(self, note):
+        x = form4_xml(rows=[buy(100_000, 20.0, date_fn=["F1"])], footnotes={"F1": note})
+        return ins.open_market_buys([filing("a", "2026-06-16", x)], SOFI)
+
+    def test_private_purchases_excluded(self):
+        # 坑 5: 代码 P = 公开市场**或私下**购买
+        for note in self.PRIVATE_NOTES:
+            self.assertEqual(self._one_note(note), [], note[:60])
+
+    def test_open_market_wording_kept(self):
+        for note in self.OPEN_NOTES:
+            self.assertEqual(len(self._one_note(note)), 1, note[:60])
+
+    def test_private_wording_in_holdings_footnote_does_not_exclude(self):
+        x = form4_xml(rows=[buy(100_000, 20.0, post_fn=["F2"])],
+                      footnotes={"F2": "Includes 50,000 shares purchased in the 2024 private placement"})
+        self.assertEqual(len(ins.open_market_buys([filing("a", "2026-06-16", x)], SOFI)), 1)
 
     def _same_day_same_price(self, n):
         return [filing(f"a{i}", "2026-09-09", form4_xml(
@@ -4346,6 +4405,63 @@ class TestOpenMarketBuys(unittest.TestCase):
         # TSM 真实申报: 同一份里同日两笔 1,000 股 @77.09, 按内容去重会吞掉一笔
         x = form4_xml(rows=[buy(1_000, 77.09), buy(1_000, 77.09)])
         self.assertEqual(len(ins.open_market_buys([filing("a", "2026-07-02", x)], SOFI)), 2)
+
+    def test_amendment_correcting_shares_replaces_original(self):
+        # Copilot 评审: 4/A 改了股数, 按数字去重对不上 -> 原先会重复计
+        orig = filing("o", "2026-06-16", form4_xml(rows=[buy(30_000, 1.0, date="2026-06-15")]))
+        fix = filing("f", "2026-06-20", form4_xml(orig="2026-06-16",
+                                                  rows=[buy(35_000, 1.0, date="2026-06-15")]), "4/A")
+        got = ins.open_market_buys([orig, fix], SOFI)
+        self.assertEqual([(b["acc"], b["shares"]) for b in got], [("f", 35_000)])
+
+    def test_amendment_restating_and_adding_omitted_trade(self):
+        # 真实样子 (AULT 9/14 的 4/A): 整份重报原申报 9/9-9/11 三行, 再补上漏报的 9/8
+        days = ["2026-09-09", "2026-09-10", "2026-09-11"]
+        orig = filing("o", "2026-09-11", form4_xml(rows=[buy(30_000, 1.0, date=d) for d in days]))
+        fix = filing("f", "2026-09-14", form4_xml(
+            orig="2026-09-11", rows=[buy(30_000, 1.0, date=d) for d in ["2026-09-08"] + days]), "4/A")
+        got = ins.open_market_buys([orig, fix], SOFI)
+        self.assertEqual(sorted(b["date"] for b in got), ["2026-09-08"] + days)
+        self.assertEqual({b["acc"] for b in got}, {"f"})
+
+    def test_partial_amendment_keeps_original_other_days(self):
+        orig = filing("o", "2026-06-17", form4_xml(rows=[buy(30_000, 1.0, date="2026-06-15"),
+                                                          buy(30_000, 1.0, date="2026-06-16")]))
+        fix = filing("f", "2026-06-20", form4_xml(orig="2026-06-17",
+                                                  rows=[buy(40_000, 1.0, date="2026-06-16")]), "4/A")
+        got = sorted((b["date"], b["acc"]) for b in ins.open_market_buys([orig, fix], SOFI))
+        self.assertEqual(got, [("2026-06-15", "o"), ("2026-06-16", "f")])
+
+    def test_amendment_of_another_filing_does_not_touch_this_one(self):
+        orig = filing("o", "2026-06-17", form4_xml(rows=[buy(30_000, 1.0, date="2026-06-15")]))
+        other = filing("f", "2026-06-20", form4_xml(orig="2026-06-01",
+                                                    rows=[buy(30_000, 1.0, date="2026-06-15")]), "4/A")
+        self.assertEqual(len(ins.open_market_buys([orig, other], SOFI)), 2)
+
+    def test_amendment_by_someone_else_does_not_touch_this_owner(self):
+        # 同一天两位高管各自申报; B 修正自己的那份, 不能把 A 的买入一起作废
+        a = filing("a", "2026-06-17", form4_xml(owners=[owner("1", "A")],
+                                                rows=[buy(30_000, 1.0, date="2026-06-15")]))
+        b_fix = filing("bf", "2026-06-20", form4_xml(owners=[owner("2", "B")], orig="2026-06-17",
+                                                     rows=[buy(30_000, 1.0, date="2026-06-15")]), "4/A")
+        got = ins.open_market_buys([a, b_fix], SOFI)
+        self.assertEqual(sorted(b["acc"] for b in got), ["a", "bf"])
+
+    def test_latest_of_two_amendments_wins(self):
+        rows = [buy(30_000, 1.0, date="2026-04-14")]
+        orig = filing("o", "2026-04-16", form4_xml(rows=rows))
+        a1 = filing("a1", "2026-08-31", form4_xml(orig="2026-04-16", rows=rows), "4/A")
+        a2 = filing("a2", "2026-08-31", form4_xml(orig="2026-04-16",
+                                                  rows=[buy(31_000, 1.0, date="2026-04-14")]), "4/A")
+        got = ins.open_market_buys([a2, orig, a1], SOFI)
+        self.assertEqual([(b["acc"], b["shares"]) for b in got], [("a2", 31_000)])
+
+    def test_amendment_recoding_purchase_away_removes_it(self):
+        # 原申报误记成 P, 4/A 改成 A: 那天的 P 行要作废
+        orig = filing("o", "2026-07-29", form4_xml(rows=[buy(30_000, 1.49, date="2026-07-27")]))
+        fix = filing("f", "2026-08-07", form4_xml(
+            orig="2026-07-29", rows=[dict(buy(30_000, 1.49, date="2026-07-27"), code="A")]), "4/A")
+        self.assertEqual(ins.open_market_buys([orig, fix], SOFI), [])
 
     def test_amendment_repeat_is_deduped_but_two_originals_are_not(self):
         x = form4_xml(rows=[buy(30_000, 1.0)])
@@ -4417,7 +4533,8 @@ class TestInsiderSummary(unittest.TestCase):
                 _b("2026-08-02", 10, 395.0)]
         s = ins.summarize(rows, self.TODAY)
         self.assertAlmostEqual(s["avg_price"], 395.0)
-        self.assertTrue(s["units_mixed"])
+        self.assertTrue(s["units_mismatch"])
+        self.assertFalse(s["units_unknown"])
         self.assertAlmostEqual(s["value"], 76_000 + 3_950)
         only_other = ins.summarize(rows[:1], self.TODAY)
         self.assertIsNone(only_other["avg_price"])
@@ -4445,9 +4562,15 @@ class TestInsiderSummary(unittest.TestCase):
         # TSM 一份申报里既有台股普通股又有 ADR: 合起来的均价两头都不是
         rows = [_b("2026-05-19", 2000, 69.91, acc="x", units_ok=False),
                 _b("2026-05-20", 17, 395.18, acc="x")]
-        self.assertFalse(ins.filing_events(rows)[0]["units_ok"])
-        rows[0]["units_ok"] = None          # 查不到收盘 = 未知, 同样不比
-        self.assertFalse(ins.filing_events(rows)[0]["units_ok"])
+        self.assertIs(ins.filing_events(rows)[0]["units_ok"], False)
+        # Copilot 评审: 查不到收盘 = 未知 (None), 不能折成"单位不同" (False)
+        rows[0]["units_ok"] = None
+        self.assertIsNone(ins.filing_events(rows)[0]["units_ok"])
+        rows.append(_b("2026-05-21", 10, 1.0, acc="x", units_ok=False))
+        self.assertIs(ins.filing_events(rows)[0]["units_ok"], False)
+        s = ins.summarize(rows[:2], self.TODAY)
+        self.assertTrue(s["units_unknown"])
+        self.assertFalse(s["units_mismatch"])
 
     def test_last_is_latest_trade_not_latest_filing(self):
         # TSM: 7/2 的交易 9/4 才迟报, 不能盖过 8/19 那笔
@@ -4681,6 +4804,22 @@ class TestScannerInsider(unittest.TestCase):
                                                         plan=True), None)
         self.assertIn("(间接: By Fund)", via)
         self.assertIn("10b5-1 计划内", via)
+
+    def test_unknown_units_worded_as_unknown(self):
+        line = sc.insider_event_line("SOFI", self._event(units_ok=None), [13.0, 16.0])
+        self.assertIn("查不到成交日收盘价", line)
+        self.assertNotIn("单位不同", line)
+        s = ins.summarize([_b("2026-06-16", 13888, 18.06, units_ok=None)], date(2026, 10, 5))
+        dig = sc.insider_digest_line("SOFI", s, [13.0, 16.0])
+        self.assertIn("查不到成交日收盘价, 不算均价", dig)
+        both = ins.summarize([_b("2026-06-16", 13888, 18.06, units_ok=None),
+                              _b("2026-06-17", 13888, 18.06, units_ok=False, key="2")],
+                             date(2026, 10, 5))
+        self.assertIn("单位不同或查不到", sc.insider_digest_line("SOFI", both, None))
+        part = ins.summarize([_b("2026-06-16", 13888, 18.06),
+                              _b("2026-06-17", 100, 18.0, units_ok=None, key="2")],
+                             date(2026, 10, 5))
+        self.assertIn("部分成交查不到当天收盘价", sc.insider_digest_line("SOFI", part, None))
 
     def test_close_block(self):
         s1 = ins.summarize([_b("2026-06-16", 13888, 18.06),
