@@ -34,6 +34,20 @@ if [ "${1:-}" = "review" ]; then
   exit "$status"
 fi
 
+# 晚间内部人检查: 美东 22:05-22:59 窗口内查当天新申报的公开市场买入, 有新买入
+# 才发邮件; 没有 / 窗口外 = exit 3 静默。取数失败也是 exit 3 (次日开盘报告会
+# 重试并写出来); 只有崩溃和发信失败才发 FAILED。
+if [ "${1:-}" = "insider" ]; then
+  .venv/bin/python scanner.py --mode insider --email >> "$log" 2>&1
+  status=$?
+  if [ "$status" -ne 0 ] && [ "$status" -ne 3 ]; then
+    body=$(mktemp); tail -50 "$log" > "$body"
+    notify "[watchlist] insider FAILED $d (exit $status)" "$body"
+    rm -f "$body"
+  fi
+  exit "$status"
+fi
+
 if [ "${1:-}" = "watchdog" ]; then
   et_date=$(TZ=America/New_York date +%F)   # the US trading day just ended
   # 该交易日到底该不该有报告 —— 问盘面, 不查假日日历 (和扫描器的

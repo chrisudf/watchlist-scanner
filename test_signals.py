@@ -9,14 +9,18 @@ import io
 import json
 import math
 import re
+import sys
 import tempfile
 import unittest
+import urllib.error as _urlerr
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 
+import insider as ins
 import scanner as sc
 
 
@@ -4174,6 +4178,874 @@ class TestIv30Method(unittest.TestCase):
         self.assertTrue(pd.isna(df.iloc[0]["iv_src"]))               # 旧行原样保留
         self.assertEqual(df.iloc[1]["iv_src"], sc.IV30_METHOD)
         self.assertAlmostEqual(df.iloc[1]["iv30_ycol"], 0.33)             # 影子列只记录
+
+
+# --------------------------------------------------------------------------
+# 内部人公开市场买入 (insider.py, 2026-10-05)
+# 合成 XML 的结构照抄真实申报: SOFI Noto 买入、TSM 员工购股计划、谷歌风投
+# 卖 Ethos (发行人不是 Alphabet)、HOOD Malka 经基金间接买入
+# --------------------------------------------------------------------------
+
+
+def form4_xml(*, issuer="0001818874", owners=None, aff="0", rows=(),
+              footnotes=None, orig=None) -> bytes:
+    owners = owners or [("0001613438", "Noto Anthony",
+                         {"isDirector": "1", "isOfficer": "1",
+                          "officerTitle": "Chief Executive Officer"})]
+    own = "".join(
+        f"<reportingOwner><reportingOwnerId><rptOwnerCik>{cik}</rptOwnerCik>"
+        f"<rptOwnerName>{name}</rptOwnerName></reportingOwnerId>"
+        "<reportingOwnerRelationship>"
+        + "".join(f"<{k}>{v}</{k}>" for k, v in rel.items())
+        + "</reportingOwnerRelationship></reportingOwner>"
+        for cik, name, rel in owners)
+
+    def fn(ids):
+        return "".join(f'<footnoteId id="{i}"/>' for i in ids or ())
+
+    txns = "".join(
+        "<nonDerivativeTransaction>"
+        f"<securityTitle><value>{r.get('security', 'Common Stock')}</value></securityTitle>"
+        f"<transactionDate><value>{r['date']}</value>{fn(r.get('date_fn'))}</transactionDate>"
+        f"<transactionCoding><transactionFormType>4</transactionFormType>"
+        f"<transactionCode>{r.get('code', 'P')}</transactionCode></transactionCoding>"
+        f"<transactionAmounts><transactionShares><value>{r['shares']}</value></transactionShares>"
+        f"<transactionPricePerShare><value>{r.get('price', '')}</value>{fn(r.get('price_fn'))}"
+        "</transactionPricePerShare>"
+        f"<transactionAcquiredDisposedCode><value>{r.get('ad', 'A')}</value>"
+        "</transactionAcquiredDisposedCode></transactionAmounts>"
+        "<postTransactionAmounts><sharesOwnedFollowingTransaction><value>1000</value>"
+        f"{fn(r.get('post_fn'))}</sharesOwnedFollowingTransaction></postTransactionAmounts>"
+        f"<ownershipNature><directOrIndirectOwnership><value>{r.get('direct', 'D')}</value>"
+        f"</directOrIndirectOwnership><natureOfOwnership><value>{r.get('nature', '')}</value>"
+        "</natureOfOwnership></ownershipNature>"
+        "</nonDerivativeTransaction>"
+        for r in rows)
+    foot = "".join(f'<footnote id="{k}">{v}</footnote>'
+                   for k, v in (footnotes or {}).items())
+    return (f"<ownershipDocument><schemaVersion>X0609</schemaVersion>"
+            f"<issuer><issuerCik>{issuer}</issuerCik></issuer>{own}"
+            + (f"<dateOfOriginalSubmission>{orig}</dateOfOriginalSubmission>" if orig else "")
+            + f"<aff10b5One>{aff}</aff10b5One>"
+            f"<nonDerivativeTable>{txns}</nonDerivativeTable>"
+            f"<footnotes>{foot}</footnotes></ownershipDocument>").encode()
+
+
+SOFI = 1818874
+
+
+def filing(acc, filed, xml, form="4"):
+    return {"acc": acc, "filed": filed, "form": form,
+            "doc": ins.parse_form4(xml)}
+
+
+def buy(shares, price, date="2026-06-16", **kw):
+    return {"date": date, "shares": shares, "price": price, **kw}
+
+
+def owner(cik, name="X", **rel):
+    rel = {"isDirector": "1", **rel}
+    return (cik, name, rel)
+
+
+class TestForm4Parse(unittest.TestCase):
+    def test_parses_buy_and_drops_other_codes(self):
+        x = form4_xml(rows=[buy(13888, 18.0578),
+                            dict(buy(500, 18.0), code="S", ad="D"),
+                            dict(buy(900, 0), code="F", ad="D")])
+        d = ins.parse_form4(x)
+        self.assertEqual(d["issuer_cik"], SOFI)
+        self.assertEqual(len(d["rows"]), 1)
+        self.assertEqual((d["rows"][0]["shares"], d["rows"][0]["price"]),
+                         (13888.0, 18.0578))
+        o = d["owners"][0]
+        self.assertEqual((o["cik"], o["director"], o["officer"]),
+                         ("1613438", True, True))
+
+    def test_booleans_accept_both_spellings(self):
+        # 坑 3: GOOG 的 aff10b5One 写 "true" —— 只认 "1" 会把计划内判成计划外
+        for v, want in (("1", True), ("true", True), ("True", True),
+                        ("0", False), ("false", False), ("", False)):
+            x = form4_xml(aff=v, owners=[("1", "A", {"isDirector": v})],
+                          rows=[buy(1, 1)])
+            d = ins.parse_form4(x)
+            self.assertEqual(d["plan"], want, v)
+            self.assertEqual(d["owners"][0]["director"], want, v)
+
+    def test_only_transaction_footnotes_are_attached(self):
+        # 交易后持股的脚注 ("其中 N 股来自 ESPP") 说的是存量, 不是这笔交易
+        x = form4_xml(rows=[buy(100, 20, date_fn=["F1"], post_fn=["F2"])],
+                      footnotes={"F1": "weighted average",
+                                 "F2": "includes shares acquired under the ESPP"})
+        notes = ins.parse_form4(x)["rows"][0]["notes"]
+        self.assertEqual(notes, ["weighted average"])
+
+    def test_txn_dates_cover_every_code_and_orig_date(self):
+        x = form4_xml(orig="2026-07-29",
+                      rows=[dict(buy(3363, 1.49, date="2026-07-27"), code="A"),
+                            buy(100, 2.0, date="2026-07-28")])
+        d = ins.parse_form4(x)
+        self.assertEqual(d["txn_dates"], ["2026-07-27", "2026-07-28"])
+        self.assertEqual(d["orig_date"], "2026-07-29")
+        self.assertEqual(ins.parse_form4(form4_xml(rows=[buy(1, 1)]))["orig_date"], "")
+
+    def test_missing_price_is_none_not_zero(self):
+        d = ins.parse_form4(form4_xml(rows=[buy(100, "")]))
+        self.assertIsNone(d["rows"][0]["price"])
+
+
+class TestOpenMarketBuys(unittest.TestCase):
+    def test_other_issuer_excluded(self):
+        # 坑 1: 谷歌风投卖 Ethos 的 Form 4 出现在 Alphabet 的申报列表里
+        f = filing("a1", "2026-07-29", form4_xml(issuer="0002000000",
+                                                 rows=[buy(10_000, 20)]))
+        self.assertEqual(ins.open_market_buys([f], SOFI), [])
+        self.assertEqual(len(ins.open_market_buys([f], 2000000)), 1)
+
+    def test_espp_footnote_and_nature_excluded(self):
+        # 坑 2: TSM 的 ESPP 代买, 脚注挂在交易日期上 / 持有方式 By ESPP Trust
+        by_note = filing("a1", "2026-09-09", form4_xml(
+            rows=[buy(100_000, 76.2, date_fn=["F1"])],
+            footnotes={"F1": "Common Shares purchased by the administrator of "
+                             "the issuer's Employee Stock Purchase Plan"}))
+        by_nature = filing("a2", "2026-09-09", form4_xml(
+            rows=[buy(100_000, 76.2, nature="By ESPP Trust", direct="I")]))
+        self.assertEqual(ins.open_market_buys([by_note], SOFI), [])
+        self.assertEqual(ins.open_market_buys([by_nature], SOFI), [])
+
+    def test_holdings_footnote_does_not_exclude_real_buy(self):
+        f = filing("a1", "2026-06-16", form4_xml(
+            rows=[buy(10_000, 20, post_fn=["F2"])],
+            footnotes={"F2": "includes 512 shares acquired under the ESPP"}))
+        self.assertEqual(len(ins.open_market_buys([f], SOFI)), 1)
+
+    PRIVATE_NOTES = [
+        "the Reporting Person also purchased 361,905 shares of common stock of the "
+        "Issuer in the Private Placement for an aggregate cash purchase price of $380,000",
+        "the Reporting Person purchased 115,965 shares of the Issuer's Class B common "
+        "stock directly from the Issuer for aggregate cash consideration of $81,176",
+        "The securities were acquired from the Issuer pursuant to a Securities Purchase "
+        "Agreement dated June 23, 2026",
+        "Represents shares of the Issuer's Class A Common Stock purchased directly from "
+        "the Issuer by the Reporting Purchaser in connection with the PIPE transaction",
+        "Reflects ordinary shares acquired through a directed share program conducted in "
+        "connection with the Issuer's initial public offering",
+        "Reflects the 181,750 Class A ordinary shares that are included in the 181,750 "
+        "private placement units of the Issuer purchased by the Sponsor",
+        "purchased in the Issuer's underwritten public offering at the public offering price",
+    ]
+    OPEN_NOTES = [
+        # SOFI / HOOD 的真实脚注 —— 这类加权均价说明不能被误杀
+        "The reported transactions were executed in multiple trades. The purchase price of "
+        "$18.0578 reported in Column 4 is the weighted average purchase price for the 13,888 "
+        "shares acquired by the Reporting Person within a range of $18.025 to $18.070 per "
+        "share. The Reporting Person hereby undertakes to provide to the Staff of the SEC, "
+        "the Issuer or any security holder of the Issuer, upon request, full information",
+        "These shares were purchased in multiple transactions at prices ranging from $80.07 "
+        "to $81.00, inclusive. The Reporting Person undertakes to provide to the Issuer",
+        "The price per share was translated from New Taiwan dollars, NT2,460",
+        # 提到发行但写明了公开市场 = 照留
+        "The shares were purchased in open market transactions following the initial "
+        "public offering",
+        "These shares were acquired on the open market in multiple transactions",
+    ]
+
+    def _one_note(self, note):
+        x = form4_xml(rows=[buy(100_000, 20.0, date_fn=["F1"])], footnotes={"F1": note})
+        return ins.open_market_buys([filing("a", "2026-06-16", x)], SOFI)
+
+    def test_private_purchases_excluded(self):
+        # 坑 5: 代码 P = 公开市场**或私下**购买
+        for note in self.PRIVATE_NOTES:
+            self.assertEqual(self._one_note(note), [], note[:60])
+
+    def test_open_market_wording_kept(self):
+        for note in self.OPEN_NOTES:
+            self.assertEqual(len(self._one_note(note)), 1, note[:60])
+
+    def test_private_wording_in_holdings_footnote_does_not_exclude(self):
+        x = form4_xml(rows=[buy(100_000, 20.0, post_fn=["F2"])],
+                      footnotes={"F2": "Includes 50,000 shares purchased in the 2024 private placement"})
+        self.assertEqual(len(ins.open_market_buys([filing("a", "2026-06-16", x)], SOFI)), 1)
+
+    def _same_day_same_price(self, n):
+        return [filing(f"a{i}", "2026-09-09", form4_xml(
+            owners=[owner(str(100 + i), f"VP{i}", isOfficer="1")],
+            rows=[buy(1_000, 76.2, date="2026-09-07")])) for i in range(n)]
+
+    def test_espp_cluster_fallback_boundary(self):
+        # 没脚注的公司代买: 同日同价 ≥5 人才剔, 4 人照留
+        self.assertEqual(ins.open_market_buys(self._same_day_same_price(5), SOFI), [])
+        self.assertEqual(len(ins.open_market_buys(self._same_day_same_price(4), SOFI)), 4)
+
+    def test_floor_single_and_weekly_sum(self):
+        one = lambda acc, sh, d: filing(acc, d, form4_xml(rows=[buy(sh, 1.0, date=d)]))
+        floor = ins.FLOOR_USD
+        self.assertEqual(ins.open_market_buys([one("a", floor - 1, "2026-06-16")], SOFI), [])
+        self.assertEqual(len(ins.open_market_buys([one("a", floor, "2026-06-16")], SOFI)), 1)
+        # 2026-06-15 周一 + 06-19 周五 = 同一 ISO 周, 合计过线两笔都留
+        same_week = [one("a", 15_000, "2026-06-15"), one("b", 15_000, "2026-06-19")]
+        self.assertEqual(len(ins.open_market_buys(same_week, SOFI)), 2)
+        # 06-19 周五 + 06-22 周一 = 跨周, 各自不过线
+        split = [one("a", 15_000, "2026-06-19"), one("b", 15_000, "2026-06-22")]
+        self.assertEqual(ins.open_market_buys(split, SOFI), [])
+
+    def test_weekly_sum_is_per_person(self):
+        fs = [filing(f"a{i}", "2026-06-16", form4_xml(
+            owners=[owner(str(i))], rows=[buy(15_000, 1.0)])) for i in range(2)]
+        self.assertEqual(ins.open_market_buys(fs, SOFI), [])
+
+    def test_unpriced_row_rides_with_priced_week(self):
+        x = form4_xml(rows=[buy(30_000, 1.0), buy(500, "")])
+        self.assertEqual(len(ins.open_market_buys([filing("a", "2026-06-16", x)], SOFI)), 2)
+        lone = form4_xml(rows=[buy(500_000, "")])
+        self.assertEqual(ins.open_market_buys([filing("a", "2026-06-16", lone)], SOFI), [])
+
+    def test_identical_rows_in_one_filing_are_two_trades(self):
+        # TSM 真实申报: 同一份里同日两笔 1,000 股 @77.09, 按内容去重会吞掉一笔
+        x = form4_xml(rows=[buy(1_000, 77.09), buy(1_000, 77.09)])
+        self.assertEqual(len(ins.open_market_buys([filing("a", "2026-07-02", x)], SOFI)), 2)
+
+    def test_amendment_correcting_shares_replaces_original(self):
+        # Copilot 评审: 4/A 改了股数, 按数字去重对不上 -> 原先会重复计
+        orig = filing("o", "2026-06-16", form4_xml(rows=[buy(30_000, 1.0, date="2026-06-15")]))
+        fix = filing("f", "2026-06-20", form4_xml(orig="2026-06-16",
+                                                  rows=[buy(35_000, 1.0, date="2026-06-15")]), "4/A")
+        got = ins.open_market_buys([orig, fix], SOFI)
+        self.assertEqual([(b["acc"], b["shares"]) for b in got], [("f", 35_000)])
+
+    def test_amendment_restating_and_adding_omitted_trade(self):
+        # 真实样子 (AULT 9/14 的 4/A): 整份重报原申报 9/9-9/11 三行, 再补上漏报的 9/8
+        days = ["2026-09-09", "2026-09-10", "2026-09-11"]
+        orig = filing("o", "2026-09-11", form4_xml(rows=[buy(30_000, 1.0, date=d) for d in days]))
+        fix = filing("f", "2026-09-14", form4_xml(
+            orig="2026-09-11", rows=[buy(30_000, 1.0, date=d) for d in ["2026-09-08"] + days]), "4/A")
+        got = ins.open_market_buys([orig, fix], SOFI)
+        self.assertEqual(sorted(b["date"] for b in got), ["2026-09-08"] + days)
+        self.assertEqual({b["acc"] for b in got}, {"f"})
+
+    def test_partial_amendment_keeps_original_other_days(self):
+        orig = filing("o", "2026-06-17", form4_xml(rows=[buy(30_000, 1.0, date="2026-06-15"),
+                                                          buy(30_000, 1.0, date="2026-06-16")]))
+        fix = filing("f", "2026-06-20", form4_xml(orig="2026-06-17",
+                                                  rows=[buy(40_000, 1.0, date="2026-06-16")]), "4/A")
+        got = sorted((b["date"], b["acc"]) for b in ins.open_market_buys([orig, fix], SOFI))
+        self.assertEqual(got, [("2026-06-15", "o"), ("2026-06-16", "f")])
+
+    def test_amendment_of_another_filing_does_not_touch_this_one(self):
+        orig = filing("o", "2026-06-17", form4_xml(rows=[buy(30_000, 1.0, date="2026-06-15")]))
+        other = filing("f", "2026-06-20", form4_xml(orig="2026-06-01",
+                                                    rows=[buy(30_000, 1.0, date="2026-06-15")]), "4/A")
+        self.assertEqual(len(ins.open_market_buys([orig, other], SOFI)), 2)
+
+    def test_amendment_by_someone_else_does_not_touch_this_owner(self):
+        # 同一天两位高管各自申报; B 修正自己的那份, 不能把 A 的买入一起作废
+        a = filing("a", "2026-06-17", form4_xml(owners=[owner("1", "A")],
+                                                rows=[buy(30_000, 1.0, date="2026-06-15")]))
+        b_fix = filing("bf", "2026-06-20", form4_xml(owners=[owner("2", "B")], orig="2026-06-17",
+                                                     rows=[buy(30_000, 1.0, date="2026-06-15")]), "4/A")
+        got = ins.open_market_buys([a, b_fix], SOFI)
+        self.assertEqual(sorted(b["acc"] for b in got), ["a", "bf"])
+
+    def test_latest_of_two_amendments_wins(self):
+        rows = [buy(30_000, 1.0, date="2026-04-14")]
+        orig = filing("o", "2026-04-16", form4_xml(rows=rows))
+        a1 = filing("a1", "2026-08-31", form4_xml(orig="2026-04-16", rows=rows), "4/A")
+        a2 = filing("a2", "2026-08-31", form4_xml(orig="2026-04-16",
+                                                  rows=[buy(31_000, 1.0, date="2026-04-14")]), "4/A")
+        got = ins.open_market_buys([a2, orig, a1], SOFI)
+        self.assertEqual([(b["acc"], b["shares"]) for b in got], [("a2", 31_000)])
+
+    def test_amendment_recoding_purchase_away_removes_it(self):
+        # 原申报误记成 P, 4/A 改成 A: 那天的 P 行要作废
+        orig = filing("o", "2026-07-29", form4_xml(rows=[buy(30_000, 1.49, date="2026-07-27")]))
+        fix = filing("f", "2026-08-07", form4_xml(
+            orig="2026-07-29", rows=[dict(buy(30_000, 1.49, date="2026-07-27"), code="A")]), "4/A")
+        self.assertEqual(ins.open_market_buys([orig, fix], SOFI), [])
+
+    def test_amendment_repeat_is_deduped_but_two_originals_are_not(self):
+        x = form4_xml(rows=[buy(30_000, 1.0)])
+        orig, amend = filing("a1", "2026-06-16", x), filing("a2", "2026-06-20", x, "4/A")
+        self.assertEqual(len(ins.open_market_buys([amend, orig], SOFI)), 1)
+        twin = filing("a3", "2026-06-17", x)
+        self.assertEqual(len(ins.open_market_buys([orig, twin], SOFI)), 2)
+        # 4/A 自己内部的两笔同样是两笔, 只跟别的申报比
+        pair = form4_xml(rows=[buy(30_000, 1.0), buy(30_000, 1.0)])
+        self.assertEqual(len(ins.open_market_buys(
+            [filing("a4", "2026-06-20", pair, "4/A")], SOFI)), 2)
+
+    def test_units_check_against_close(self):
+        x = form4_xml(rows=[buy(1_000, 76.2)])
+        f = [filing("a", "2026-09-09", x)]
+        adr_close = lambda d: 380.0        # TSM: 台股普通股 vs ADR
+        same = lambda d: 80.0
+        none = lambda d: None
+        self.assertIs(ins.open_market_buys(f, SOFI, ref_close=adr_close)[0]["units_ok"], False)
+        self.assertIs(ins.open_market_buys(f, SOFI, ref_close=same)[0]["units_ok"], True)
+        self.assertIsNone(ins.open_market_buys(f, SOFI, ref_close=none)[0]["units_ok"])
+        self.assertIs(ins.open_market_buys(f, SOFI)[0]["units_ok"], True)
+
+    def test_units_ratio_boundary(self):
+        self.assertTrue(ins.units_ok(150.0, 100.0))
+        self.assertFalse(ins.units_ok(150.1, 100.0))
+        self.assertTrue(ins.units_ok(100.0 / 1.5, 100.0))
+        self.assertFalse(ins.units_ok(66.0, 100.0))
+
+    def test_role_labels(self):
+        cases = [
+            ([("1", "A", {"isDirector": "1", "isOfficer": "1",
+                          "officerTitle": "Chief Executive Officer"})], "董事/CEO"),
+            ([("1", "A", {"isOfficer": "true", "officerTitle": "EVP and CFO"})], "CFO"),
+            ([("1", "A", {"isOfficer": "1", "officerTitle": "VP"})], "VP"),
+            ([("1", "A", {"isDirector": "1"})], "董事"),
+            ([("1", "Fund", {"isTenPercentOwner": "1"})], "10%股东"),
+            # 联名申报: 基金在前、本人 (董事) 在后, 身份要合起来看
+            ([("1", "Fund LP", {"isTenPercentOwner": "1"}),
+              ("2", "Person", {"isDirector": "1"})], "董事"),
+        ]
+        for owners, want in cases:
+            d = ins.parse_form4(form4_xml(owners=owners, rows=[buy(1, 1)]))
+            self.assertEqual(ins.role_label(d["owners"]), want)
+
+
+def _b(date, shares, price, *, key="1", owner="Noto Anthony", acc=None,
+       filed=None, units_ok=True, direct="D", nature="", plan=False):
+    return {"acc": acc or f"acc-{date}-{key}", "filed": filed or date,
+            "form": "4", "owner_key": key, "owner": owner, "role": "董事/CEO",
+            "date": date, "shares": shares, "price": price,
+            "value": shares * price if price else None,
+            "security": "Common Stock", "direct": direct, "nature": nature,
+            "plan": plan, "units_ok": units_ok}
+
+
+class TestInsiderSummary(unittest.TestCase):
+    TODAY = date(2026, 10, 5)
+
+    def test_window_boundary_by_trade_date(self):
+        edge = (self.TODAY - timedelta(days=180)).isoformat()
+        before = (self.TODAY - timedelta(days=181)).isoformat()
+        s = ins.summarize([_b(edge, 1000, 20), _b(before, 1000, 20)], self.TODAY)
+        self.assertEqual(s["n"], 1)
+        self.assertIsNone(ins.summarize([_b(before, 1000, 20)], self.TODAY))
+
+    def test_avg_price_excludes_other_units(self):
+        rows = [_b("2026-08-01", 1000, 76.0, units_ok=False),
+                _b("2026-08-02", 10, 395.0)]
+        s = ins.summarize(rows, self.TODAY)
+        self.assertAlmostEqual(s["avg_price"], 395.0)
+        self.assertTrue(s["units_mismatch"])
+        self.assertFalse(s["units_unknown"])
+        self.assertAlmostEqual(s["value"], 76_000 + 3_950)
+        only_other = ins.summarize(rows[:1], self.TODAY)
+        self.assertIsNone(only_other["avg_price"])
+
+    def test_cluster_needs_two_people_within_30_days(self):
+        a = _b("2026-06-01", 1000, 20, key="1")
+        self.assertTrue(ins.summarize([a, _b("2026-07-01", 1000, 20, key="2")],
+                                      self.TODAY)["cluster"])
+        self.assertFalse(ins.summarize([a, _b("2026-07-02", 1000, 20, key="2")],
+                                       self.TODAY)["cluster"])
+        self.assertFalse(ins.summarize([a, _b("2026-06-02", 1000, 20, key="1")],
+                                       self.TODAY)["cluster"])
+
+    def test_filing_events_group_by_accession(self):
+        rows = [_b("2026-06-15", 1000, 10.0, acc="x"), _b("2026-06-16", 3000, 12.0, acc="x"),
+                _b("2026-06-20", 100, 50.0, acc="y", filed="2026-06-22")]
+        ev = ins.filing_events(rows)
+        self.assertEqual([e["acc"] for e in ev], ["y", "x"])
+        x = ev[1]
+        self.assertEqual((x["date_lo"], x["date_hi"], x["shares"]),
+                         ("2026-06-15", "2026-06-16", 4000))
+        self.assertAlmostEqual(x["avg_price"], (10_000 + 36_000) / 4000)
+
+    def test_filing_event_with_mixed_units_is_not_compared(self):
+        # TSM 一份申报里既有台股普通股又有 ADR: 合起来的均价两头都不是
+        rows = [_b("2026-05-19", 2000, 69.91, acc="x", units_ok=False),
+                _b("2026-05-20", 17, 395.18, acc="x")]
+        self.assertIs(ins.filing_events(rows)[0]["units_ok"], False)
+        # Copilot 评审: 查不到收盘 = 未知 (None), 不能折成"单位不同" (False)
+        rows[0]["units_ok"] = None
+        self.assertIsNone(ins.filing_events(rows)[0]["units_ok"])
+        rows.append(_b("2026-05-21", 10, 1.0, acc="x", units_ok=False))
+        self.assertIs(ins.filing_events(rows)[0]["units_ok"], False)
+        s = ins.summarize(rows[:2], self.TODAY)
+        self.assertTrue(s["units_unknown"])
+        self.assertFalse(s["units_mismatch"])
+
+    def test_last_is_latest_trade_not_latest_filing(self):
+        # TSM: 7/2 的交易 9/4 才迟报, 不能盖过 8/19 那笔
+        late = _b("2026-07-02", 1000, 77.09, key="1", acc="late", filed="2026-09-04")
+        recent = _b("2026-08-19", 1000, 73.77, key="2", acc="rec", filed="2026-08-20")
+        s = ins.summarize([late, recent], self.TODAY)
+        self.assertEqual(s["last"]["acc"], "rec")
+        self.assertEqual(ins.filing_events([late, recent])[0]["acc"], "late")
+
+    def test_new_events_skip_seen_and_old(self):
+        rows = [_b("2026-09-28", 1000, 30, acc="old", filed="2026-09-27"),
+                _b("2026-09-28", 1000, 30, acc="edge", filed="2026-09-28"),
+                _b("2026-10-02", 1000, 30, acc="seen", filed="2026-10-02"),
+                _b("2026-10-02", 1000, 30, acc="new", filed="2026-10-03")]
+        got = ins.new_events(rows, {"seen": "2026-10-02"}, self.TODAY)
+        self.assertEqual(sorted(e["acc"] for e in got), ["edge", "new"])
+
+
+class _FakeSec:
+    """假 SEC: 代码表 / submissions / XML 三类 URL, 记录请求。"""
+
+    def __init__(self, subs: dict, docs: dict, tickers=None, fail=False):
+        self.subs, self.docs, self.fail = subs, docs, fail
+        self.tickers = tickers or {"0": {"ticker": "SOFI", "cik_str": SOFI}}
+        self.requests, self.urls = 0, []
+
+    def _hit(self, url):
+        self.requests += 1
+        self.urls.append(url)
+        if self.fail:
+            raise _urlerr.URLError("down")
+
+    def get_json(self, url):
+        self._hit(url)
+        if url == ins.TICKERS_URL:
+            return self.tickers
+        return self.subs[url]
+
+    def get(self, url):
+        self._hit(url)
+        return self.docs[url.rsplit("/", 1)[-1]]
+
+
+def _subs(cik, entries):
+    """entries: [(acc, filingDate, form, doc)] 新的在前 (同 SEC)。"""
+    return {ins.SUBMISSIONS_URL.format(cik=cik): {"filings": {"recent": {
+        "accessionNumber": [e[0] for e in entries],
+        "filingDate": [e[1] for e in entries],
+        "form": [e[2] for e in entries],
+        "primaryDocument": [f"xslF345X06/{e[3]}" for e in entries]},
+        "files": []}}}
+
+
+class TestInsiderRun(unittest.TestCase):
+    TODAY = date(2026, 10, 5)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.subs = _subs(SOFI, [
+            ("0001-26-2", "2026-10-02", "4", "b.xml"),
+            ("0001-26-1", "2026-06-16", "4", "a.xml"),
+            ("0001-26-0", "2026-06-10", "144", "x.xml")])
+        self.docs = {"a.xml": form4_xml(rows=[buy(13_888, 18.06)]),
+                     "b.xml": form4_xml(rows=[buy(20_000, 16.5, date="2026-10-01")])}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, client, **kw):
+        return ins.run(["SOFI"], self.TODAY, data_dir=self.dir, client=client, **kw)
+
+    def test_summary_new_and_cache(self):
+        c = _FakeSec(self.subs, self.docs)
+        info = self._run(c)["by_symbol"]["SOFI"]
+        self.assertEqual(info["summary"]["n"], 2)
+        self.assertEqual([e["acc"] for e in info["new"]], ["0001-26-2"])
+        self.assertEqual(c.requests, 4)        # 代码表 + submissions + 2 份 XML
+        c2 = _FakeSec(self.subs, {})            # 第二次: 全走缓存, 不拉 XML
+        self._run(c2)
+        self.assertEqual(c2.requests, 1)        # 只有 submissions
+
+    def test_seen_only_after_mark(self):
+        # run() 只读不写: 手工跑 / 写报告前崩掉, 都不会把新申报吞掉
+        first = self._run(_FakeSec(self.subs, self.docs))
+        self.assertFalse((self.dir / ins.SEEN_NAME).exists())
+        again = self._run(_FakeSec(self.subs, self.docs))
+        self.assertEqual(len(first["by_symbol"]["SOFI"]["new"]), 1)
+        self.assertEqual(len(again["by_symbol"]["SOFI"]["new"]), 1)
+        self.assertEqual(ins.mark_seen(again, self.TODAY, self.dir), 1)
+        self.assertEqual(ins.mark_seen(again, self.TODAY, self.dir), 0)
+        third = self._run(_FakeSec(self.subs, self.docs))
+        self.assertEqual(third["by_symbol"]["SOFI"]["new"], [])
+
+    def test_mark_seen_prunes_old_entries(self):
+        old = (self.TODAY - timedelta(days=ins.SEEN_KEEP_DAYS + 1)).isoformat()
+        (self.dir / ins.SEEN_NAME).write_text(json.dumps({"stale": old}),
+                                               encoding="utf-8")
+        ins.mark_seen({"by_symbol": {}}, self.TODAY, self.dir)
+        self.assertEqual(json.loads((self.dir / ins.SEEN_NAME).read_text(
+            encoding="utf-8")), {})
+
+    def test_budget_marks_missing_then_completes(self):
+        with mock_attr(ins, "MAX_FETCH_PER_RUN", 1):
+            first = self._run(_FakeSec(self.subs, self.docs))["by_symbol"]["SOFI"]
+            self.assertEqual(first["missing"], 1)
+            second = self._run(_FakeSec(self.subs, self.docs))["by_symbol"]["SOFI"]
+        self.assertEqual(second["missing"], 0)
+        self.assertEqual(second["summary"]["n"], 2)
+
+    def test_sec_down_stops_trying(self):
+        syms = ["A", "B", "C", "D", "E"]
+        tickers = {str(i): {"ticker": s, "cik_str": 100 + i} for i, s in enumerate(syms)}
+        # 代码表走缓存 (今天刚刷过), 然后每个标的的 submissions 都连不上
+        (self.dir / ins.TICKER_MAP_NAME).write_text(json.dumps(
+            {"fetched": self.TODAY.isoformat(),
+             "map": {s: 100 + i for i, s in enumerate(syms)}}), encoding="utf-8")
+        c = _FakeSec({}, {}, tickers=tickers, fail=True)
+        out = ins.run(syms, self.TODAY, data_dir=self.dir, client=c)
+        self.assertEqual(c.requests, ins.MAX_CONSECUTIVE_FAILS)
+        self.assertTrue(all(out["by_symbol"][s].get("error") for s in syms))
+        self.assertIn("未尝试", out["by_symbol"]["E"]["error"])
+
+    def test_disabled_without_email(self):
+        with mock_env("SEC_EMAIL", None):
+            out = ins.run(["SOFI"], self.TODAY, data_dir=self.dir)
+        self.assertFalse(out["enabled"])
+        self.assertIn("SEC_EMAIL", out["reason"])
+
+    def test_unknown_ticker_refreshes_map_once_a_day(self):
+        c = _FakeSec(self.subs, self.docs)
+        ins.run(["SOFI", "ZZZZ"], self.TODAY, data_dir=self.dir, client=c)
+        c2 = _FakeSec(self.subs, self.docs)
+        out = ins.run(["SOFI", "ZZZZ"], self.TODAY, data_dir=self.dir, client=c2)
+        self.assertNotIn(ins.TICKERS_URL, c2.urls)
+        self.assertIn("没有这个代码", out["by_symbol"]["ZZZZ"]["error"])
+
+
+class mock_attr:
+    def __init__(self, obj, name, value):
+        self.obj, self.name, self.value = obj, name, value
+
+    def __enter__(self):
+        self.old = getattr(self.obj, self.name)
+        setattr(self.obj, self.name, self.value)
+
+    def __exit__(self, *a):
+        setattr(self.obj, self.name, self.old)
+
+
+class mock_env:
+    def __init__(self, name, value):
+        self.name, self.value = name, value
+
+    def __enter__(self):
+        import os
+        self.old = os.environ.get(self.name)
+        if self.value is None:
+            os.environ.pop(self.name, None)
+        else:
+            os.environ[self.name] = self.value
+
+    def __exit__(self, *a):
+        import os
+        if self.old is None:
+            os.environ.pop(self.name, None)
+        else:
+            os.environ[self.name] = self.old
+
+
+class TestScannerInsider(unittest.TestCase):
+    """scanner 侧: 渲染 / 流水账 / 收盘价查找 / 异常降级。"""
+
+    def _event(self, **kw):
+        e = {"acc": "a", "filed": "2026-10-02", "owner": "Noto Anthony",
+             "owner_key": "1", "role": "董事/CEO", "date_lo": "2026-10-01",
+             "date_hi": "2026-10-01", "shares": 13888, "value": 250_787.0,
+             "avg_price": 18.06, "units_ok": True, "indirect": False,
+             "nature": "", "plan": False, "security": "Common Stock"}
+        e.update(kw)
+        return e
+
+    def _r(self, sym="SOFI", zone=(13.0, 16.0), insider_info=None, **kw):
+        r = TestRenderOpenZoneAlert._r(TestRenderOpenZoneAlert(), sym, 18.0,
+                                       list(zone) if zone else None)
+        r["insider"] = insider_info
+        r.update(kw)
+        return r
+
+    def _open(self, rs, meta):
+        now = datetime(2026, 10, 5, 9, 45, tzinfo=sc.ET)
+        return sc.render_open(rs, dict(TestRenderOpenZoneAlert.REGIME), now,
+                              sc.SETTINGS_DEFAULTS, meta)
+
+    META = {"enabled": True, "reason": None, "requests": 3, "by_symbol": {}}
+
+    def test_open_report_shows_new_buy_with_zone(self):
+        r = self._r(insider_info={"cik": SOFI, "new": [self._event()]})
+        text = self._open([r], self.META)
+        self.assertIn("🆕 **SOFI** 内部人买入: Noto Anthony (董事/CEO)", text)
+        self.assertIn("13,888 股 @18.06 ≈ $25.1万", text)
+        self.assertIn("价值区 13-16: 上方+13%", text)
+        self.assertNotIn("无异动", text)
+
+    def test_open_report_quiet_when_nothing_new(self):
+        r = self._r(zone=None, insider_info={"cik": SOFI, "new": []})
+        self.assertIn("财报/内部人买入 均未触发", self._open([r], self.META))
+        # 不带 meta (--no-insider) = 原文不变
+        self.assertIn("财报 均未触发", self._open([self._r(zone=None)], None))
+
+    def test_open_report_failure_is_not_silence(self):
+        r = self._r(zone=None, insider_info={"error": "连续 3 份 Form 4 取数失败"})
+        text = self._open([r], self.META)
+        self.assertIn("⚠️ 内部人数据获取失败: SOFI", text)
+        self.assertIn("不等于没有买入", text)
+        self.assertNotIn("无异动", text)
+
+    def test_disabled_says_so(self):
+        text = self._open([self._r(zone=None)], {"enabled": False,
+                                                 "reason": "未配置 SEC_EMAIL"})
+        self.assertIn("内部人数据未启用 (未配置 SEC_EMAIL)", text)
+
+    def test_event_line_units_and_invalid_zone(self):
+        tsm = sc.insider_event_line("TSM", self._event(units_ok=False, avg_price=76.2),
+                                    [280.0, 320.0])
+        self.assertIn("不对比价值区", tsm)
+        self.assertNotIn("价值区 280", tsm)
+        r = self._r(zone_invalid="拆股")
+        self.assertIsNone(sc._live_zone(r))
+        via = sc.insider_event_line("HOOD", self._event(indirect=True, nature="By Fund",
+                                                        plan=True), None)
+        self.assertIn("(间接: By Fund)", via)
+        self.assertIn("10b5-1 计划内", via)
+
+    def test_unknown_units_worded_as_unknown(self):
+        line = sc.insider_event_line("SOFI", self._event(units_ok=None), [13.0, 16.0])
+        self.assertIn("查不到成交日收盘价", line)
+        self.assertNotIn("单位不同", line)
+        s = ins.summarize([_b("2026-06-16", 13888, 18.06, units_ok=None)], date(2026, 10, 5))
+        dig = sc.insider_digest_line("SOFI", s, [13.0, 16.0])
+        self.assertIn("查不到成交日收盘价, 不算均价", dig)
+        both = ins.summarize([_b("2026-06-16", 13888, 18.06, units_ok=None),
+                              _b("2026-06-17", 13888, 18.06, units_ok=False, key="2")],
+                             date(2026, 10, 5))
+        self.assertIn("单位不同或查不到", sc.insider_digest_line("SOFI", both, None))
+        part = ins.summarize([_b("2026-06-16", 13888, 18.06),
+                              _b("2026-06-17", 100, 18.0, units_ok=None, key="2")],
+                             date(2026, 10, 5))
+        self.assertIn("部分成交查不到当天收盘价", sc.insider_digest_line("SOFI", part, None))
+
+    def test_close_block(self):
+        s1 = ins.summarize([_b("2026-06-16", 13888, 18.06),
+                            _b("2026-06-01", 15878, 15.73, key="2", owner="B")],
+                           date(2026, 10, 5))
+        s2 = ins.summarize([_b("2026-06-05", 250_000, 80.7368)], date(2026, 10, 5))
+        rs = [self._r("SOFI", insider_info={"cik": 1, "summary": s1, "new": []}),
+              self._r("HOOD", zone=(85.0, 105.0),
+                      insider_info={"cik": 2, "summary": s2, "new": []}),
+              self._r("QQQ", zone=None, insider_info=None)]
+        lines = sc.insider_block(rs, self.META)
+        body = [l for l in lines if l.startswith("- ")]
+        self.assertTrue(body[0].startswith("- **HOOD** 1 人 1 笔 $2,018万"))
+        self.assertIn("价值区 85-105: 破下沿-5%", body[0])
+        self.assertIn("2 人 2 笔", body[1])
+        self.assertIn("30 天内多人买入", body[1])
+        self.assertEqual(sc.insider_block(rs, None), [])
+        empty = sc.insider_block([self._r(insider_info={"cik": 1, "new": []})], self.META)
+        self.assertIn("- 无", empty)
+
+    def test_usd_short(self):
+        self.assertEqual(sc.usd_short(9_800), "$9,800")
+        self.assertEqual(sc.usd_short(250_787), "$25.1万")
+        self.assertEqual(sc.usd_short(55_306_258), "$5,531万")
+        self.assertEqual(sc.usd_short(1_545_942_571), "$15.46亿")
+        self.assertEqual(sc.usd_short(None), "—")
+
+    def test_journal_snapshot_none_vs_zero(self):
+        base = TestRecommendationJournal()._res
+        s90 = ins.summarize([_b("2026-09-01", 20_000, 16.0)], date(2026, 9, 21), 90)
+        cases = [
+            ({"cik": 1, "summary90": s90, "missing": 0, "partial_history": False}, (1, 320_000)),
+            ({"cik": 1, "summary90": None, "missing": 0, "partial_history": False}, (0, 0)),
+            ({"cik": 1, "summary90": s90, "missing": 2, "partial_history": False}, (None, None)),
+            ({"error": "x"}, (None, None)),
+            (None, (None, None)),
+        ]
+        for info, want in cases:
+            row = sc.journal_rows([base(insider=info)], "2026-09-21", "close", {})[0]
+            self.assertEqual((row["insider_buyers_90d"], row["insider_buy_usd_90d"]),
+                             want, info)
+
+    def test_close_lookup_on_or_before(self):
+        idx = pd.to_datetime(["2026-06-12", "2026-06-15", "2026-06-16"])
+        hist = pd.DataFrame({"Close": [10.0, 11.0, 12.0]}, index=idx)
+        at = sc._close_lookup(hist)
+        self.assertEqual(at("2026-06-14"), 10.0)    # 周日 -> 周五收盘
+        self.assertEqual(at("2026-06-16"), 12.0)
+        self.assertIsNone(at("2026-06-01"))
+        tz = hist.tz_localize("America/New_York")
+        self.assertEqual(sc._close_lookup(tz)("2026-06-15"), 11.0)
+        self.assertIsNone(sc._close_lookup(None)("2026-06-15"))
+
+    def test_attach_degrades_on_module_bug(self):
+        rs = [self._r("SOFI"), self._r("QQQ", zone=None)]
+        tickers = {"SOFI": {"kind": "stock"}, "QQQ": {"kind": "index"}}
+
+        def boom(*a, **k):
+            raise KeyError("filings")
+        with mock_attr(sc.insider, "run", boom):
+            meta = sc.attach_insider(rs, tickers, {}, date(2026, 10, 5))
+        self.assertIn("内部人模块异常", rs[0]["insider"]["error"])
+        self.assertIsNone(rs[1]["insider"])
+        self.assertTrue(meta["enabled"])
+
+class TestInsiderEvening(unittest.TestCase):
+    """晚间内部人检查 (--mode insider): cron 时点 / 窗口、zone 作废、发信与"已报过"。"""
+
+    BNE = ZoneInfo("Australia/Brisbane")
+    UTC = ZoneInfo("UTC")
+
+    def _fires_in_window(self, tz, hm_list, day):
+        """某个本地日期的几个 cron 时点里, 落进晚间窗口 (且美东是工作日) 的有几个。"""
+        n = 0
+        for h, m in hm_list:
+            et = datetime(day.year, day.month, day.day, h, m, tzinfo=tz).astimezone(sc.ET)
+            if et.weekday() < 5 and sc.in_window(et, sc.INSIDER_WINDOW):
+                n += 1
+        return n
+
+    def test_cron_pairs_fire_exactly_once_per_us_weekday(self):
+        # 布里斯班时钟 (droplet 实际): 12:15 / 13:15 周二到周六; UTC 模板: 02:15 / 03:15
+        for tz, hms in ((self.BNE, [(12, 15), (13, 15)]),
+                        (self.UTC, [(2, 15), (3, 15)])):
+            for start in (date(2026, 7, 14), date(2026, 1, 13),     # 美国夏令时 / 冬令时
+                          date(2026, 3, 10), date(2026, 11, 3)):    # 切换周前后
+                for k in range(5):                                  # 本地周二..周六
+                    day = start + timedelta(days=k)
+                    self.assertEqual(day.weekday() in (1, 2, 3, 4, 5), True)
+                    self.assertEqual(self._fires_in_window(tz, hms, day), 1,
+                                     f"{tz} {day}")
+                # 本地周日/周一 (= 美东周六/周日晚上) 一发都不跑
+                for k in (5, 6):
+                    day = start + timedelta(days=k)
+                    self.assertEqual(self._fires_in_window(tz, hms, day), 0,
+                                     f"{tz} {day}")
+
+    def test_crontab_example_matches_window(self):
+        text = (Path(sc.BASE) / "deploy" / "crontab.example").read_text(encoding="utf-8")
+        lines = [l for l in text.splitlines() if "run_scan.sh insider" in l]
+        self.assertEqual([l.split()[:5] for l in lines],
+                         [["15", "2", "*", "*", "2-6"], ["15", "3", "*", "*", "2-6"]])
+
+    def test_zone_invalid_for(self):
+        cfg = {"value_zone": [13.0, 16.0], "zone_asof": "2026-09-05"}
+        sig = sc.zone_sig(cfg["value_zone"], cfg["zone_asof"])
+        self.assertIsNone(sc.zone_invalid_for(cfg, None, {}))
+        sticky = {"zone_split": {"sig": sig, "info": "拆股 2:1 @ 2026-09-20"}}
+        self.assertEqual(sc.zone_invalid_for(cfg, None, sticky), "拆股 2:1 @ 2026-09-20")
+        # 重锚过 (sig 变了) = 旧的作废记录不再生效
+        old = {"zone_split": {"sig": "other", "info": "x"}}
+        self.assertIsNone(sc.zone_invalid_for(cfg, None, old))
+        idx = pd.to_datetime(["2026-09-04", "2026-09-21"])
+        hist = pd.DataFrame({"Close": [18.0, 9.0], "Stock Splits": [0.0, 2.0]}, index=idx)
+        self.assertEqual(sc.zone_invalid_for(cfg, hist, {}), "拆股 2:1 @ 2026-09-21")
+        self.assertIsNone(sc.zone_invalid_for({"value_zone": None}, hist, {}))
+
+    # ---- run_insider_check ------------------------------------------------------
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.reports, self.data = root / "reports", root / "data"
+        self.sent, self.runs = [], 0
+        self.fail_email = False
+        self.news = True
+        ev = TestScannerInsider._event(TestScannerInsider())
+        self.summary = ins.summarize([_b("2026-10-05", 13888, 18.06)], date(2026, 10, 5))
+
+        def fake_run(symbols, today, **kw):
+            self.runs += 1
+            return {"enabled": True, "reason": None, "requests": 2, "by_symbol": {
+                "SOFI": {"cik": SOFI, "summary": self.summary, "summary90": None,
+                         "new": [dict(ev, acc="acc-1")] if self.news else [],
+                         "missing": 0, "partial_history": False},
+                # HOOD 有汇总但没有新申报 —— 晚间邮件不该提它
+                "HOOD": {"cik": 1, "summary": self.summary, "summary90": None, "new": [],
+                         "missing": 0, "partial_history": False}}}
+
+        def fake_send(path, subject):
+            if self.fail_email:
+                raise RuntimeError("smtp down")
+            self.sent.append((path.name, subject))
+
+        cfg = lambda zone: {**sc.TICKER_DEFAULTS, "value_zone": zone}
+        tickers = {"SOFI": cfg([13.0, 16.0]), "HOOD": cfg([85.0, 105.0]),
+                   "QQQ": {**sc.TICKER_DEFAULTS, "kind": "index"}}
+        self.patches = [mock_attr(sc, "REPORTS", self.reports), mock_attr(sc, "DATA", self.data),
+                        mock_attr(sc, "load_config", lambda: (dict(sc.SETTINGS_DEFAULTS), tickers)),
+                        mock_attr(sc, "batch_history", lambda syms: {s_: None for s_ in syms}),
+                        mock_attr(sc, "load_state", lambda: {}),
+                        mock_attr(sc.insider, "run", fake_run),
+                        mock_attr(sc, "send_email_report", fake_send)]
+        for p_ in self.patches:
+            p_.__enter__()
+
+    def tearDown(self):
+        for p_ in reversed(self.patches):
+            p_.__exit__()
+        self.tmp.cleanup()
+
+    def _args(self, **kw):
+        import argparse
+        return argparse.Namespace(**{"force": False, "tickers": None, "email": True, **kw})
+
+    MON_2215 = datetime(2026, 10, 5, 22, 15, tzinfo=sc.ET)
+
+    def _check(self, args, t):
+        import contextlib
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            return sc.run_insider_check(args, t)
+
+    def _seen(self):
+        p_ = self.data / ins.SEEN_NAME
+        return json.loads(p_.read_text(encoding="utf-8")) if p_.exists() else {}
+
+    def test_outside_window_and_weekend_skip_without_fetching(self):
+        for t in (datetime(2026, 10, 5, 21, 59, tzinfo=sc.ET),
+                  datetime(2026, 10, 5, 23, 0, tzinfo=sc.ET),
+                  datetime(2026, 10, 10, 22, 15, tzinfo=sc.ET)):     # 周六
+            self.assertEqual(self._check(self._args(), t), sc.SKIP)
+        self.assertEqual(self.runs, 0)
+
+    def test_no_news_is_silent(self):
+        self.news = False
+        self.assertEqual(self._check(self._args(), self.MON_2215), sc.SKIP)
+        self.assertEqual(self.sent, [])
+        self.assertFalse(self.reports.exists() and any(self.reports.iterdir()))
+
+    def test_news_emailed_then_marked_seen(self):
+        self.assertEqual(self._check(self._args(), self.MON_2215), 0)
+        self.assertEqual(self.sent, [("2026-10-05-insider.md",
+                                      "[watchlist] 2026-10-05 内部人买入 — SOFI")])
+        self.assertTrue((self.reports / "2026-10-05-insider.sent").exists())
+        self.assertIn("acc-1", self._seen())
+        text = (self.reports / "2026-10-05-insider.md").read_text(encoding="utf-8")
+        self.assertIn("🆕 **SOFI** 内部人买入", text)
+        self.assertIn("## 这几只近 180 天的汇总", text)
+        self.assertNotIn("**HOOD**", text)         # 没有新申报的标的不进晚间邮件
+
+    def test_email_failure_leaves_it_for_the_open_report(self):
+        self.fail_email = True
+        self.assertEqual(self._check(self._args(), self.MON_2215), 1)
+        self.assertEqual(self._seen(), {})
+        self.assertFalse((self.reports / "2026-10-05-insider.sent").exists())
+
+    def test_manual_run_never_marks_seen(self):
+        self.assertEqual(self._check(self._args(force=True), self.MON_2215), 0)
+        self.assertEqual(self.sent[0][0], "2026-10-05-insider-manual.md")
+        self.assertTrue(self.sent[0][1].endswith(" manual"))
+        self.assertEqual(self._seen(), {})
+
+    def test_without_email_nothing_is_marked(self):
+        self.assertEqual(self._check(self._args(email=False), self.MON_2215), 0)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self._seen(), {})
+
+    def test_main_routes_insider_mode(self):
+        calls = []
+        with mock_attr(sc, "run_insider_check", lambda a, t: calls.append(a.mode) or 42), \
+                mock_attr(sc, "resend_pending_reports", lambda d, t: calls.append("resend")), \
+                mock_attr(sys, "argv", ["scanner.py", "--mode", "insider", "--email"]):
+            self.assertEqual(sc.main(), 42)
+        # 晚间这发也当 open/close 的补发班车
+        self.assertEqual(calls, ["resend", "insider"])
 
 
 if __name__ == "__main__":
