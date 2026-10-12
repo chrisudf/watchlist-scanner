@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 
 import insider as ins
+import revisions as rv
 import scanner as sc
 
 
@@ -5046,6 +5047,730 @@ class TestInsiderEvening(unittest.TestCase):
             self.assertEqual(sc.main(), 42)
         # 晚间这发也当 open/close 的补发班车
         self.assertEqual(calls, ["resend", "insider"])
+
+
+# ---------------------------------------------------------------------------
+# 分析师预期修正 (revisions.py, 2026-10-12) — 只做提示, 不进门控
+# ---------------------------------------------------------------------------
+
+_PERIODS = ["0q", "+1q", "0y", "+1y"]
+# MCD 2026-10-12 实测 (Yahoo 分析页; 家数 n 除 +1y 外为示意)
+MCD_REV = {"0q": (1, 1, 12, 10), "+1q": (1, 2, 9, 8),
+           "0y": (1, 2, 14, 11), "+1y": (1, 2, 15, 13)}
+MCD_TREND = {"0q": (3.38390, 3.38333, 3.40226, 3.39735, 3.44920),
+             "+1q": (3.29402, 3.28992, 3.30335, 3.30117, 3.36620),
+             "0y": (12.88746, 12.89223, 12.92878, 12.92840, 12.97671),
+             "+1y": (13.76586, 13.82299, 13.97841, 13.99430, 14.21318)}
+MCD_N = {"0q": 30, "+1q": 29, "0y": 34, "+1y": 32}
+# 每期 EPS (最低, 最高, 去年, 增长)
+MCD_EST = {"0q": (3.23, 3.5, 3.22, 0.0509), "+1q": (3.19, 3.5, 3.12, 0.0558),
+           "0y": (12.63, 13.23, 12.2, 0.0563), "+1y": (12.81, 14.73, 12.89, 0.0682)}
+# 每期营收 (家数, 平均, 最低, 最高, 去年, 增长)
+MCD_REVENUE = {"0q": (26, 7.29e9, 7.0e9, 7.4e9, 7.08e9, 0.0292),
+               "+1q": (26, 7.25e9, 6.97e9, 7.43e9, 7.01e9, 0.0346),
+               "0y": (31, 28.15e9, 27.41e9, 28.5e9, 26.89e9, 0.0469),
+               "+1y": (32, 28.96e9, 26.05e9, 30.61e9, 28.15e9, 0.029)}
+MCD_END = {"0q": "2026-09-30", "+1q": "2026-12-31", "0y": "2026-12-31",
+           "+1y": "2027-12-31"}
+
+_RCOLS = ["upLast7days", "upLast30days", "downLast30days", "downLast7Days"]
+_TCOLS = ["current", "7daysAgo", "30daysAgo", "60daysAgo", "90daysAgo"]
+_ECOLS = ["low", "high", "yearAgoEps", "growth"]
+_VCOLS = ["numberOfAnalysts", "avg", "low", "high", "yearAgoRevenue", "growth"]
+
+
+def _rev_frames(rev=MCD_REV, trend=MCD_TREND, n=MCD_N, est=MCD_EST, revenue=MCD_REVENUE):
+    """yfinance 公开接口原样的四张表 —— 列名照抄, 包括 downLast7Days 的大写 D。"""
+    idx = pd.Index(_PERIODS, name="period")
+
+    def frame(rows):
+        return pd.DataFrame(rows, index=idx)
+    return (frame([dict(zip(_RCOLS, rev[p]), currency="USD") for p in _PERIODS]),
+            frame([dict(zip(_TCOLS, trend[p]), currency="USD") for p in _PERIODS]),
+            frame([dict(zip(_ECOLS, est[p]), avg=trend[p][0], numberOfAnalysts=n[p],
+                        currency="USD") for p in _PERIODS]),
+            frame([dict(zip(_VCOLS, revenue[p]), currency="USD") for p in _PERIODS]))
+
+
+def _trend_json(rev=MCD_REV, trend=MCD_TREND, n=MCD_N, est=MCD_EST,
+                revenue=MCD_REVENUE, end=MCD_END, rev_ccy="USD"):
+    """quoteSummary 原始 JSON 的 trend 列表 —— 单元格包一层 {"raw", "fmt"}, 0 的
+    fmt 是 None, 缺值是 {} (downLast90days), 都照 2026-10-12 实测的样子。"""
+    def cell(v):
+        return {"raw": v, "fmt": None if v == 0 else str(v)}
+    return [{"maxAge": 1, "period": p, "endDate": end[p], "growth": cell(est[p][3]),
+             "earningsEstimate": {"avg": cell(trend[p][0]), "numberOfAnalysts": cell(n[p]),
+                                  **{k: cell(v) for k, v in zip(_ECOLS, est[p])},
+                                  "earningsCurrency": "USD"},
+             "revenueEstimate": {**{k: cell(v) for k, v in zip(_VCOLS, revenue[p])},
+                                 "revenueCurrency": rev_ccy},
+             "epsTrend": {**{k: cell(v) for k, v in zip(_TCOLS, trend[p])},
+                          "epsTrendCurrency": "USD"},
+             "epsRevisions": {**{k: cell(v) for k, v in zip(_RCOLS, rev[p])},
+                              "downLast90days": {}, "epsRevisionsCurrency": "USD"}}
+            for p in _PERIODS]
+
+
+def _modules(default=None, normalized=None):
+    """_fetch_raw 的返回形状; 默认 = MCD 默认口径 + 没有 Normalized。"""
+    return {rv.DEFAULT_MODULE: _trend_json() if default is None else default,
+            rv.NORMALIZED_MODULE: [] if normalized is None else normalized}
+
+
+# RKLB 2026-10-12: 下财年默认口径 -0.07 / ↑2↓6 / 14 家, Normalized +0.06 / ↑5↓0 / 9 家
+RKLB_NORM = dict(rev={**MCD_REV, "+1y": (1, 5, 0, 0)},
+                 trend={**MCD_TREND, "+1y": (0.05888, 0.05, 0.04, 0.04, 0.03)},
+                 n={**MCD_N, "+1y": 9})
+
+
+def _trend(y0, y1):
+    """只关心一次性判据的趋势数据: y0/y1 = (90 天前, 现在)。"""
+    return {"0y": {"eps_90d": y0[0], "eps": y0[1]},
+            "+1y": {"eps_90d": y1[0], "eps": y1[1]}}
+
+
+def _raw_boom(tk, sym):
+    raise RuntimeError("HTTP Error 404: Not Found")
+
+
+class _FakeYfTicker:
+    """yfinance 公开接口的替身。没有 _data —— 真的私有接口在它身上会 AttributeError,
+    正好模拟 yfinance 改了私有接口。"""
+
+    def __init__(self, frames=None, est_raises=False, public_forbidden=False):
+        self.frames = frames if frames is not None else (pd.DataFrame(),) * 4
+        self.est_raises = est_raises
+        self.public_forbidden = public_forbidden
+
+    def _get(self, i):
+        if self.public_forbidden:
+            raise AssertionError("私有接口拿到了, 不该再走公开接口")
+        return self.frames[i]
+
+    @property
+    def eps_revisions(self):
+        return self._get(0)
+
+    @property
+    def eps_trend(self):
+        return self._get(1)
+
+    @property
+    def earnings_estimate(self):
+        if self.est_raises:
+            raise KeyError("earningsEstimate")
+        return self._get(2)
+
+    @property
+    def revenue_estimate(self):
+        return self._get(3)
+
+
+class TestRevisionsParse(unittest.TestCase):
+    def test_yahoo_shape(self):
+        data = rv.parse(*_rev_frames())
+        p = data["+1y"]
+        self.assertEqual((p["up7"], p["up30"], p["down30"], p["down7"], p["n"]),
+                         (1, 2, 15, 13, 32))
+        self.assertIsInstance(p["down7"], int)      # 大写 D 的列也认得
+        self.assertAlmostEqual(p["eps"], 13.76586)
+        self.assertAlmostEqual(p["eps_30d"], 13.97841)
+        self.assertEqual((p["eps_low"], p["eps_high"], p["eps_year_ago"]), (12.81, 14.73, 12.89))
+        self.assertEqual((p["rev_n"], p["rev_avg"]), (32, 28.96e9))
+        self.assertIsInstance(p["rev_n"], int)
+        self.assertIsNone(p["end"])                 # 公开接口没有财年结束日
+        self.assertEqual(list(data), _PERIODS)
+
+    def test_empty_and_nan(self):
+        self.assertEqual(rv.parse(pd.DataFrame(), pd.DataFrame(), pd.DataFrame()), {})
+        self.assertEqual(rv.parse(None, None), {})
+        rdf, tdf, *_ = _rev_frames()
+        tdf.loc["+1y", "30daysAgo"] = float("nan")
+        p = rv.parse(rdf, tdf, None)["+1y"]
+        self.assertIsNone(p["eps_30d"])
+        self.assertIsNone(p["n"])                   # 没有家数表照样出
+        self.assertIsNone(p["rev_avg"])
+
+    def test_json_path_matches_dataframe_path(self):
+        js, df = rv.parse_trend_json(_trend_json()), rv.parse(*_rev_frames())
+
+        def strip(d):
+            return {p: {k: v for k, v in x.items() if k != "end"} for p, x in d.items()}
+        self.assertEqual(strip(js), strip(df))
+        self.assertEqual({p: x["end"] for p, x in js.items()}, MCD_END)
+
+    def test_json_empty_cells_and_junk(self):
+        items = _trend_json()
+        items[3]["epsRevisions"]["upLast30days"] = {}
+        items[3]["endDate"] = "late 2027"
+        items[2] = {"period": "0y", "epsTrend": {}, "epsRevisions": {}}
+        got = rv.parse_trend_json(items + [{"period": "-1q"}, "junk"])
+        self.assertIsNone(got["+1y"]["up30"])
+        self.assertIsNone(got["+1y"]["end"])        # 认不出的日期不收
+        self.assertNotIn("0y", got)                 # 全空的 period 不要
+        self.assertEqual(list(got), ["0q", "+1q", "+1y"])
+        self.assertEqual(rv.parse_trend_json(None), {})
+
+
+class TestRevisionsFetch(unittest.TestCase):
+    """先走私有接口 (一个请求, 两套口径全字段), 坏了默认口径退回公开接口。"""
+
+    def _fetch(self, raw_fetch, **fake):
+        return rv.fetch_one("MCD", lambda s: _FakeYfTicker(_rev_frames(), **fake),
+                            raw_fetch=raw_fetch)
+
+    def test_raw_path_has_everything(self):
+        got = self._fetch(lambda tk, s: _modules(normalized=_trend_json(**RKLB_NORM)),
+                          public_forbidden=True)
+        self.assertEqual((got["src"], got["raw_error"], got["normalized_error"]),
+                         ("raw", None, None))
+        p = got["data"]["+1y"]
+        self.assertEqual((p["down30"], p["end"], p["rev_avg"], p["eps_high"]),
+                         (15, "2027-12-31", 28.96e9, 14.73))
+        self.assertEqual(got["ccy"], {"eps": "USD", "rev": "USD"})
+        self.assertEqual((got["normalized"]["+1y"]["up30"], got["normalized"]["+1y"]["n"]),
+                         (5, 9))
+
+    def test_revenue_currency_kept_apart(self):
+        # TSM: EPS 是美元 (每 ADR), 营收是新台币
+        got = self._fetch(lambda tk, s: _modules(default=_trend_json(rev_ccy="TWD")),
+                          public_forbidden=True)
+        self.assertEqual(got["ccy"], {"eps": "USD", "rev": "TWD"})
+
+    def test_private_api_failure_falls_back_to_public(self):
+        got = self._fetch(_raw_boom)
+        self.assertEqual((got["src"], got["raw_error"]),
+                         ("yf", "RuntimeError: HTTP Error 404: Not Found"))
+        p = got["data"]["+1y"]
+        self.assertEqual((p["down30"], p["rev_avg"]), (15, 28.96e9))   # 默认口径照常
+        self.assertIsNone(p["end"])                                   # 只缺结束日
+        self.assertEqual(got["ccy"], {"eps": "USD", "rev": "USD"})
+        self.assertIsNone(got["normalized"])
+        self.assertEqual(got["normalized_error"], "RuntimeError: HTTP Error 404: Not Found")
+
+    def test_real_private_api_drift(self):
+        # 真的 _fetch_raw: yfinance 哪天把 _data 改没了, 也只是退回公开接口
+        got = rv.fetch_one("MCD", lambda s: _FakeYfTicker(_rev_frames()))
+        self.assertEqual(got["src"], "yf")
+        self.assertTrue(got["raw_error"].startswith("AttributeError"))
+        self.assertEqual(got["data"]["+1y"]["down30"], 15)
+
+    def test_raw_without_default_module(self):
+        got = self._fetch(lambda tk, s: _modules(default=[], normalized=_trend_json()))
+        self.assertEqual((got["src"], got["raw_error"]), ("yf", "私有接口没返回默认口径"))
+        self.assertEqual(got["normalized"]["+1y"]["up30"], 2)
+
+    def test_only_normalized_missing(self):
+        got = self._fetch(lambda tk, s: _modules(), public_forbidden=True)
+        self.assertEqual(got["src"], "raw")
+        self.assertIsNone(got["normalized"])
+        self.assertEqual(got["normalized_error"], "Yahoo 返回空表")
+
+    def test_empty_everywhere_is_an_error_not_silence(self):
+        for raw in (lambda tk, s: _modules(default=[]), _raw_boom, rv._fetch_raw):
+            with self.assertRaises(rv.EmptyData):
+                rv.fetch_one("SOFI", lambda s: _FakeYfTicker(), raw_fetch=raw)
+
+    def test_public_extra_tables_optional(self):
+        got = self._fetch(_raw_boom, est_raises=True)
+        self.assertEqual(got["data"]["+1y"]["down30"], 15)
+        self.assertIsNone(got["data"]["+1y"]["n"])
+        # 家数表缺了, EPS 币种从趋势表拿 (PR #24 评审: 降级的日子别再丢币种)
+        self.assertEqual(got["ccy"], {"eps": "USD", "rev": "USD"})
+
+
+class TestRevisionsOneTime(unittest.TestCase):
+    """判据照抄 sec-filing-downloader ref_table.one_time_warning。"""
+
+    def test_amzn_anthropic_hit(self):
+        # 2026-10-12 实测: 本财年 8.68 -> 12.89 (+48%), 下财年 9.98 -> 10.53 (+5.5%)
+        f = rv.one_time_flag(_trend((8.68482, 12.89077), (9.98486, 10.53332)))
+        self.assertAlmostEqual(f["j0"], 0.4843, places=3)
+        self.assertAlmostEqual(f["j1"], 0.0549, places=3)
+        data = rv.parse(*_rev_frames())
+        data["0y"].update(eps_90d=8.68482, eps=12.89077)
+        data["+1y"].update(eps_90d=9.98486, eps=10.53332)
+        text = rv.line("AMZN", {"data": data, "flag": rv.one_time_flag(data)})
+        self.assertIn("本财年一致预期 90 天 +48%、下财年仅 +5%", text)
+        self.assertTrue(text.endswith("上调疑似一次性收益驱动，看下财年"))
+
+    def test_real_upgrades_do_not_hit(self):
+        # NVDA: 两年一起抬, 下财年抬得更多
+        self.assertIsNone(rv.one_time_flag(_trend((8.93743, 9.31242), (12.71023, 15.9146))))
+        # COHR: 本财年 +15.3% 过了 15% 下限, 但不到下财年 +12.2% 的 2.5 倍
+        self.assertIsNone(rv.one_time_flag(_trend((8.17378, 9.42042), (12.51568, 14.04555))))
+        # 本财年 +14% 而下财年不动: 没过 15% 下限
+        self.assertIsNone(rv.one_time_flag(_trend((10.0, 11.4), (12.0, 12.0))))
+
+    def test_loss_or_zero_crossing_never_hits(self):
+        # SPCX: 本财年 90 天前 -0.53, 现在 +0.16 —— 百分比没有方向
+        self.assertIsNone(rv.one_time_flag(_trend((-0.53361, 0.16289), (0.67591, 2.07419))))
+        self.assertIsNone(rv.one_time_flag(_trend((0.0, 1.0), (1.0, 1.0))))
+        self.assertIsNone(rv.one_time_flag(_trend((None, 1.0), (1.0, 1.0))))
+        self.assertIsNone(rv.one_time_flag({}))
+
+    def test_downward_one_time_worded_as_loss(self):
+        data = rv.parse(*_rev_frames())
+        data["0y"].update(eps_90d=10.0, eps=7.0)          # 减值进了 GAAP 口径
+        data["+1y"].update(eps_90d=11.0, eps=10.8)
+        text = rv.line("XYZ", {"data": data, "flag": rv.one_time_flag(data)})
+        self.assertIn("-30%", text)
+        self.assertIn("下调疑似一次性损失驱动，看下财年", text)
+        self.assertNotIn("上调疑似", text)
+
+
+class TestRevisionsReport(unittest.TestCase):
+    def _info(self, **plus):
+        data = rv.parse(*_rev_frames())
+        data["+1y"].update(plus)
+        return {"data": data, "flag": rv.one_time_flag(data)}
+
+    def test_line_mcd(self):
+        self.assertEqual(rv.line("MCD", self._info()),
+                         "- **MCD** 下财年 32 家: 30天 ↑2/↓15 净 -41% (7天 ↑1/↓13)，"
+                         "一致预期 30 天 -1.5%、90 天 -3.1%")
+
+    def test_line_earnings_date(self):
+        self.assertTrue(rv.line("MCD", self._info(), "2026-11-05").endswith(" · 财报 11-05"))
+        for bad in ("", None, "TBD"):
+            self.assertNotIn("财报", rv.line("MCD", self._info(), bad))
+
+    def test_loss_maker_reports_absolute(self):
+        # RKLB 下财年: -0.08929 -> -0.06557 是减亏, 百分比会算成 -27%
+        text = rv.line("RKLB", self._info(eps=-0.06557, eps_30d=-0.08929, eps_90d=-0.03818))
+        self.assertIn("一致预期 30 天 -0.09→-0.07、90 天 -0.04→-0.07", text)
+
+    def test_breadth_not_raw_counts(self):
+        # SOFI 9 家里 ↑2/↓0 = +22%, AMZN 53 家里 ↑4/↓0 = +8% —— 按家数 AMZN 在前, 按净比例 SOFI 在前
+        items = [("MCD", self._info()), ("AMZN", self._info(up30=4, down30=0, n=53)),
+                 ("SOFI", self._info(up30=2, down30=0, n=9))]
+        body = [l for l in rv.report_block(items) if l.startswith("- ")]
+        self.assertEqual([l.split("**")[1] for l in body], ["SOFI", "AMZN", "MCD"])
+        self.assertIn("净 +22%", body[0])
+        self.assertIsNone(rv.breadth({"up30": 2, "down30": 0, "n": None}))
+        self.assertNotIn("净", rv.line("XYZ", self._info(n=None)))
+
+    def test_block_sorted_etf_silent_failures_one_line(self):
+        nvda = self._info(up30=46, down30=0, n=52)
+        items = [("MCD", self._info()), ("QQQ", None), ("NVDA", nvda),
+                 ("SOFI", {"error": "Yahoo 返回空表"}),
+                 ("HOOD", {"error": "Yahoo 返回空表"}),
+                 ("TSM", {"error": "ConnectionError: reset"})]
+        lines = rv.report_block(items, {"NVDA": "2026-11-17"})
+        self.assertEqual(lines[0], "## 分析师预期修正 (下财年 EPS, Yahoo)")
+        body = [l for l in lines if l.startswith("- ")]
+        self.assertTrue(body[0].startswith("- **NVDA**"))     # 净上调比例高的在前
+        self.assertIn("净 +88%", body[0])
+        self.assertTrue(body[0].endswith("· 财报 11-17"))
+        self.assertTrue(body[1].startswith("- **MCD**"))
+        warn = [l for l in body if "⚠️" in l]
+        self.assertEqual(len(warn), 1)                       # 失败只占一行
+        self.assertIn("SOFI, HOOD (Yahoo 返回空表); TSM (ConnectionError: reset)", warn[0])
+        self.assertNotIn("QQQ", "\n".join(lines))            # ETF/指数静默
+        self.assertIn("未经回测", lines[-2])
+
+    def test_block_missing_next_fy_and_empty(self):
+        data = rv.parse(*_rev_frames())
+        del data["+1y"]
+        lines = rv.report_block([("MCD", {"data": data, "flag": None})])
+        self.assertIn("MCD (缺下财年修正数据)", "\n".join(lines))
+        self.assertIn("- 无 (没有个股)", rv.report_block([("QQQ", None)]))
+
+    def test_fallback_and_normalized_warnings_are_separate(self):
+        ok = dict(self._info(), src="raw")
+        yf = dict(ok, src="yf", raw_error="AttributeError: _data",
+                  normalized_error="AttributeError: _data")
+        no_norm = dict(ok, normalized_error="Yahoo 返回空表")
+        lines = rv.report_block([("SOFI", yf), ("TSM", yf), ("HOOD", no_norm), ("MCD", ok)])
+        body = [l for l in lines if l.startswith("- ")]
+        self.assertEqual(len(body), 6)                # 四行照常 + 两行 ⚠️
+        self.assertIn("- ⚠️ 私有接口取不到: SOFI, TSM (AttributeError: _data) — 上面照常",
+                      body[4])
+        self.assertIn("快照缺 Normalized 和财年结束日", body[4])
+        self.assertTrue(body[5].startswith("- ⚠️ Normalized 口径取不到: HOOD (Yahoo 返回空表)"))
+        self.assertNotIn("分析师修正取不到", "\n".join(lines))
+        self.assertFalse(any(l.startswith("- ⚠️") for l in rv.report_block([("MCD", ok)])))
+
+
+class TestRevisionsRunAndAttach(unittest.TestCase):
+    def test_run_isolates_failures(self):
+        def fetch(sym):
+            if sym == "BAD":
+                raise ConnectionError("Connection reset by peer\nmore")
+            if sym == "EMPTY":
+                raise rv.EmptyData("Yahoo 返回空表")
+            return {"data": rv.parse(*_rev_frames()), "normalized": None,
+                    "normalized_error": "HTTPError: 404"}
+        out = rv.run(["MCD", "BAD", "EMPTY"], workers=2, fetch=fetch)["by_symbol"]
+        self.assertEqual(out["BAD"], {"error": "ConnectionError: Connection reset by peer"})
+        self.assertEqual(out["EMPTY"], {"error": "Yahoo 返回空表"})
+        self.assertEqual(out["MCD"]["data"]["+1y"]["down30"], 15)
+        self.assertEqual(out["MCD"]["normalized_error"], "HTTPError: 404")
+        self.assertIsNone(out["MCD"]["flag"])
+
+    def _results(self):
+        mk = TestRenderOpenZoneAlert._r
+        return [mk(TestRenderOpenZoneAlert(), s, 18.0, None) for s in ("SOFI", "QQQ", "GLD")]
+
+    TICKERS = {"SOFI": {"kind": "stock"}, "QQQ": {"kind": "index"}, "GLD": {"kind": "etf"}}
+
+    def _fake_run(self, asked):
+        def fake_run(symbols, workers=4):
+            asked.extend(symbols)
+            return {"by_symbol": {s_: {"data": rv.parse(*_rev_frames()), "flag": None}
+                                  for s_ in symbols}}
+        return fake_run
+
+    def test_attach_never_fetches_etf_or_index(self):
+        asked = []
+        rs = self._results()
+        with mock_attr(sc.revisions, "run", self._fake_run(asked)):
+            sc.attach_revisions(rs, self.TICKERS)
+        self.assertEqual(asked, ["SOFI"])
+        self.assertIsNone(rs[1]["revisions"])
+        self.assertIsNone(rs[2]["revisions"])
+        self.assertEqual(rs[0]["revisions"]["data"]["+1y"]["up30"], 2)
+
+    def test_block_takes_next_earnings_from_results(self):
+        rs = self._results()
+        rs[0]["earnings"] = "2026-11-03"
+        with mock_attr(sc.revisions, "run", self._fake_run([])):
+            meta = sc.attach_revisions(rs, self.TICKERS)
+        body = [l for l in sc.revisions_block(rs, meta) if l.startswith("- **SOFI**")]
+        self.assertTrue(body[0].endswith("· 财报 11-03"))
+
+    def test_module_bug_degrades_to_one_note(self):
+        def boom(*a, **k):
+            raise KeyError("trend")
+        rs = self._results()
+        with mock_attr(sc.revisions, "run", boom):
+            meta = sc.attach_revisions(rs, self.TICKERS)
+        self.assertIn("修正模块异常", rs[0]["revisions"]["error"])
+        self.assertIsNone(rs[1]["revisions"])
+        now = datetime(2026, 10, 12, 9, 45, tzinfo=sc.ET)
+        text = sc.render_open(rs, dict(TestRenderOpenZoneAlert.REGIME), now,
+                              sc.SETTINGS_DEFAULTS, None, meta)
+        self.assertIn("## 分析师预期修正", text)
+        self.assertIn("⚠️ 分析师修正取不到: SOFI (修正模块异常: KeyError: 'trend')", text)
+        # 修正段不进异动列表: 其他什么都没触发时照样"无异动"
+        self.assertIn("无异动", text)
+
+    def test_no_revisions_meta_renders_nothing(self):
+        rs = self._results()
+        now = datetime(2026, 10, 12, 9, 45, tzinfo=sc.ET)
+        text = sc.render_open(rs, dict(TestRenderOpenZoneAlert.REGIME), now,
+                              sc.SETTINGS_DEFAULTS)
+        self.assertNotIn("分析师", text)
+        self.assertEqual(sc.revisions_block(rs, None), [])
+
+
+class TestRevisionsSnapshot(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "data" / rv.SNAPSHOT_NAME
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _by(self):
+        mcd = rv.fetch_one("MCD", lambda s: _FakeYfTicker(public_forbidden=True),
+                           raw_fetch=lambda tk, s: _modules(normalized=_trend_json(**RKLB_NORM)))
+        return {"MCD": {**mcd, "flag": None}, "BAD": {"error": "Yahoo 返回空表"}}
+
+    def _read(self):
+        import csv
+        with self.path.open(newline="", encoding="utf-8") as f:
+            rd = csv.DictReader(f)
+            return rd.fieldnames, list(rd)
+
+    def test_column_layout(self):
+        f = rv.SNAPSHOT_FIELDS
+        self.assertEqual(len(f), len(set(f)))
+        self.assertEqual(len(f), 5 + 4 * (len(rv.SHARED_KEYS) + len(rv.EPS_KEYS))
+                         + 4 * len(rv.EPS_KEYS))
+        self.assertEqual(f[:5], ["date", "symbol", "src", "eps_ccy", "rev_ccy"])
+        for c in ("+1y_end", "+1y_rev_avg", "+1y_eps_low", "norm_+1y_eps_high", "norm_0q_up30"):
+            self.assertIn(c, f)
+        # 营收和结束日不分口径, 只存一份
+        self.assertFalse([c for c in f if c.startswith(rv.NORM_PREFIX)
+                          and ("_rev_" in c or c.endswith("_end"))])
+
+    def test_rows_and_dedup(self):
+        rows = rv.snapshot_rows(self._by(), "2026-10-12")
+        self.assertEqual([r["symbol"] for r in rows], ["MCD"])   # 失败的不写
+        self.assertEqual(rv.append_snapshot(rows, self.path), 1)
+        self.assertEqual(rv.append_snapshot(rows, self.path), 0)  # 同一天同一票不重复
+        self.assertEqual(rv.append_snapshot(rv.snapshot_rows(self._by(), "2026-10-13"),
+                                            self.path), 1)
+        header, got = self._read()
+        self.assertEqual(header, rv.SNAPSHOT_FIELDS)
+        self.assertEqual([(r["date"], r["symbol"]) for r in got],
+                         [("2026-10-12", "MCD"), ("2026-10-13", "MCD")])
+        r = got[0]
+        self.assertEqual((r["src"], r["eps_ccy"], r["rev_ccy"]), ("raw", "USD", "USD"))
+        self.assertEqual((r["+1y_up30"], r["+1y_down30"], r["+1y_n"]), ("2", "15", "32"))
+        self.assertEqual((r["0y_eps"], r["0y_eps_90d"]), ("12.88746", "12.97671"))
+        self.assertEqual((r["+1y_end"], r["0q_end"]), ("2027-12-31", "2026-09-30"))
+        self.assertEqual((r["+1y_eps_low"], r["+1y_eps_high"]), ("12.81", "14.73"))
+        self.assertEqual((r["+1y_rev_n"], float(r["+1y_rev_avg"])), ("32", 28.96e9))
+        self.assertEqual((r["norm_+1y_up30"], r["norm_+1y_n"]), ("5", "9"))
+
+    def test_append_path_only_reads_keys(self):
+        # PR #24 评审: 文件会长到上万行 × 145 列, 平常追加只该读 (date, symbol)
+        self.assertEqual(rv.append_snapshot(rv.snapshot_rows(self._by(), "2026-10-12"),
+                                            self.path), 1)
+
+        def no_full_rows(*a, **k):
+            raise AssertionError("追加路径把整行读进来了")
+        with mock_attr(rv.csv, "DictReader", no_full_rows):
+            self.assertEqual(rv.append_snapshot(rv.snapshot_rows(self._by(), "2026-10-12"),
+                                                self.path), 0)
+            self.assertEqual(rv.append_snapshot(rv.snapshot_rows(self._by(), "2026-10-13"),
+                                                self.path), 1)
+        self.assertEqual([r["date"] for r in self._read()[1]], ["2026-10-12", "2026-10-13"])
+
+    def test_old_header_rewritten_as_union(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text("date,symbol,+1y_up30,legacy\n2026-10-09,NVDA,46,x\n",
+                             encoding="utf-8")
+        self.assertEqual(rv.append_snapshot(rv.snapshot_rows(self._by(), "2026-10-12"),
+                                            self.path), 1)
+        header, got = self._read()
+        self.assertEqual(header[:4], ["date", "symbol", "+1y_up30", "legacy"])
+        self.assertEqual(set(header), set(rv.SNAPSHOT_FIELDS) | {"legacy"})
+        self.assertEqual(got[0]["+1y_up30"], "46")      # 旧行原样保留
+        self.assertEqual(got[0]["legacy"], "x")
+        self.assertEqual(got[1]["+1y_down30"], "15")
+        self.assertFalse(self.path.with_name(self.path.name + ".tmp").exists())
+
+    def test_both_bases_and_fallback_rows(self):
+        dflt = rv.parse_trend_json(_trend_json())
+        dflt["+1y"].update(eps=-0.06557, up30=2, down30=6, n=14)
+        by = {"RKLB": {"data": dflt, "src": "raw",
+                       "normalized": rv.parse_trend_json(_trend_json(**RKLB_NORM))},
+              "SOFI": {"data": rv.parse(*_rev_frames()), "src": "yf", "normalized": None,
+                       "normalized_error": "x", "ccy": {"eps": "USD", "rev": "USD"}}}
+        rows = {r["symbol"]: r for r in rv.snapshot_rows(by, "2026-10-12")}
+        r = rows["RKLB"]
+        self.assertEqual((r["+1y_eps"], r["+1y_up30"], r["+1y_down30"], r["+1y_n"]),
+                         (-0.06557, 2, 6, 14))
+        self.assertEqual((r["norm_+1y_eps"], r["norm_+1y_up30"], r["norm_+1y_down30"],
+                          r["norm_+1y_n"]), (0.05888, 5, 0, 9))
+        self.assertEqual(list(r), rv.SNAPSHOT_FIELDS)
+        # 退回公开接口的行照写: 默认口径和营收都在, 结束日和 norm_ 列留空
+        s = rows["SOFI"]
+        self.assertEqual((s["src"], s["+1y_down30"], s["+1y_rev_avg"]), ("yf", 15, 28.96e9))
+        self.assertIsNone(s["+1y_end"])
+        self.assertTrue(all(s[c] is None for c in rv.SNAPSHOT_FIELDS
+                            if c.startswith(rv.NORM_PREFIX)))
+
+
+class TestRevisionsUniverse(unittest.TestCase):
+    """扩展快照池 (标普 100) 的文件、状态文件和缺口提示。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.status = self.dir / rv.STATUS_NAME
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_repo_universe_file(self):
+        u = rv.load_universe(Path(sc.BASE) / rv.UNIVERSE_NAME)
+        self.assertEqual(len(u), 100)                   # 101 行成分表去掉 GOOGL
+        self.assertEqual(len(u), len(set(u)))
+        self.assertIn("GOOG", u)
+        self.assertNotIn("GOOGL", u)                    # 和 GOOG 预期逐字相同
+        self.assertIn("BRK-B", u)                       # Yahoo 写法, 不是 BRK.B
+        self.assertTrue(all(re.fullmatch(r"[A-Z]{1,5}(-[A-Z])?", s) for s in u), u)
+
+    def test_load_universe_parsing(self):
+        p = self.dir / "u.txt"
+        p.write_text("# 注释 AAPL\nmsft, nvda  # 行尾注释\n\nNVDA\tBRK-B\n", encoding="utf-8")
+        self.assertEqual(rv.load_universe(p), ["MSFT", "NVDA", "BRK-B"])
+        self.assertEqual(rv.load_universe(self.dir / "missing.txt"), [])
+
+    def _write(self, by, wanted=("JPM", "XOM", "KO"), crash=None, day="2026-10-14"):
+        rv.write_status(self.status, day, list(wanted), by, crash=crash)
+
+    def test_gap_is_flagged(self):
+        ok = {"data": {"+1y": {}}}
+        self._write({"JPM": ok, "XOM": {"error": "Yahoo 返回空表"}})
+        st = json.loads(self.status.read_text(encoding="utf-8"))
+        self.assertEqual((st["wanted"], st["got"]), (3, 1))
+        w = rv.status_warning(self.status, date(2026, 10, 15))
+        self.assertIn("扩展快照 (标普 100) 2026-10-14 只存到 1/3 只: "
+                      "XOM (Yahoo 返回空表); KO (没取到)", w)
+        self._write({s_: ok for s_ in ("JPM", "XOM", "KO")})
+        self.assertIsNone(rv.status_warning(self.status, date(2026, 10, 15)))
+
+    def test_stale_missing_and_corrupt(self):
+        self._write({s_: {"data": {"+1y": {}}} for s_ in ("JPM", "XOM", "KO")},
+                    day="2026-10-09")                    # 周五
+        # 最长正常间隔是周五 → 周一假日后的周二 (4 天), 再留一天余量; 6 天没跑才报
+        self.assertIsNone(rv.status_warning(self.status, date(2026, 10, 14)))
+        self.assertIn("最近一次是 2026-10-09, 之后没跑",
+                      rv.status_warning(self.status, date(2026, 10, 15)))
+        self.assertIsNone(rv.status_warning(self.dir / "none.json", date(2026, 10, 15)))
+        self.status.write_text("{oops", encoding="utf-8")
+        self.assertIn("状态文件读不了", rv.status_warning(self.status, date(2026, 10, 15)))
+
+    def test_public_fallback_counts_as_degraded(self):
+        # PR #24 评审: 退回公开接口的行存了, 但缺 end 和 Normalized —— 不能算完整
+        ok = {"data": {"+1y": {}}, "src": "raw"}
+        yf = {"data": {"+1y": {}}, "src": "yf", "raw_error": "YFRateLimitError"}
+        self._write({"JPM": yf, "XOM": ok, "KO": ok})
+        st = json.loads(self.status.read_text(encoding="utf-8"))
+        self.assertEqual((st["got"], st["degraded"]), (3, {"YFRateLimitError": ["JPM"]}))
+        w = rv.status_warning(self.status, date(2026, 10, 15))
+        self.assertIn("2026-10-14 1 只退回公开接口、缺财年结束日和 Normalized: "
+                      "JPM (YFRateLimitError)", w)
+        self.assertNotIn("只存到", w)
+        self._write({"JPM": yf, "XOM": {"error": "Yahoo 返回空表"}, "KO": ok})
+        w = rv.status_warning(self.status, date(2026, 10, 15))
+        self.assertIn("只存到 2/3 只: XOM (Yahoo 返回空表)；1 只退回公开接口", w)
+
+    def test_crash_and_long_lists(self):
+        wanted = [f"S{i}" for i in range(9)]
+        self._write({}, wanted=wanted, crash="RuntimeError: Too Many Requests")
+        w = rv.status_warning(self.status, date(2026, 10, 14))
+        self.assertIn("只存到 0/9 只: S0, S1, S2, S3, S4, S5 等 9 只 "
+                      "(RuntimeError: Too Many Requests)", w)
+
+
+class TestRevisionsMain(unittest.TestCase):
+    """main() 的接线: 快照只在定时尾盘扫描写, --force/--tickers/开盘都不写;
+    --no-revisions 整段不拉不出; 扩展快照池在报告和邮件之后取。"""
+
+    UNIVERSE = ["SOFI", "QQQ", "JPM", "XOM"]    # SOFI 已在 watchlist, QQQ 是指数
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.reports, self.data = root / "reports", root / "data"
+        self.asked = []
+        self.report_first = None
+        self.extra_boom = False
+        self.xom_fails = False
+
+        def fake_run(symbols, workers=4):
+            self.asked.append(list(symbols))
+            if "JPM" in symbols:            # 扩展快照那一轮
+                self.report_first = any(self.reports.glob("*-close.md"))
+                if self.extra_boom:
+                    raise RuntimeError("Too Many Requests")
+            return {"by_symbol": {
+                s_: ({"error": "Yahoo 返回空表"} if s_ == "XOM" and self.xom_fails
+                     else {"data": rv.parse(*_rev_frames()), "flag": None})
+                for s_ in symbols}}
+
+        cfg = {**sc.TICKER_DEFAULTS, "value_zone": [13.0, 16.0]}
+        tickers = {"SOFI": cfg, "QQQ": {**sc.TICKER_DEFAULTS, "kind": "index"}}
+        self.patches = [
+            mock_attr(sc, "REPORTS", self.reports), mock_attr(sc, "DATA", self.data),
+            mock_attr(sc, "IV_HISTORY", self.data / "iv_history.csv"),
+            mock_attr(sc, "load_config", lambda: (dict(sc.SETTINGS_DEFAULTS), dict(tickers))),
+            mock_attr(sc, "fetch_regime", lambda s: dict(TestRenderOpenZoneAlert.REGIME)),
+            mock_attr(sc, "batch_history", lambda syms: {s_: None for s_ in syms}),
+            mock_attr(sc, "market_is_live", lambda: True),
+            mock_attr(sc, "next_earnings", lambda tk: None),
+            mock_attr(sc, "load_state", lambda: {}),
+            mock_attr(sc, "save_state", lambda st: None),
+            mock_attr(sc, "append_journal", lambda rows, path=None: 0),
+            mock_attr(sc.revisions, "run", fake_run),
+            mock_attr(sc.revisions, "load_universe", lambda path: list(self.UNIVERSE))]
+        for p_ in self.patches:
+            p_.__enter__()
+
+    def tearDown(self):
+        for p_ in reversed(self.patches):
+            p_.__exit__()
+        self.tmp.cleanup()
+
+    def _main(self, *argv):
+        import contextlib
+        with mock_attr(sys, "argv", ["scanner.py", "--no-insider", "--no-options", *argv]), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            return sc.main()
+
+    def _snap(self):
+        return self.data / rv.SNAPSHOT_NAME
+
+    def _report(self, name):
+        return (self.reports / name).read_text(encoding="utf-8")
+
+    def _today(self):
+        return datetime.now(sc.ET).strftime("%Y-%m-%d")
+
+    def test_force_close_reports_but_never_snapshots(self):
+        self.assertEqual(self._main("--mode", "close", "--force"), 0)
+        self.assertFalse(self._snap().exists())
+        self.assertEqual(self.asked, [["SOFI"]])
+        text = self._report(f"{self._today()}-close-manual.md")
+        self.assertIn("## 分析师预期修正", text)
+        self.assertIn("- **SOFI** 下财年 32 家: 30天 ↑2/↓15", text)
+
+    def test_tickers_subset_never_snapshots(self):
+        self.assertEqual(self._main("--mode", "close", "--tickers", "SOFI"), 0)
+        self.assertFalse(self._snap().exists())
+        self.assertEqual(self.asked, [["SOFI"]])     # 扩展池也不取
+
+    def _rows(self):
+        import csv
+        with self._snap().open(newline="", encoding="utf-8") as f:
+            return [(r["date"], r["symbol"]) for r in csv.DictReader(f)]
+
+    def _status(self):
+        return json.loads((self.data / rv.STATUS_NAME).read_text(encoding="utf-8"))
+
+    def test_scheduled_close_snapshots_watchlist_then_universe(self):
+        self.assertEqual(self._main("--mode", "close"), 0)
+        # watchlist 个股先取 (报告要用), 扩展池只取 watchlist 之外的个股, 指数不取
+        self.assertEqual(self.asked, [["SOFI"], ["JPM", "XOM"]])
+        self.assertTrue(self.report_first)          # 扩展池在报告写盘之后
+        self.assertEqual(self._rows(), [(self._today(), s_) for s_ in ("SOFI", "JPM", "XOM")])
+        self.assertEqual((self._status()["wanted"], self._status()["got"]), (2, 2))
+        text = self._report(f"{self._today()}-close.md")
+        self.assertIn("## 分析师预期修正", text)
+        self.assertNotIn("JPM", text)               # 扩展池不进报告
+
+    def test_universe_runs_even_if_email_fails(self):
+        def boom(path, subject):
+            raise RuntimeError("smtp down")
+        with mock_attr(sc, "send_email_report", boom), \
+                mock_attr(sc, "resend_pending_reports", lambda d, t: None):
+            self.assertEqual(self._main("--mode", "close", "--email"), 1)
+        self.assertEqual(self._rows()[1:], [(self._today(), "JPM"), (self._today(), "XOM")])
+
+    def test_universe_gap_shows_in_next_report(self):
+        self.xom_fails = True
+        self.assertEqual(self._main("--mode", "close"), 0)
+        self.assertEqual((self._status()["wanted"], self._status()["got"]), (2, 1))
+        self.assertEqual(self._main("--mode", "open", "--force"), 0)
+        self.assertIn(f"⚠️ 扩展快照 (标普 100) {self._today()} 只存到 1/2 只: "
+                      "XOM (Yahoo 返回空表)", self._report(f"{self._today()}-open-manual.md"))
+
+    def test_universe_crash_is_recorded_not_raised(self):
+        self.extra_boom = True
+        self.assertEqual(self._main("--mode", "close"), 0)
+        self.assertEqual(self._rows(), [(self._today(), "SOFI")])
+        st = self._status()
+        self.assertEqual((st["wanted"], st["got"]), (2, 0))
+        self.assertEqual(st["failed"], {"RuntimeError: Too Many Requests": ["JPM", "XOM"]})
+
+    def test_scheduled_open_shows_but_never_snapshots(self):
+        self.assertEqual(self._main("--mode", "open"), 0)
+        self.assertFalse(self._snap().exists())
+        self.assertEqual(self.asked, [["SOFI"]])
+        self.assertIn("## 分析师预期修正", self._report(f"{self._today()}-open.md"))
+
+    def test_no_revisions_flag(self):
+        self.assertEqual(self._main("--mode", "close", "--no-revisions"), 0)
+        self.assertEqual(self.asked, [])
+        self.assertFalse(self._snap().exists())
+        self.assertNotIn("分析师", self._report(f"{self._today()}-close.md"))
 
 
 if __name__ == "__main__":
