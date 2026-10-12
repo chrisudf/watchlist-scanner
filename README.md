@@ -395,7 +395,11 @@ watchlist 里的个股 (ETF/指数跳过) 出现**公开市场买入**时提示�
   `one_time_warning`。
 - **快照**: 雅虎没有历史, 定时尾盘扫描每天把四个 period 的家数和一致预期
   追加到 `data/eps_revisions.csv` (手动跑不写), 攒满约 120 个交易日后回测
-  有没有预测力 (todo.md #10)。
+  有没有预测力 (todo.md #10)。**两套口径都存**: Yahoo 页面每张表有
+  GAAP / Normalized 切换, 报告用的是默认 (标 GAAP) 那套, 快照里 `norm_`
+  前缀的列是 Normalized (未公开的模块 `earningsTrendNonGaap`, 走 yfinance
+  私有接口, 坏了只缺这组列并在报告里出一行 ⚠️)。15 只里 10 只两套相同;
+  RKLB 下财年默认 ↑2/↓6、Normalized ↑5/↓0, 方向相反。
 - 取数失败合并成一条 ⚠️ —— 个股拿到空表也算失败 (yfinance 会把 HTTP 错误
   吞成空表), 不能当"没有修正"。
 

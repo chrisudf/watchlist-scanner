@@ -5127,9 +5127,10 @@ class TestRevisionsParse(unittest.TestCase):
         with self.assertRaises(rv.EmptyData):
             rv.fetch_one("SOFI", lambda s: _FakeYfTicker())
         # 家数表单独出错不影响修正数据
-        data = rv.fetch_one("MCD", lambda s: _FakeYfTicker(_rev_frames(), est_raises=True))
-        self.assertEqual(data["+1y"]["down30"], 15)
-        self.assertIsNone(data["+1y"]["n"])
+        got = rv.fetch_one("MCD", lambda s: _FakeYfTicker(_rev_frames(), est_raises=True),
+                           normalized_fetch=lambda tk, s: _trend_json())
+        self.assertEqual(got["data"]["+1y"]["down30"], 15)
+        self.assertIsNone(got["data"]["+1y"]["n"])
 
 
 class TestRevisionsOneTime(unittest.TestCase):
@@ -5220,11 +5221,13 @@ class TestRevisionsRunAndAttach(unittest.TestCase):
                 raise ConnectionError("Connection reset by peer\nmore")
             if sym == "EMPTY":
                 raise rv.EmptyData("Yahoo 返回空表")
-            return rv.parse(*_rev_frames())
+            return {"data": rv.parse(*_rev_frames()), "normalized": None,
+                    "normalized_error": "HTTPError: 404"}
         out = rv.run(["MCD", "BAD", "EMPTY"], workers=2, fetch=fetch)["by_symbol"]
         self.assertEqual(out["BAD"], {"error": "ConnectionError: Connection reset by peer"})
         self.assertEqual(out["EMPTY"], {"error": "Yahoo 返回空表"})
         self.assertEqual(out["MCD"]["data"]["+1y"]["down30"], 15)
+        self.assertEqual(out["MCD"]["normalized_error"], "HTTPError: 404")
         self.assertIsNone(out["MCD"]["flag"])
 
     def _results(self):
@@ -5319,6 +5322,100 @@ class TestRevisionsSnapshot(unittest.TestCase):
         self.assertEqual(got[0]["legacy"], "x")
         self.assertEqual(got[1]["+1y_down30"], "15")
         self.assertFalse(self.path.with_name(self.path.name + ".tmp").exists())
+
+
+def _trend_json(rev=MCD_REV, trend=MCD_TREND, n=MCD_N):
+    """quoteSummary 原始 JSON 的 trend 列表 —— 单元格包一层 {"raw", "fmt"}, 0 的
+    fmt 是 None, 缺值是 {} (downLast90days), 都照 2026-10-12 实测的样子。"""
+    def cell(v):
+        return {"raw": v, "fmt": None if v == 0 else str(v)}
+    rk = ["upLast7days", "upLast30days", "downLast30days", "downLast7Days"]
+    tk = ["current", "7daysAgo", "30daysAgo", "60daysAgo", "90daysAgo"]
+    return [{"maxAge": 1, "period": p, "endDate": "2027-12-31",
+             "earningsEstimate": {"avg": cell(trend[p][0]),
+                                  "numberOfAnalysts": cell(n[p])},
+             "epsTrend": {**{k: cell(v) for k, v in zip(tk, trend[p])},
+                          "epsTrendCurrency": "USD"},
+             "epsRevisions": {**{k: cell(v) for k, v in zip(rk, rev[p])},
+                              "downLast90days": {}, "epsRevisionsCurrency": "USD"}}
+            for p in _PERIODS]
+
+
+# RKLB 2026-10-12: 下财年默认口径 -0.07 / ↑2↓6 / 14 家, Normalized +0.06 / ↑5↓0 / 9 家
+RKLB_NORM = dict(rev={**MCD_REV, "+1y": (1, 5, 0, 0)},
+                 trend={**MCD_TREND, "+1y": (0.05888, 0.05, 0.04, 0.04, 0.03)},
+                 n={**MCD_N, "+1y": 9})
+
+
+class TestRevisionsNormalized(unittest.TestCase):
+    """两套口径: 默认 (yfinance 公开接口) + Normalized (私有接口, 单独降级)。"""
+
+    def test_json_path_matches_dataframe_path(self):
+        self.assertEqual(rv.parse_trend_json(_trend_json()), rv.parse(*_rev_frames()))
+
+    def test_json_empty_cells_and_junk(self):
+        items = _trend_json()
+        items[3]["epsRevisions"]["upLast30days"] = {}
+        items[2] = {"period": "0y", "epsTrend": {}, "epsRevisions": {}}
+        got = rv.parse_trend_json(items + [{"period": "-1q"}, "junk"])
+        self.assertIsNone(got["+1y"]["up30"])
+        self.assertNotIn("0y", got)                 # 全空的 period 不要
+        self.assertEqual(list(got), ["0q", "+1q", "+1y"])
+        self.assertEqual(rv.parse_trend_json(None), {})
+
+    def _fetch(self, normalized_fetch):
+        return rv.fetch_one("RKLB", lambda s: _FakeYfTicker(_rev_frames()),
+                            normalized_fetch=normalized_fetch)
+
+    def test_fetch_one_keeps_both(self):
+        got = self._fetch(lambda tk, s: _trend_json(**RKLB_NORM))
+        self.assertEqual(got["data"]["+1y"]["down30"], 15)
+        self.assertEqual((got["normalized"]["+1y"]["up30"],
+                          got["normalized"]["+1y"]["n"]), (5, 9))
+        self.assertIsNone(got["normalized_error"])
+
+    def test_normalized_failure_is_isolated(self):
+        def boom(tk, s):
+            raise RuntimeError("HTTP Error 404: Not Found")
+        for fetch, why in ((boom, "RuntimeError: HTTP Error 404: Not Found"),
+                           (lambda tk, s: [], "Yahoo 返回空表")):
+            got = self._fetch(fetch)
+            self.assertEqual(got["data"]["+1y"]["down30"], 15)   # 默认口径照常
+            self.assertIsNone(got["normalized"])
+            self.assertEqual(got["normalized_error"], why)
+        # 真的私有接口: yfinance 哪天把 _data 改没了, 也只是这一套降级
+        got = rv.fetch_one("RKLB", lambda s: _FakeYfTicker(_rev_frames()))
+        self.assertTrue(got["normalized_error"].startswith("AttributeError"))
+
+    def test_report_names_normalized_failure_separately(self):
+        info = {"data": rv.parse(*_rev_frames()), "flag": None, "normalized": None,
+                "normalized_error": "AttributeError: _data"}
+        ok = dict(info, normalized=rv.parse_trend_json(_trend_json()), normalized_error=None)
+        lines = rv.report_block([("SOFI", info), ("HOOD", info), ("MCD", ok)])
+        body = [l for l in lines if l.startswith("- ")]
+        self.assertEqual(len(body), 4)                # 三行照常 + 一行 ⚠️
+        self.assertIn("- ⚠️ Normalized 口径取不到: SOFI, HOOD (AttributeError: _data)",
+                      body[3])
+        self.assertNotIn("分析师修正取不到", "\n".join(lines))
+        self.assertFalse(any("Normalized" in l for l in rv.report_block([("MCD", ok)])))
+
+    def test_snapshot_has_both_sets(self):
+        dflt = rv.parse(*_rev_frames())
+        dflt["+1y"].update(eps=-0.06557, up30=2, down30=6, n=14)
+        by = {"RKLB": {"data": dflt, "normalized": rv.parse_trend_json(_trend_json(**RKLB_NORM))},
+              "SOFI": {"data": rv.parse(*_rev_frames()), "normalized": None,
+                       "normalized_error": "x"}}
+        rows = {r["symbol"]: r for r in rv.snapshot_rows(by, "2026-10-12")}
+        r = rows["RKLB"]
+        self.assertEqual((r["+1y_eps"], r["+1y_up30"], r["+1y_down30"], r["+1y_n"]),
+                         (-0.06557, 2, 6, 14))
+        self.assertEqual((r["norm_+1y_eps"], r["norm_+1y_up30"], r["norm_+1y_down30"],
+                          r["norm_+1y_n"]), (0.05888, 5, 0, 9))
+        self.assertEqual(list(r), rv.SNAPSHOT_FIELDS)
+        # 只有 Normalized 失败: 行照写, norm_ 列留空
+        self.assertEqual(rows["SOFI"]["+1y_down30"], 15)
+        self.assertTrue(all(rows["SOFI"][c] is None for c in rv.SNAPSHOT_FIELDS
+                            if c.startswith(rv.NORM_PREFIX)))
 
 
 class TestRevisionsMain(unittest.TestCase):

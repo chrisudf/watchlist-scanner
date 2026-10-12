@@ -4383,8 +4383,9 @@ def main() -> int:
     revisions_meta = None
     if not args.no_revisions:
         revisions_meta = attach_revisions(results, tickers, args.workers)
-        got = sum(1 for v in revisions_meta["by_symbol"].values() if v.get("data"))
-        print(f"  revisions: {got}/{len(revisions_meta['by_symbol'])} 只个股取到")
+        by = revisions_meta["by_symbol"].values()
+        print(f"  revisions: {sum(1 for v in by if v.get('data'))}/{len(by)} 只个股取到"
+              f" (Normalized {sum(1 for v in by if v.get('normalized'))})")
 
     ivdf = load_iv_history()
     if mode == "close":

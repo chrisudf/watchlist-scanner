@@ -16,6 +16,18 @@
 
 报告看下财年 (+1y): 本财年会被一次性项目污染 (见 one_time_flag), 估值也看下财年。
 
+两套口径 (2026-10-12 实测, 快照两套都存, 报告只显示默认那套):
+  - 默认: 上面三张表 = Yahoo 页面切换钮上标 "GAAP" 的那套, 逐格对得上。标签别按
+    字面理解 —— NVDA 两套数字完全相同, 而它的 GAAP 与 non-GAAP 本应差一块股权激励;
+    更像"多数分析师用的口径"的大池子。不报 non-GAAP 的公司 (AMZN/META) 大池子
+    就是 GAAP, 一次性项目会混进去。
+  - Normalized: 未公开的 quoteSummary 模块 earningsTrendNonGaap, yfinance 的
+    valid_modules 里没有, 只能走它的私有接口 (_data.get_raw_json) —— yfinance
+    一改就会失效, 所以单独一个请求、单独降级, 坏了不影响默认那套和报告。
+  - watchlist 个股 + MCD 共 15 只里 10 只两套一样; RKLB 下财年默认 -0.07 / ↑2↓6、
+    Normalized +0.06 / ↑5↓0, 修正方向相反; META 54 家 vs 15 家; AMZN 本财年 51 家
+    (含 Anthropic) vs 4 家。哪套更有预测力留给回测 (todo.md #10)。
+
 三个实测坑 (2026-10-12):
   1. ETF/指数没有这个模块, Yahoo 回 404, yfinance 默认吞掉异常、返回空表。所以
      ETF/指数按 kind 直接不查 (静默)。个股拿到空表多半是取数失败被吞了
@@ -52,10 +64,15 @@ PERIOD_KEYS = (*(k for k, _ in REV_FIELDS), "n", *(k for k, _ in TREND_FIELDS))
 ONE_TIME_MIN_JUMP = 0.15    # 本财年 90 天变动的绝对值下限
 ONE_TIME_RATIO = 2.5        # 且大于下财年变动的这么多倍
 
+NORMALIZED_MODULE = "earningsTrendNonGaap"
+NORM_PREFIX = "norm_"
+
 SNAPSHOT_NAME = "eps_revisions.csv"
-# 每行 = 一个 ET 交易日 × 一只个股; 列名 "{period}_{键}", 例如 +1y_up30 / 0y_eps_90d
-SNAPSHOT_FIELDS = ["date", "symbol"] + [f"{p}_{k}" for p in PERIODS
-                                        for k in PERIOD_KEYS]
+# 每行 = 一个 ET 交易日 × 一只个股。列名 "{period}_{键}" = 默认口径 (例如 +1y_up30 /
+# 0y_eps_90d), "norm_{period}_{键}" = Normalized 口径; 那天 Normalized 没取到就留空
+_COLS = [f"{p}_{k}" for p in PERIODS for k in PERIOD_KEYS]
+SNAPSHOT_FIELDS = (["date", "symbol"] + _COLS
+                   + [NORM_PREFIX + c for c in _COLS])
 
 
 class EmptyData(Exception):
@@ -114,6 +131,31 @@ def parse(rev_df, trend_df, est_df=None) -> dict[str, dict]:
     return out
 
 
+def _raw(v) -> float | None:
+    """quoteSummary 的单元格是 {"raw": 2, "fmt": "2"} (formatted=false 也照样包一层),
+    缺值是 {}。"""
+    return _num(v.get("raw") if isinstance(v, dict) else v)
+
+
+def parse_trend_json(items) -> dict[str, dict]:
+    """quoteSummary 原始 JSON 的 trend 列表 (earningsTrend / earningsTrendNonGaap 同一
+    结构) -> 与 parse() 同形的 {period: {...}}; 一个 period 全空就不要。"""
+    out = {}
+    for it in items or []:
+        p = it.get("period") if isinstance(it, dict) else None
+        if p not in PERIODS:
+            continue
+        rev, trend, est = ({str(k).lower(): v for k, v in (it.get(sec) or {}).items()}
+                           for sec in ("epsRevisions", "epsTrend", "earningsEstimate"))
+        d = dict.fromkeys(PERIOD_KEYS)
+        d.update({k: _raw(trend.get(src)) for k, src in TREND_FIELDS})
+        d.update({k: _int(_raw(rev.get(src))) for k, src in REV_FIELDS})
+        d["n"] = _int(_raw(est.get("numberofanalysts")))
+        if any(v is not None for v in d.values()):
+            out[p] = d
+    return out
+
+
 def one_time_flag(data: dict) -> dict | None:
     """本财年 (0y) 一致预期 90 天跳幅远大于下财年 (+1y) -> {j0, j1}, 否则 None.
 
@@ -143,8 +185,25 @@ def _yf_ticker(sym: str):
     return yf.Ticker(sym)
 
 
-def fetch_one(sym: str, ticker_factory=_yf_ticker) -> dict[str, dict]:
-    """一只个股 -> parse() 的结果。取不到抛异常, 空表也算 (坑 1)。"""
+def _fetch_normalized(tk, sym: str) -> list:
+    """Normalized 口径的 trend 列表。走 yfinance 私有接口 (见模块文档), 和公开的
+    eps_trend 共用同一个会话/crumb; 接口改了就在这里抛异常, 由 fetch_one 兜住。"""
+    from yfinance.scrapers.quote import _QUOTE_SUMMARY_URL_
+    r = tk._data.get_raw_json(
+        f"{_QUOTE_SUMMARY_URL_}/{sym}",
+        params={"modules": NORMALIZED_MODULE, "formatted": "false",
+                "symbol": sym, "corsDomain": "finance.yahoo.com"})
+    res = ((r or {}).get("quoteSummary") or {}).get("result") or []
+    return ((res[0] if res else {}).get(NORMALIZED_MODULE) or {}).get("trend") or []
+
+
+def fetch_one(sym: str, ticker_factory=_yf_ticker,
+              normalized_fetch=_fetch_normalized) -> dict:
+    """一只个股 -> {"data": 默认口径, "normalized": Normalized 口径 | None,
+    "normalized_error": 原因 | None}。
+
+    默认口径取不到抛异常, 空表也算 (坑 1)。Normalized 单独降级: 它只进快照,
+    取不到只记原因, 不影响默认那套和报告。"""
     tk = ticker_factory(sym)
     rev, trend = tk.eps_revisions, tk.eps_trend
     try:
@@ -154,7 +213,15 @@ def fetch_one(sym: str, ticker_factory=_yf_ticker) -> dict[str, dict]:
     data = parse(rev, trend, est)
     if not data:
         raise EmptyData("Yahoo 返回空表")
-    return data
+    out = {"data": data, "normalized": None, "normalized_error": None}
+    try:
+        norm = parse_trend_json(normalized_fetch(tk, sym))
+        if not norm:
+            raise EmptyData("Yahoo 返回空表")
+        out["normalized"] = norm
+    except Exception as e:              # noqa: BLE001
+        out["normalized_error"] = _why(e)
+    return out
 
 
 def _why(e: Exception) -> str:
@@ -165,14 +232,15 @@ def _why(e: Exception) -> str:
 
 
 def run(symbols: list[str], workers: int = 4, fetch=fetch_one) -> dict:
-    """并发取数 -> {"by_symbol": {sym: {"data", "flag"} | {"error"}}}.
-    只传个股 (ETF/指数由调用方按 kind 剔掉); 单只失败只记 error, 不抛。"""
+    """并发取数 -> {"by_symbol": {sym: {"data", "normalized", "normalized_error",
+    "flag"} | {"error"}}}。只传个股 (ETF/指数由调用方按 kind 剔掉); 单只失败只记
+    error, 不抛。一次性判据只看默认口径 —— 报告显示的就是它。"""
     def one(sym):
         try:
-            data = fetch(sym)
+            got = fetch(sym)
         except Exception as e:          # noqa: BLE001
             return {"error": _why(e)}
-        return {"data": data, "flag": one_time_flag(data)}
+        return {**got, "flag": one_time_flag(got["data"])}
 
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         infos = list(pool.map(one, symbols))
@@ -223,13 +291,15 @@ def _net(info: dict) -> int:
 def report_block(items: list[tuple[str, dict | None]]) -> list[str]:
     """[(symbol, info)] -> 报告段落: 标题、每只个股一行 (按 30 天净上调家数
     从多到少)、失败合并成一条 ⚠️、说明。info=None (ETF/指数) 静默跳过。"""
-    body, failed = [], {}
+    body, failed, norm_failed = [], {}, {}
     for sym, info in items:
         if info is None:
             continue
         if info.get("error"):
             failed.setdefault(info["error"], []).append(sym)
             continue
+        if info.get("normalized_error"):
+            norm_failed.setdefault(info["normalized_error"], []).append(sym)
         text = line(sym, info)
         if text is None:
             failed.setdefault("缺下财年修正数据", []).append(sym)
@@ -240,6 +310,11 @@ def report_block(items: list[tuple[str, dict | None]]) -> list[str]:
     if failed:
         why = "; ".join(f"{', '.join(syms)} ({w})" for w, syms in failed.items())
         lines.append(f"- ⚠️ 分析师修正取不到: {why} — 只缺这一段提示, 下次扫描重试")
+    if norm_failed:
+        # 快照是以后回测的唯一来源, 少存一套不能只躺在 cron log 里
+        why = "; ".join(f"{', '.join(syms)} ({w})" for w, syms in norm_failed.items())
+        lines.append(f"- ⚠️ Normalized 口径取不到: {why} — 上面照常, 只是快照里"
+                     "缺这一套; 天天出现 = Yahoo/yfinance 改了接口")
     if not (body or failed):
         lines.append("- 无 (没有个股)")
     lines += ["",
@@ -256,16 +331,18 @@ def report_block(items: list[tuple[str, dict | None]]) -> list[str]:
 # --------------------------------------------------------------------------
 
 def snapshot_rows(by_symbol: dict, day: str) -> list[dict]:
-    """run() 的结果 -> 快照行; 取数失败的不写 (缺一天就是缺一天, 不补 0)。"""
+    """run() 的结果 -> 快照行, 两套口径各一组列。默认口径取数失败的不写 (缺一天
+    就是缺一天, 不补 0); 只有 Normalized 失败的照写, norm_ 列留空。"""
     rows = []
     for sym, info in by_symbol.items():
         data = (info or {}).get("data")
         if not data:
             continue
         row = {"date": day, "symbol": sym}
-        for p in PERIODS:
-            for k in PERIOD_KEYS:
-                row[f"{p}_{k}"] = (data.get(p) or {}).get(k)
+        for prefix, src in (("", data), (NORM_PREFIX, info.get("normalized") or {})):
+            for p in PERIODS:
+                for k in PERIOD_KEYS:
+                    row[f"{prefix}{p}_{k}"] = (src.get(p) or {}).get(k)
         rows.append(row)
     return rows
 
