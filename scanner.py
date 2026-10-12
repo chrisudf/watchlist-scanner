@@ -3202,8 +3202,10 @@ def revisions_block(results, meta) -> list[str]:
     """开盘/尾盘报告的修正段。meta=None (--no-revisions) 整段不出。"""
     if meta is None:
         return []
-    return revisions.report_block([(r["symbol"], r.get("revisions"))
-                                   for r in results])
+    # 下次财报日: 修正扎堆在财报后, 读家数要知道它在财报周期的哪一段。
+    # 收盘 --no-options 不拉财报日 (analyze_ticker 在期权链之前返回), 那时不写
+    return revisions.report_block([(r["symbol"], r.get("revisions")) for r in results],
+                                  {r["symbol"]: r.get("earnings") for r in results})
 
 
 def snapshot_revisions(meta, d: str) -> None:
@@ -4384,8 +4386,10 @@ def main() -> int:
     if not args.no_revisions:
         revisions_meta = attach_revisions(results, tickers, args.workers)
         by = revisions_meta["by_symbol"].values()
+        fallback = sum(1 for v in by if v.get("src") == "yf")
         print(f"  revisions: {sum(1 for v in by if v.get('data'))}/{len(by)} 只个股取到"
-              f" (Normalized {sum(1 for v in by if v.get('normalized'))})")
+              f" (Normalized {sum(1 for v in by if v.get('normalized'))}"
+              + (f", 退回公开接口 {fallback}" if fallback else "") + ")")
 
     ivdf = load_iv_history()
     if mode == "close":

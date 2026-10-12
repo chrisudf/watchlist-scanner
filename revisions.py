@@ -1,40 +1,51 @@
 #!/usr/bin/env python3
-"""分析师预期修正 (Yahoo eps_revisions / eps_trend) — 取数 / 解析 / 一次性判据 / 快照.
+"""分析师预期修正 (Yahoo earningsTrend) — 取数 / 解析 / 一次性判据 / 快照.
 
 只做提示, 不进状态机/门控/票据 (2026-10-12 定)。雅虎只给当下快照、没有历史,
 回测不了; 这个仓库的规矩是指标先回测再进门控 (MACD/KDJ/布林都被回测否掉过)。
 所以先每天收盘存一份快照 (data/eps_revisions.csv), 攒满约 120 个交易日再验证
 有没有预测力 (todo.md #10)。
 
-数据: yfinance 的 earningsTrend 模块, 一次请求, 下面三张表共用它的缓存:
-  - eps_revisions: 行 0q/+1q/0y/+1y (本季/下季/本财年/下财年), 列 upLast7days /
-    upLast30days / downLast30days / downLast7Days = 近 7/30 天上调/下调 EPS 预期
-    的分析师家数
-  - eps_trend: 同四行, 列 current/7daysAgo/30daysAgo/60daysAgo/90daysAgo =
-    一致预期 EPS 和它 N 天前的值 (最多回溯 90 天)
-  - earnings_estimate 的 numberOfAnalysts: 覆盖家数, 只进快照 (回测时当分母)
+数据: quoteSummary 的 earningsTrend 模块。每个期间 (0q/+1q/0y/+1y = 本季/下季/
+本财年/下财年) 一项, 四个小节都存进快照:
+  - epsRevisions: 近 7/30 天上调/下调 EPS 预期的分析师家数
+  - epsTrend: 一致预期 EPS 和它 7/30/60/90 天前的值 (最多回溯 90 天)
+  - earningsEstimate: 覆盖家数、最低/最高 (分歧度)、去年 EPS、增长
+  - revenueEstimate: 营收的家数/平均/最低/最高/去年/增长 —— 营收修正 Yahoo 不给
+    历史, 只能靠自己每天存
+  - endDate: 这个期间对应的财年/季度结束日。页面上不显示, yfinance 的公开接口也丢了
+    它, 但回测离不开: 公司公布年报后 0y/+1y 的标签整体换到下一年, 没有结束日就会
+    把两个财年接成一条线; 算"未来 12 个月"加权也要知道本财年还剩几个月。
 
 报告看下财年 (+1y): 本财年会被一次性项目污染 (见 one_time_flag), 估值也看下财年。
+注意"下财年"离现在多远因公司而异 (12 月财年 15 个月, NVDA 16 个月, MSFT/COHR 21
+个月) —— 哪个期间/加权方式更有预测力留给回测。
 
 两套口径 (2026-10-12 实测, 快照两套都存, 报告只显示默认那套):
-  - 默认: 上面三张表 = Yahoo 页面切换钮上标 "GAAP" 的那套, 逐格对得上。标签别按
-    字面理解 —— NVDA 两套数字完全相同, 而它的 GAAP 与 non-GAAP 本应差一块股权激励;
-    更像"多数分析师用的口径"的大池子。不报 non-GAAP 的公司 (AMZN/META) 大池子
-    就是 GAAP, 一次性项目会混进去。
-  - Normalized: 未公开的 quoteSummary 模块 earningsTrendNonGaap, yfinance 的
-    valid_modules 里没有, 只能走它的私有接口 (_data.get_raw_json) —— yfinance
-    一改就会失效, 所以单独一个请求、单独降级, 坏了不影响默认那套和报告。
+  - 默认 (earningsTrend): Yahoo 页面切换钮上标 "GAAP" 的那套, 与 yfinance 的
+    eps_revisions/eps_trend 逐格对得上。标签别按字面理解 —— NVDA 两套数字完全相同,
+    而它的 GAAP 与 non-GAAP 本应差一块股权激励; 更像"多数分析师用的口径"的大池子。
+    不报 non-GAAP 的公司 (AMZN/META) 大池子就是 GAAP, 一次性项目会混进去。
+  - Normalized (earningsTrendNonGaap): 未公开的模块, yfinance 的 valid_modules 里
+    没有。营收和 endDate 两个模块逐字相同, 快照只存一份; EPS 部分存两份。
   - watchlist 个股 + MCD 共 15 只里 10 只两套一样; RKLB 下财年默认 -0.07 / ↑2↓6、
     Normalized +0.06 / ↑5↓0, 修正方向相反; META 54 家 vs 15 家; AMZN 本财年 51 家
-    (含 Anthropic) vs 4 家。哪套更有预测力留给回测 (todo.md #10)。
+    (含 Anthropic) vs 4 家。
 
-三个实测坑 (2026-10-12):
-  1. ETF/指数没有这个模块, Yahoo 回 404, yfinance 默认吞掉异常、返回空表。所以
-     ETF/指数按 kind 直接不查 (静默)。个股拿到空表多半是取数失败被吞了
+取数: 一个请求同时拿两个模块的原始 JSON (yfinance 私有接口 _data.get_raw_json)。
+私有接口 yfinance 一改就会失效, 所以失效时默认口径退回 yfinance 公开接口
+(eps_revisions / eps_trend / earnings_estimate / revenue_estimate), 只缺 endDate
+和 Normalized, 报告照常并出一行 ⚠️; 快照的 src 列记走的是哪条路 (raw / yf)。
+
+四个实测坑 (2026-10-12):
+  1. ETF/指数没有这个模块, Yahoo 回 404, yfinance 公开接口默认吞掉异常、返回空表。
+     所以 ETF/指数按 kind 直接不查 (静默)。个股拿到空表多半是取数失败被吞了
      (watchlist 14 只个股全有覆盖), 要写进失败提示, 不能当成"没有修正"。
-  2. 列名大小写不统一: upLast7days 是小写 d, downLast7Days 是大写 D —— 按小写比对。
+  2. 字段名大小写不统一: upLast7days 是小写 d, downLast7Days 是大写 D —— 按小写比对。
   3. 亏损股 (RKLB 两年都亏, SPCX 本财年 90 天前还是负数) 的 EPS 为负或穿零, 百分比
      没有方向意义 (-1.00 → -0.50 是减亏却算出 -50%), 改报绝对值 a→b。
+  4. 币种: TSM 的 EPS 是美元 (每 ADR), 营收却是新台币 (7.4 万亿) —— 快照存
+     eps_ccy / rev_ccy 两列, 别拿营收去和美元数比。
 
 命令行 (手工看一眼; 不写快照):
     .venv/bin/python revisions.py [MCD NVDA ...]
@@ -45,34 +56,53 @@ from __future__ import annotations
 import csv
 import math
 import os
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 PERIODS = ("0q", "+1q", "0y", "+1y")
 SHOW_PERIOD = "+1y"
-# (我们的键, Yahoo 列名小写) —— 小写比对见坑 2
+DEFAULT_MODULE = "earningsTrend"
+NORMALIZED_MODULE = "earningsTrendNonGaap"
+NORM_PREFIX = "norm_"
+
+# (我们的键, Yahoo 字段名小写) —— 小写比对见坑 2。四个小节在原始 JSON 和 yfinance
+# 公开接口的 DataFrame 里字段名相同, 两条路共用这张表
 REV_FIELDS = (("up7", "uplast7days"), ("up30", "uplast30days"),
               ("down30", "downlast30days"), ("down7", "downlast7days"))
 TREND_FIELDS = (("eps", "current"), ("eps_7d", "7daysago"),
                 ("eps_30d", "30daysago"), ("eps_60d", "60daysago"),
                 ("eps_90d", "90daysago"))
-PERIOD_KEYS = (*(k for k, _ in REV_FIELDS), "n", *(k for k, _ in TREND_FIELDS))
+EST_FIELDS = (("n", "numberofanalysts"), ("eps_low", "low"), ("eps_high", "high"),
+              ("eps_year_ago", "yearagoeps"), ("eps_growth", "growth"))
+REVENUE_FIELDS = (("rev_n", "numberofanalysts"), ("rev_avg", "avg"),
+                  ("rev_low", "low"), ("rev_high", "high"),
+                  ("rev_year_ago", "yearagorevenue"), ("rev_growth", "growth"))
+SECTIONS = (("epsRevisions", REV_FIELDS), ("epsTrend", TREND_FIELDS),
+            ("earningsEstimate", EST_FIELDS), ("revenueEstimate", REVENUE_FIELDS))
+INT_KEYS = frozenset({"up7", "up30", "down30", "down7", "n", "rev_n"})
+# 分口径的 (两套各存一份) / 不分口径的 (两个模块逐字相同, 只存一份)
+EPS_KEYS = ("up7", "up30", "down30", "down7", "n", "eps", "eps_7d", "eps_30d",
+            "eps_60d", "eps_90d", "eps_low", "eps_high", "eps_year_ago", "eps_growth")
+SHARED_KEYS = ("end", "rev_n", "rev_avg", "rev_low", "rev_high", "rev_year_ago",
+               "rev_growth")
+PERIOD_KEYS = EPS_KEYS + SHARED_KEYS
 
 # 一次性判据, 数值照抄 sec-filing-downloader valuation/ref_table.py 的
 # one_time_warning (pe_rank.py 的 one_time_flag 复用同一判据)
 ONE_TIME_MIN_JUMP = 0.15    # 本财年 90 天变动的绝对值下限
 ONE_TIME_RATIO = 2.5        # 且大于下财年变动的这么多倍
 
-NORMALIZED_MODULE = "earningsTrendNonGaap"
-NORM_PREFIX = "norm_"
-
 SNAPSHOT_NAME = "eps_revisions.csv"
-# 每行 = 一个 ET 交易日 × 一只个股。列名 "{period}_{键}" = 默认口径 (例如 +1y_up30 /
-# 0y_eps_90d), "norm_{period}_{键}" = Normalized 口径; 那天 Normalized 没取到就留空
-_COLS = [f"{p}_{k}" for p in PERIODS for k in PERIOD_KEYS]
-SNAPSHOT_FIELDS = (["date", "symbol"] + _COLS
-                   + [NORM_PREFIX + c for c in _COLS])
+# 每行 = 一个 ET 交易日 × 一只个股。src = raw (私有接口, 全字段) / yf (退回公开接口,
+# 缺 end 和 norm_ 列)。"{period}_{键}" = 默认口径 + 营收 + end; "norm_{period}_{键}"
+# = Normalized 口径的 EPS 部分, 那天没取到就留空
+SNAPSHOT_FIELDS = (["date", "symbol", "src", "eps_ccy", "rev_ccy"]
+                   + [f"{p}_{k}" for p in PERIODS for k in SHARED_KEYS + EPS_KEYS]
+                   + [f"{NORM_PREFIX}{p}_{k}" for p in PERIODS for k in EPS_KEYS])
+
+_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 class EmptyData(Exception):
@@ -94,6 +124,14 @@ def _num(v) -> float | None:
     return f if math.isfinite(f) else None
 
 
+def _int(v: float | None) -> int | None:
+    return None if v is None else int(round(v))
+
+
+def _typed(key: str, v: float | None):
+    return _int(v) if key in INT_KEYS else v
+
+
 def _rows(df, fields) -> dict[str, dict]:
     """DataFrame (index = period) -> {period: {我们的键: 值}}; 列名按小写比对。"""
     if df is None or getattr(df, "empty", True):
@@ -104,29 +142,24 @@ def _rows(df, fields) -> dict[str, dict]:
         if p not in df.index:
             continue
         row = df.loc[p]
-        out[p] = {k: (_num(row[cols[src]]) if src in cols else None)
+        out[p] = {k: _typed(k, _num(row[cols[src]]) if src in cols else None)
                   for k, src in fields}
     return out
 
 
-def _int(v: float | None) -> int | None:
-    return None if v is None else int(round(v))
-
-
-def parse(rev_df, trend_df, est_df=None) -> dict[str, dict]:
-    """三张表 -> {period: {up7, up30, down30, down7, n, eps, eps_7d, ...}}.
-    修正表和趋势表都没有内容 = {}。"""
-    rev = _rows(rev_df, REV_FIELDS)
-    trend = _rows(trend_df, TREND_FIELDS)
-    est = _rows(est_df, (("n", "numberofanalysts"),))
+def parse(rev_df, trend_df, est_df=None, revenue_df=None) -> dict[str, dict]:
+    """yfinance 公开接口的四张表 -> {period: {PERIOD_KEYS...}} (end 恒为 None,
+    公开接口没有)。四张表都没有这个 period = 不要; 全空 = {}。"""
+    parts = [_rows(df, fields) for df, fields in
+             ((rev_df, REV_FIELDS), (trend_df, TREND_FIELDS),
+              (est_df, EST_FIELDS), (revenue_df, REVENUE_FIELDS))]
     out = {}
     for p in PERIODS:
-        if p not in rev and p not in trend:
+        if not any(p in part for part in parts):
             continue
         d = dict.fromkeys(PERIOD_KEYS)
-        d.update(trend.get(p, {}))
-        d.update({k: _int(v) for k, v in rev.get(p, {}).items()})
-        d["n"] = _int(est.get(p, {}).get("n"))
+        for part in parts:
+            d.update(part.get(p, {}))
         out[p] = d
     return out
 
@@ -138,22 +171,40 @@ def _raw(v) -> float | None:
 
 
 def parse_trend_json(items) -> dict[str, dict]:
-    """quoteSummary 原始 JSON 的 trend 列表 (earningsTrend / earningsTrendNonGaap 同一
-    结构) -> 与 parse() 同形的 {period: {...}}; 一个 period 全空就不要。"""
+    """quoteSummary 原始 JSON 的 trend 列表 (两个模块同一结构) -> 与 parse() 同形的
+    {period: {...}}, 多一个 end; 一个 period 全空就不要。"""
     out = {}
     for it in items or []:
         p = it.get("period") if isinstance(it, dict) else None
         if p not in PERIODS:
             continue
-        rev, trend, est = ({str(k).lower(): v for k, v in (it.get(sec) or {}).items()}
-                           for sec in ("epsRevisions", "epsTrend", "earningsEstimate"))
         d = dict.fromkeys(PERIOD_KEYS)
-        d.update({k: _raw(trend.get(src)) for k, src in TREND_FIELDS})
-        d.update({k: _int(_raw(rev.get(src))) for k, src in REV_FIELDS})
-        d["n"] = _int(_raw(est.get("numberofanalysts")))
+        for sec, fields in SECTIONS:
+            cells = {str(k).lower(): v for k, v in (it.get(sec) or {}).items()}
+            d.update({k: _typed(k, _raw(cells.get(src))) for k, src in fields})
+        end = it.get("endDate")
+        d["end"] = end if isinstance(end, str) and _ISO_DATE.match(end) else None
         if any(v is not None for v in d.values()):
             out[p] = d
     return out
+
+
+def _ccy_json(items) -> dict:
+    """EPS 和营收各自的币种 (坑 4); 取第一个期间的。"""
+    it = next((x for x in items or [] if isinstance(x, dict)), {})
+    return {"eps": ((it.get("earningsEstimate") or {}).get("earningsCurrency")
+                    or (it.get("epsTrend") or {}).get("epsTrendCurrency")),
+            "rev": (it.get("revenueEstimate") or {}).get("revenueCurrency")}
+
+
+def _ccy_df(est_df, revenue_df) -> dict:
+    """公开接口把币种放在 DataFrame 的 currency 列。"""
+    def first(df):
+        if df is None or getattr(df, "empty", True) or "currency" not in df.columns:
+            return None
+        v = df["currency"].dropna()
+        return str(v.iloc[0]) if len(v) else None
+    return {"eps": first(est_df), "rev": first(revenue_df)}
 
 
 def one_time_flag(data: dict) -> dict | None:
@@ -185,42 +236,62 @@ def _yf_ticker(sym: str):
     return yf.Ticker(sym)
 
 
-def _fetch_normalized(tk, sym: str) -> list:
-    """Normalized 口径的 trend 列表。走 yfinance 私有接口 (见模块文档), 和公开的
-    eps_trend 共用同一个会话/crumb; 接口改了就在这里抛异常, 由 fetch_one 兜住。"""
+def _fetch_raw(tk, sym: str) -> dict[str, list]:
+    """一个请求拿两个模块的原始 trend 列表 -> {模块名: trend}。走 yfinance 私有
+    接口 (见模块文档), 和公开接口共用同一个会话/crumb; 接口改了就在这里抛异常,
+    由 fetch_one 兜住。直接调 get_raw_json 不会像公开接口那样把 HTTP 错误吞成空表。"""
     from yfinance.scrapers.quote import _QUOTE_SUMMARY_URL_
     r = tk._data.get_raw_json(
         f"{_QUOTE_SUMMARY_URL_}/{sym}",
-        params={"modules": NORMALIZED_MODULE, "formatted": "false",
-                "symbol": sym, "corsDomain": "finance.yahoo.com"})
+        params={"modules": f"{DEFAULT_MODULE},{NORMALIZED_MODULE}",
+                "formatted": "false", "symbol": sym,
+                "corsDomain": "finance.yahoo.com"})
     res = ((r or {}).get("quoteSummary") or {}).get("result") or []
-    return ((res[0] if res else {}).get(NORMALIZED_MODULE) or {}).get("trend") or []
+    res0 = res[0] if res else {}
+    return {m: (res0.get(m) or {}).get("trend") or []
+            for m in (DEFAULT_MODULE, NORMALIZED_MODULE)}
 
 
-def fetch_one(sym: str, ticker_factory=_yf_ticker,
-              normalized_fetch=_fetch_normalized) -> dict:
-    """一只个股 -> {"data": 默认口径, "normalized": Normalized 口径 | None,
-    "normalized_error": 原因 | None}。
-
-    默认口径取不到抛异常, 空表也算 (坑 1)。Normalized 单独降级: 它只进快照,
-    取不到只记原因, 不影响默认那套和报告。"""
-    tk = ticker_factory(sym)
+def _fetch_public(tk) -> tuple[dict, dict]:
+    """退路: yfinance 公开接口, 只有默认口径、没有 endDate。四张表共用一次请求的缓存;
+    家数/营收两张表单独出错不影响修正数据。"""
     rev, trend = tk.eps_revisions, tk.eps_trend
+    extra = []
+    for name in ("earnings_estimate", "revenue_estimate"):
+        try:
+            extra.append(getattr(tk, name))
+        except Exception:               # noqa: BLE001
+            extra.append(None)
+    return parse(rev, trend, *extra), _ccy_df(*extra)
+
+
+def fetch_one(sym: str, ticker_factory=_yf_ticker, raw_fetch=_fetch_raw) -> dict:
+    """一只个股 -> {"data": 默认口径, "ccy": {eps, rev}, "src": "raw"|"yf",
+    "raw_error": 退回公开接口的原因 | None,
+    "normalized": Normalized 口径 | None, "normalized_error": 原因 | None}。
+
+    先走私有接口 (一个请求两套口径全字段); 它坏了或没给默认模块, 默认口径退回
+    公开接口。默认口径两条路都拿不到就抛异常, 空表也算 (坑 1)。Normalized 只进
+    快照, 取不到只记原因。"""
+    tk = ticker_factory(sym)
     try:
-        est = tk.earnings_estimate      # 同一次请求的缓存; 家数只进快照
-    except Exception:                   # noqa: BLE001
-        est = None
-    data = parse(rev, trend, est)
-    if not data:
-        raise EmptyData("Yahoo 返回空表")
-    out = {"data": data, "normalized": None, "normalized_error": None}
-    try:
-        norm = parse_trend_json(normalized_fetch(tk, sym))
-        if not norm:
-            raise EmptyData("Yahoo 返回空表")
-        out["normalized"] = norm
+        mods, raw_err = raw_fetch(tk, sym), None
     except Exception as e:              # noqa: BLE001
-        out["normalized_error"] = _why(e)
+        mods, raw_err = {}, _why(e)
+    out = {"data": parse_trend_json(mods.get(DEFAULT_MODULE)),
+           "ccy": _ccy_json(mods.get(DEFAULT_MODULE)), "src": "raw",
+           "raw_error": None, "normalized": None, "normalized_error": None}
+    if not out["data"]:
+        out["data"], out["ccy"] = _fetch_public(tk)
+        out["src"] = "yf"
+        out["raw_error"] = raw_err or "私有接口没返回默认口径"
+        if not out["data"]:
+            raise EmptyData("Yahoo 返回空表")
+    norm = parse_trend_json(mods.get(NORMALIZED_MODULE))
+    if norm:
+        out["normalized"] = norm
+    else:
+        out["normalized_error"] = raw_err or "Yahoo 返回空表"
     return out
 
 
@@ -232,9 +303,9 @@ def _why(e: Exception) -> str:
 
 
 def run(symbols: list[str], workers: int = 4, fetch=fetch_one) -> dict:
-    """并发取数 -> {"by_symbol": {sym: {"data", "normalized", "normalized_error",
-    "flag"} | {"error"}}}。只传个股 (ETF/指数由调用方按 kind 剔掉); 单只失败只记
-    error, 不抛。一次性判据只看默认口径 —— 报告显示的就是它。"""
+    """并发取数 -> {"by_symbol": {sym: {fetch_one 的键 + "flag"} | {"error"}}}。
+    只传个股 (ETF/指数由调用方按 kind 剔掉); 单只失败只记 error, 不抛。一次性
+    判据只看默认口径 —— 报告显示的就是它。"""
     def one(sym):
         try:
             got = fetch(sym)
@@ -261,18 +332,36 @@ def consensus_change(p: dict, ago_key: str = "eps_30d") -> str | None:
     return f"{ago:.2f}→{cur:.2f}"
 
 
-def line(sym: str, info: dict) -> str | None:
-    """一只个股一行 (下财年); 缺下财年的家数 -> None (调用方记进失败提示)。"""
+def breadth(p: dict) -> float | None:
+    """净上调比例 = (30 天上调 − 下调) ÷ 覆盖家数。原始家数会偏向覆盖多的票:
+    SOFI 9 家里 ↑2/↓0 (+22%) 比 AMZN 53 家里 ↑4/↓0 (+8%) 强, 按家数却排在后面。"""
+    n, up, down = p.get("n"), p.get("up30"), p.get("down30")
+    if not n or up is None or down is None:
+        return None
+    return (up - down) / n
+
+
+def line(sym: str, info: dict, earnings: str | None = None) -> str | None:
+    """一只个股一行 (下财年); 缺下财年的家数 -> None (调用方记进失败提示)。
+    earnings = 下次财报日 (ISO), 没有就不写。"""
     p = (info.get("data") or {}).get(SHOW_PERIOD) or {}
     if p.get("up30") is None or p.get("down30") is None:
         return None
     cover = f" {p['n']} 家" if p.get("n") else ""
     s = f"- **{sym}** 下财年{cover}: 30天 ↑{p['up30']}/↓{p['down30']}"
+    b = breadth(p)
+    if b is not None:
+        s += f" 净 {b * 100:+.0f}%"
     if p.get("up7") is not None and p.get("down7") is not None:
         s += f" (7天 ↑{p['up7']}/↓{p['down7']})"
-    chg = consensus_change(p)
+    # 30 天之外再给 90 天: 修正扎堆在财报后一两周, 财报季之间 30 天窗口会整个漏掉
+    # 上一次财报后的那波 (10/12: NVDA 30 天 +2.5% 而 90 天 +25%, TSLA +1.1% 而 −15%)
+    chg = [f"{days} 天 {c}" for days, key in (("30", "eps_30d"), ("90", "eps_90d"))
+           if (c := consensus_change(p, key))]
     if chg:
-        s += f"，一致预期 30 天 {chg}"
+        s += "，一致预期 " + "、".join(chg)
+    if earnings and _ISO_DATE.match(earnings):
+        s += f" · 财报 {earnings[5:]}"
     f = info.get("flag")
     if f:
         # 判据对上下两个方向都成立: 一次性亏损 (减值) 进了 GAAP 口径同样只压本财年
@@ -283,43 +372,59 @@ def line(sym: str, info: dict) -> str | None:
     return s
 
 
-def _net(info: dict) -> int:
+def _sort_key(info: dict) -> tuple:
     p = info["data"][SHOW_PERIOD]
-    return p["up30"] - p["down30"]
+    b = breadth(p)
+    return (b if b is not None else 0.0, p["up30"] - p["down30"])
 
 
-def report_block(items: list[tuple[str, dict | None]]) -> list[str]:
-    """[(symbol, info)] -> 报告段落: 标题、每只个股一行 (按 30 天净上调家数
-    从多到少)、失败合并成一条 ⚠️、说明。info=None (ETF/指数) 静默跳过。"""
-    body, failed, norm_failed = [], {}, {}
+def report_block(items: list[tuple[str, dict | None]],
+                 earnings: dict[str, str] | None = None) -> list[str]:
+    """[(symbol, info)] -> 报告段落: 标题、每只个股一行 (按净上调比例从高到低)、
+    失败各合并成一条 ⚠️、说明。info=None (ETF/指数) 静默跳过。
+    earnings = {symbol: 下次财报日}, 可缺。"""
+    earnings = earnings or {}
+    body, failed, raw_failed, norm_failed = [], {}, {}, {}
     for sym, info in items:
         if info is None:
             continue
         if info.get("error"):
             failed.setdefault(info["error"], []).append(sym)
             continue
-        if info.get("normalized_error"):
+        if info.get("src") == "yf":
+            raw_failed.setdefault(info.get("raw_error") or "原因不明", []).append(sym)
+        elif info.get("normalized_error"):
             norm_failed.setdefault(info["normalized_error"], []).append(sym)
-        text = line(sym, info)
+        text = line(sym, info, earnings.get(sym))
         if text is None:
             failed.setdefault("缺下财年修正数据", []).append(sym)
             continue
-        body.append((_net(info), text))
+        body.append((_sort_key(info), text))
+
+    def join(groups):
+        return "; ".join(f"{', '.join(syms)} ({w})" for w, syms in groups.items())
+
     lines = ["## 分析师预期修正 (下财年 EPS, Yahoo)", ""]
-    lines += [t for _, t in sorted(body, key=lambda x: -x[0])]
+    lines += [t for _, t in sorted(body, key=lambda x: x[0], reverse=True)]
     if failed:
-        why = "; ".join(f"{', '.join(syms)} ({w})" for w, syms in failed.items())
-        lines.append(f"- ⚠️ 分析师修正取不到: {why} — 只缺这一段提示, 下次扫描重试")
+        lines.append(f"- ⚠️ 分析师修正取不到: {join(failed)} — 只缺这一段提示, "
+                     "下次扫描重试")
+    # 快照是以后回测的唯一来源, 少存一部分不能只躺在 cron log 里
+    if raw_failed:
+        lines.append(f"- ⚠️ 私有接口取不到: {join(raw_failed)} — 上面照常 (退回公开"
+                     "接口), 快照缺 Normalized 和财年结束日; 天天出现 = Yahoo/yfinance "
+                     "改了接口")
     if norm_failed:
-        # 快照是以后回测的唯一来源, 少存一套不能只躺在 cron log 里
-        why = "; ".join(f"{', '.join(syms)} ({w})" for w, syms in norm_failed.items())
-        lines.append(f"- ⚠️ Normalized 口径取不到: {why} — 上面照常, 只是快照里"
-                     "缺这一套; 天天出现 = Yahoo/yfinance 改了接口")
+        lines.append(f"- ⚠️ Normalized 口径取不到: {join(norm_failed)} — 上面照常, "
+                     "只是快照里缺这一套")
     if not (body or failed):
         lines.append("- 无 (没有个股)")
     lines += ["",
               "> ↑/↓ = 近 30 天 (括号内 7 天) 上调/下调下财年 EPS 预期的分析师家数; "
-              "一致预期 = 下财年 EPS 一致预期较 30 天前 (亏损股报绝对值)。"
+              "净 = (上调−下调) ÷ 覆盖家数, 按它从高到低排; "
+              "一致预期 = 下财年 EPS 一致预期较 30 / 90 天前 (亏损股报绝对值); "
+              "财报 = 下次财报日 —— 修正多扎堆在财报后一两周, 刚发完财报的票家数"
+              "天然多, 横比时留意。"
               "⚠️ = 本财年 90 天跳幅远大于下财年, 疑似一次性项目进了 GAAP 口径预期。"
               "只做提示, 未经回测, 不影响任何信号和票据。",
               ""]
@@ -331,18 +436,23 @@ def report_block(items: list[tuple[str, dict | None]]) -> list[str]:
 # --------------------------------------------------------------------------
 
 def snapshot_rows(by_symbol: dict, day: str) -> list[dict]:
-    """run() 的结果 -> 快照行, 两套口径各一组列。默认口径取数失败的不写 (缺一天
-    就是缺一天, 不补 0); 只有 Normalized 失败的照写, norm_ 列留空。"""
+    """run() 的结果 -> 快照行。默认口径取数失败的不写 (缺一天就是缺一天, 不补 0);
+    只有 Normalized 失败的照写, norm_ 列留空。"""
     rows = []
     for sym, info in by_symbol.items():
         data = (info or {}).get("data")
         if not data:
             continue
-        row = {"date": day, "symbol": sym}
-        for prefix, src in (("", data), (NORM_PREFIX, info.get("normalized") or {})):
-            for p in PERIODS:
-                for k in PERIOD_KEYS:
-                    row[f"{prefix}{p}_{k}"] = (src.get(p) or {}).get(k)
+        ccy = info.get("ccy") or {}
+        row = {"date": day, "symbol": sym, "src": info.get("src"),
+               "eps_ccy": ccy.get("eps"), "rev_ccy": ccy.get("rev")}
+        for p in PERIODS:
+            for k in SHARED_KEYS + EPS_KEYS:
+                row[f"{p}_{k}"] = (data.get(p) or {}).get(k)
+        norm = info.get("normalized") or {}
+        for p in PERIODS:
+            for k in EPS_KEYS:
+                row[f"{NORM_PREFIX}{p}_{k}"] = (norm.get(p) or {}).get(k)
         rows.append(row)
     return rows
 
