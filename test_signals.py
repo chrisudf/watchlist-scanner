@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 
 import insider as ins
+import revisions as rv
 import scanner as sc
 
 
@@ -5046,6 +5047,364 @@ class TestInsiderEvening(unittest.TestCase):
             self.assertEqual(sc.main(), 42)
         # 晚间这发也当 open/close 的补发班车
         self.assertEqual(calls, ["resend", "insider"])
+
+
+# ---------------------------------------------------------------------------
+# 分析师预期修正 (revisions.py, 2026-10-12) — 只做提示, 不进门控
+# ---------------------------------------------------------------------------
+
+_PERIODS = ["0q", "+1q", "0y", "+1y"]
+# 2026-10-12 实测 (家数 n 除 +1y 外为示意)
+MCD_REV = {"0q": (1, 1, 12, 10), "+1q": (1, 2, 9, 8),
+           "0y": (1, 2, 14, 11), "+1y": (1, 2, 15, 13)}
+MCD_TREND = {"0q": (3.38390, 3.38333, 3.40226, 3.39735, 3.44920),
+             "+1q": (3.29402, 3.28992, 3.30335, 3.30117, 3.36620),
+             "0y": (12.88746, 12.89223, 12.92878, 12.92840, 12.97671),
+             "+1y": (13.76586, 13.82299, 13.97841, 13.99430, 14.21318)}
+MCD_N = {"0q": 30, "+1q": 29, "0y": 34, "+1y": 32}
+
+
+def _rev_frames(rev=MCD_REV, trend=MCD_TREND, n=MCD_N):
+    """Yahoo 原样的三张表 —— 列名照抄, 包括 downLast7Days 的大写 D。"""
+    idx = pd.Index(_PERIODS, name="period")
+    rcols = ["upLast7days", "upLast30days", "downLast30days", "downLast7Days"]
+    tcols = ["current", "7daysAgo", "30daysAgo", "60daysAgo", "90daysAgo"]
+    rdf = pd.DataFrame([dict(zip(rcols, rev[p]), currency="USD") for p in _PERIODS],
+                       index=idx)
+    tdf = pd.DataFrame([dict(zip(tcols, trend[p]), currency="USD") for p in _PERIODS],
+                       index=idx)
+    edf = pd.DataFrame({"numberOfAnalysts": [n[p] for p in _PERIODS]}, index=idx)
+    return rdf, tdf, edf
+
+
+def _trend(y0, y1):
+    """只关心一次性判据的趋势数据: y0/y1 = (90 天前, 现在)。"""
+    return {"0y": {"eps_90d": y0[0], "eps": y0[1]},
+            "+1y": {"eps_90d": y1[0], "eps": y1[1]}}
+
+
+class _FakeYfTicker:
+    def __init__(self, frames=None, est_raises=False):
+        self.frames = frames if frames is not None else (pd.DataFrame(),) * 3
+        self.est_raises = est_raises
+
+    @property
+    def eps_revisions(self):
+        return self.frames[0]
+
+    @property
+    def eps_trend(self):
+        return self.frames[1]
+
+    @property
+    def earnings_estimate(self):
+        if self.est_raises:
+            raise KeyError("earningsEstimate")
+        return self.frames[2]
+
+
+class TestRevisionsParse(unittest.TestCase):
+    def test_yahoo_shape(self):
+        data = rv.parse(*_rev_frames())
+        p = data["+1y"]
+        self.assertEqual((p["up7"], p["up30"], p["down30"], p["down7"], p["n"]),
+                         (1, 2, 15, 13, 32))
+        self.assertIsInstance(p["down7"], int)      # 大写 D 的列也认得
+        self.assertAlmostEqual(p["eps"], 13.76586)
+        self.assertAlmostEqual(p["eps_30d"], 13.97841)
+        self.assertEqual(list(data), _PERIODS)
+
+    def test_empty_and_nan(self):
+        self.assertEqual(rv.parse(pd.DataFrame(), pd.DataFrame(), pd.DataFrame()), {})
+        self.assertEqual(rv.parse(None, None), {})
+        rdf, tdf, _ = _rev_frames()
+        tdf.loc["+1y", "30daysAgo"] = float("nan")
+        p = rv.parse(rdf, tdf, None)["+1y"]
+        self.assertIsNone(p["eps_30d"])
+        self.assertIsNone(p["n"])                   # 没有家数表照样出
+
+    def test_fetch_one_empty_is_an_error_not_silence(self):
+        with self.assertRaises(rv.EmptyData):
+            rv.fetch_one("SOFI", lambda s: _FakeYfTicker())
+        # 家数表单独出错不影响修正数据
+        data = rv.fetch_one("MCD", lambda s: _FakeYfTicker(_rev_frames(), est_raises=True))
+        self.assertEqual(data["+1y"]["down30"], 15)
+        self.assertIsNone(data["+1y"]["n"])
+
+
+class TestRevisionsOneTime(unittest.TestCase):
+    """判据照抄 sec-filing-downloader ref_table.one_time_warning。"""
+
+    def test_amzn_anthropic_hit(self):
+        # 2026-10-12 实测: 本财年 8.68 -> 12.89 (+48%), 下财年 9.98 -> 10.53 (+5.5%)
+        f = rv.one_time_flag(_trend((8.68482, 12.89077), (9.98486, 10.53332)))
+        self.assertAlmostEqual(f["j0"], 0.4843, places=3)
+        self.assertAlmostEqual(f["j1"], 0.0549, places=3)
+        data = rv.parse(*_rev_frames())
+        data["0y"].update(eps_90d=8.68482, eps=12.89077)
+        data["+1y"].update(eps_90d=9.98486, eps=10.53332)
+        text = rv.line("AMZN", {"data": data, "flag": rv.one_time_flag(data)})
+        self.assertIn("本财年一致预期 90 天 +48%、下财年仅 +5%", text)
+        self.assertTrue(text.endswith("上调疑似一次性收益驱动，看下财年"))
+
+    def test_real_upgrades_do_not_hit(self):
+        # NVDA: 两年一起抬, 下财年抬得更多
+        self.assertIsNone(rv.one_time_flag(_trend((8.93743, 9.31242), (12.71023, 15.9146))))
+        # COHR: 本财年 +15.3% 过了 15% 下限, 但不到下财年 +12.2% 的 2.5 倍
+        self.assertIsNone(rv.one_time_flag(_trend((8.17378, 9.42042), (12.51568, 14.04555))))
+        # 本财年 +14% 而下财年不动: 没过 15% 下限
+        self.assertIsNone(rv.one_time_flag(_trend((10.0, 11.4), (12.0, 12.0))))
+
+    def test_loss_or_zero_crossing_never_hits(self):
+        # SPCX: 本财年 90 天前 -0.53, 现在 +0.16 —— 百分比没有方向
+        self.assertIsNone(rv.one_time_flag(_trend((-0.53361, 0.16289), (0.67591, 2.07419))))
+        self.assertIsNone(rv.one_time_flag(_trend((0.0, 1.0), (1.0, 1.0))))
+        self.assertIsNone(rv.one_time_flag(_trend((None, 1.0), (1.0, 1.0))))
+        self.assertIsNone(rv.one_time_flag({}))
+
+    def test_downward_one_time_worded_as_loss(self):
+        data = rv.parse(*_rev_frames())
+        data["0y"].update(eps_90d=10.0, eps=7.0)          # 减值进了 GAAP 口径
+        data["+1y"].update(eps_90d=11.0, eps=10.8)
+        text = rv.line("XYZ", {"data": data, "flag": rv.one_time_flag(data)})
+        self.assertIn("-30%", text)
+        self.assertIn("下调疑似一次性损失驱动，看下财年", text)
+        self.assertNotIn("上调疑似", text)
+
+
+class TestRevisionsReport(unittest.TestCase):
+    def _info(self, **plus):
+        data = rv.parse(*_rev_frames())
+        data["+1y"].update(plus)
+        return {"data": data, "flag": rv.one_time_flag(data)}
+
+    def test_line_mcd(self):
+        self.assertEqual(rv.line("MCD", self._info()),
+                         "- **MCD** 下财年 32 家: 30天 ↑2/↓15 (7天 ↑1/↓13)，一致预期 30 天 -1.5%")
+
+    def test_loss_maker_reports_absolute(self):
+        # RKLB 下财年: -0.08929 -> -0.06557 是减亏, 百分比会算成 -27%
+        text = rv.line("RKLB", self._info(eps=-0.06557, eps_30d=-0.08929))
+        self.assertIn("一致预期 30 天 -0.09→-0.07", text)
+        self.assertNotIn("%", text)
+
+    def test_block_sorted_etf_silent_failures_one_line(self):
+        nvda = self._info(up30=46, down30=0)
+        items = [("MCD", self._info()), ("QQQ", None), ("NVDA", nvda),
+                 ("SOFI", {"error": "Yahoo 返回空表"}),
+                 ("HOOD", {"error": "Yahoo 返回空表"}),
+                 ("TSM", {"error": "ConnectionError: reset"})]
+        lines = rv.report_block(items)
+        self.assertEqual(lines[0], "## 分析师预期修正 (下财年 EPS, Yahoo)")
+        body = [l for l in lines if l.startswith("- ")]
+        self.assertTrue(body[0].startswith("- **NVDA**"))     # 净上调多的在前
+        self.assertTrue(body[1].startswith("- **MCD**"))
+        warn = [l for l in body if "⚠️" in l]
+        self.assertEqual(len(warn), 1)                       # 失败只占一行
+        self.assertIn("SOFI, HOOD (Yahoo 返回空表); TSM (ConnectionError: reset)", warn[0])
+        self.assertNotIn("QQQ", "\n".join(lines))            # ETF/指数静默
+        self.assertIn("未经回测", lines[-2])
+
+    def test_block_missing_next_fy_and_empty(self):
+        data = rv.parse(*_rev_frames())
+        del data["+1y"]
+        lines = rv.report_block([("MCD", {"data": data, "flag": None})])
+        self.assertIn("MCD (缺下财年修正数据)", "\n".join(lines))
+        self.assertIn("- 无 (没有个股)", rv.report_block([("QQQ", None)]))
+
+
+class TestRevisionsRunAndAttach(unittest.TestCase):
+    def test_run_isolates_failures(self):
+        def fetch(sym):
+            if sym == "BAD":
+                raise ConnectionError("Connection reset by peer\nmore")
+            if sym == "EMPTY":
+                raise rv.EmptyData("Yahoo 返回空表")
+            return rv.parse(*_rev_frames())
+        out = rv.run(["MCD", "BAD", "EMPTY"], workers=2, fetch=fetch)["by_symbol"]
+        self.assertEqual(out["BAD"], {"error": "ConnectionError: Connection reset by peer"})
+        self.assertEqual(out["EMPTY"], {"error": "Yahoo 返回空表"})
+        self.assertEqual(out["MCD"]["data"]["+1y"]["down30"], 15)
+        self.assertIsNone(out["MCD"]["flag"])
+
+    def _results(self):
+        mk = TestRenderOpenZoneAlert._r
+        return [mk(TestRenderOpenZoneAlert(), s, 18.0, None) for s in ("SOFI", "QQQ", "GLD")]
+
+    TICKERS = {"SOFI": {"kind": "stock"}, "QQQ": {"kind": "index"}, "GLD": {"kind": "etf"}}
+
+    def test_attach_never_fetches_etf_or_index(self):
+        asked = []
+
+        def fake_run(symbols, workers=4):
+            asked.extend(symbols)
+            return {"by_symbol": {s_: {"data": rv.parse(*_rev_frames()), "flag": None}
+                                  for s_ in symbols}}
+        rs = self._results()
+        with mock_attr(sc.revisions, "run", fake_run):
+            sc.attach_revisions(rs, self.TICKERS)
+        self.assertEqual(asked, ["SOFI"])
+        self.assertIsNone(rs[1]["revisions"])
+        self.assertIsNone(rs[2]["revisions"])
+        self.assertEqual(rs[0]["revisions"]["data"]["+1y"]["up30"], 2)
+
+    def test_module_bug_degrades_to_one_note(self):
+        def boom(*a, **k):
+            raise KeyError("trend")
+        rs = self._results()
+        with mock_attr(sc.revisions, "run", boom):
+            meta = sc.attach_revisions(rs, self.TICKERS)
+        self.assertIn("修正模块异常", rs[0]["revisions"]["error"])
+        self.assertIsNone(rs[1]["revisions"])
+        now = datetime(2026, 10, 12, 9, 45, tzinfo=sc.ET)
+        text = sc.render_open(rs, dict(TestRenderOpenZoneAlert.REGIME), now,
+                              sc.SETTINGS_DEFAULTS, None, meta)
+        self.assertIn("## 分析师预期修正", text)
+        self.assertIn("⚠️ 分析师修正取不到: SOFI (修正模块异常: KeyError: 'trend')", text)
+        # 修正段不进异动列表: 其他什么都没触发时照样"无异动"
+        self.assertIn("无异动", text)
+
+    def test_no_revisions_meta_renders_nothing(self):
+        rs = self._results()
+        now = datetime(2026, 10, 12, 9, 45, tzinfo=sc.ET)
+        text = sc.render_open(rs, dict(TestRenderOpenZoneAlert.REGIME), now,
+                              sc.SETTINGS_DEFAULTS)
+        self.assertNotIn("分析师", text)
+        self.assertEqual(sc.revisions_block(rs, None), [])
+
+
+class TestRevisionsSnapshot(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "data" / rv.SNAPSHOT_NAME
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _by(self):
+        return {"MCD": {"data": rv.parse(*_rev_frames()), "flag": None},
+                "BAD": {"error": "Yahoo 返回空表"}}
+
+    def _read(self):
+        import csv
+        with self.path.open(newline="", encoding="utf-8") as f:
+            rd = csv.DictReader(f)
+            return rd.fieldnames, list(rd)
+
+    def test_rows_and_dedup(self):
+        rows = rv.snapshot_rows(self._by(), "2026-10-12")
+        self.assertEqual([r["symbol"] for r in rows], ["MCD"])   # 失败的不写
+        self.assertEqual(rv.append_snapshot(rows, self.path), 1)
+        self.assertEqual(rv.append_snapshot(rows, self.path), 0)  # 同一天同一票不重复
+        self.assertEqual(rv.append_snapshot(rv.snapshot_rows(self._by(), "2026-10-13"),
+                                            self.path), 1)
+        header, got = self._read()
+        self.assertEqual(header, rv.SNAPSHOT_FIELDS)
+        self.assertEqual([(r["date"], r["symbol"]) for r in got],
+                         [("2026-10-12", "MCD"), ("2026-10-13", "MCD")])
+        r = got[0]
+        self.assertEqual((r["+1y_up30"], r["+1y_down30"], r["+1y_n"]), ("2", "15", "32"))
+        self.assertEqual((r["0y_eps"], r["0y_eps_90d"]), ("12.88746", "12.97671"))
+
+    def test_old_header_rewritten_as_union(self):
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text("date,symbol,+1y_up30,legacy\n2026-10-09,NVDA,46,x\n",
+                             encoding="utf-8")
+        self.assertEqual(rv.append_snapshot(rv.snapshot_rows(self._by(), "2026-10-12"),
+                                            self.path), 1)
+        header, got = self._read()
+        self.assertEqual(header[:4], ["date", "symbol", "+1y_up30", "legacy"])
+        self.assertEqual(set(header), set(rv.SNAPSHOT_FIELDS) | {"legacy"})
+        self.assertEqual(got[0]["+1y_up30"], "46")      # 旧行原样保留
+        self.assertEqual(got[0]["legacy"], "x")
+        self.assertEqual(got[1]["+1y_down30"], "15")
+        self.assertFalse(self.path.with_name(self.path.name + ".tmp").exists())
+
+
+class TestRevisionsMain(unittest.TestCase):
+    """main() 的接线: 快照只在定时尾盘扫描写, --force/--tickers/开盘都不写;
+    --no-revisions 整段不拉不出。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.reports, self.data = root / "reports", root / "data"
+        self.asked = []
+
+        def fake_run(symbols, workers=4):
+            self.asked.append(list(symbols))
+            return {"by_symbol": {s_: {"data": rv.parse(*_rev_frames()), "flag": None}
+                                  for s_ in symbols}}
+
+        cfg = {**sc.TICKER_DEFAULTS, "value_zone": [13.0, 16.0]}
+        tickers = {"SOFI": cfg, "QQQ": {**sc.TICKER_DEFAULTS, "kind": "index"}}
+        self.patches = [
+            mock_attr(sc, "REPORTS", self.reports), mock_attr(sc, "DATA", self.data),
+            mock_attr(sc, "IV_HISTORY", self.data / "iv_history.csv"),
+            mock_attr(sc, "load_config", lambda: (dict(sc.SETTINGS_DEFAULTS), dict(tickers))),
+            mock_attr(sc, "fetch_regime", lambda s: dict(TestRenderOpenZoneAlert.REGIME)),
+            mock_attr(sc, "batch_history", lambda syms: {s_: None for s_ in syms}),
+            mock_attr(sc, "market_is_live", lambda: True),
+            mock_attr(sc, "next_earnings", lambda tk: None),
+            mock_attr(sc, "load_state", lambda: {}),
+            mock_attr(sc, "save_state", lambda st: None),
+            mock_attr(sc, "append_journal", lambda rows, path=None: 0),
+            mock_attr(sc.revisions, "run", fake_run)]
+        for p_ in self.patches:
+            p_.__enter__()
+
+    def tearDown(self):
+        for p_ in reversed(self.patches):
+            p_.__exit__()
+        self.tmp.cleanup()
+
+    def _main(self, *argv):
+        import contextlib
+        with mock_attr(sys, "argv", ["scanner.py", "--no-insider", "--no-options", *argv]), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            return sc.main()
+
+    def _snap(self):
+        return self.data / rv.SNAPSHOT_NAME
+
+    def _report(self, name):
+        return (self.reports / name).read_text(encoding="utf-8")
+
+    def _today(self):
+        return datetime.now(sc.ET).strftime("%Y-%m-%d")
+
+    def test_force_close_reports_but_never_snapshots(self):
+        self.assertEqual(self._main("--mode", "close", "--force"), 0)
+        self.assertFalse(self._snap().exists())
+        self.assertEqual(self.asked, [["SOFI"]])
+        text = self._report(f"{self._today()}-close-manual.md")
+        self.assertIn("## 分析师预期修正", text)
+        self.assertIn("- **SOFI** 下财年 32 家: 30天 ↑2/↓15", text)
+
+    def test_tickers_subset_never_snapshots(self):
+        self.assertEqual(self._main("--mode", "close", "--tickers", "SOFI"), 0)
+        self.assertFalse(self._snap().exists())
+
+    def test_scheduled_close_snapshots_stocks_only(self):
+        self.assertEqual(self._main("--mode", "close"), 0)
+        import csv
+        with self._snap().open(newline="", encoding="utf-8") as f:
+            got = list(csv.DictReader(f))
+        self.assertEqual([(r["date"], r["symbol"]) for r in got],
+                         [(self._today(), "SOFI")])
+        self.assertIn("## 分析师预期修正", self._report(f"{self._today()}-close.md"))
+
+    def test_scheduled_open_shows_but_never_snapshots(self):
+        self.assertEqual(self._main("--mode", "open"), 0)
+        self.assertFalse(self._snap().exists())
+        self.assertIn("## 分析师预期修正", self._report(f"{self._today()}-open.md"))
+
+    def test_no_revisions_flag(self):
+        self.assertEqual(self._main("--mode", "close", "--no-revisions"), 0)
+        self.assertEqual(self.asked, [])
+        self.assertFalse(self._snap().exists())
+        self.assertNotIn("分析师", self._report(f"{self._today()}-close.md"))
 
 
 if __name__ == "__main__":

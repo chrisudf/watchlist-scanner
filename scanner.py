@@ -56,6 +56,7 @@ import pandas as pd
 import yfinance as yf
 
 import insider
+import revisions
 
 # ETFs have no earnings calendar — silence yfinance's 404 chatter
 import logging
@@ -3176,6 +3177,50 @@ def insider_block(results, meta) -> list[str]:
     return lines
 
 
+# --------------------------------------------------------------------------
+# 分析师预期修正 (revisions.py) — 只做提示, 不进状态机/门控/票据
+# --------------------------------------------------------------------------
+
+def attach_revisions(results, tickers, workers: int = 4) -> dict:
+    """给每个个股结果挂上 r["revisions"] (ETF/指数 = None, 不查), 返回
+    {"by_symbol": ...}。整段包在 try 里, 同 attach_insider: 附加信息自己出
+    bug 也只能降级成报告里一行 ⚠️, 不能拖垮扫描。"""
+    stocks = [r["symbol"] for r in results
+              if tickers[r["symbol"]]["kind"] == "stock"]
+    try:
+        meta = revisions.run(stocks, workers=workers)
+    except Exception as e:      # noqa: BLE001
+        meta = {"by_symbol": {s_: {"error": f"修正模块异常: "
+                                            f"{type(e).__name__}: {e}"}
+                              for s_ in stocks}}
+    for r in results:
+        r["revisions"] = meta["by_symbol"].get(r["symbol"])
+    return meta
+
+
+def revisions_block(results, meta) -> list[str]:
+    """开盘/尾盘报告的修正段。meta=None (--no-revisions) 整段不出。"""
+    if meta is None:
+        return []
+    return revisions.report_block([(r["symbol"], r.get("revisions"))
+                                   for r in results])
+
+
+def snapshot_revisions(meta, d: str) -> None:
+    """定时尾盘扫描把当天的修正存一行 (雅虎没有历史, 这是以后回测的唯一
+    来源)。写不进去只告警 —— 少一天快照不值得让扫描失败。"""
+    try:
+        n = revisions.append_snapshot(
+            revisions.snapshot_rows(meta["by_symbol"], d),
+            DATA / revisions.SNAPSHOT_NAME)
+    except Exception as e:      # noqa: BLE001
+        print(f"  revisions: 快照写入失败 ({type(e).__name__}: {e})",
+              file=sys.stderr)
+        return
+    if n:
+        print(f"  revisions: +{n} 行快照 -> {revisions.SNAPSHOT_NAME}")
+
+
 def zone_invalid_for(cfg: dict, hist, prev_state: dict | None) -> str | None:
     """晚间检查用的 zone 作废判定 —— 与 analyze_ticker 同一口径 (state 里
     的粘性作废 + zone_asof 之后的拆股), 只读不写: 晚间不推进任何状态。"""
@@ -3563,7 +3608,8 @@ def zone_position(close: float, zone) -> str:
     return "区内"
 
 
-def render_close(results, regime, ivdf, now_et, insider_meta=None) -> str:
+def render_close(results, regime, ivdf, now_et, insider_meta=None,
+                 revisions_meta=None) -> str:
     d = now_et.strftime("%Y-%m-%d")
     lines = [f"# 左右侧 watchlist 扫描 — {d} 尾盘 "
              f"({now_et:%H:%M} ET)", ""]
@@ -3609,6 +3655,7 @@ def render_close(results, regime, ivdf, now_et, insider_meta=None) -> str:
         "上沿X%(等回落), 区内 = 可接货, 破下沿 = 检查论点。",
         ""]
     lines += insider_block(results, insider_meta)
+    lines += revisions_block(results, revisions_meta)
 
     detail = [r for r in ordered
               if r["state"] in ("CONFIRMED", "TREND", "LEFT_ZONE", "NEAR_ZONE")
@@ -3745,7 +3792,8 @@ def render_close(results, regime, ivdf, now_et, insider_meta=None) -> str:
     return "\n".join(lines)
 
 
-def render_open(results, regime, now_et, s: dict, insider_meta=None) -> str:
+def render_open(results, regime, now_et, s: dict, insider_meta=None,
+                revisions_meta=None) -> str:
     d = now_et.strftime("%Y-%m-%d")
     lines = [f"# 开盘异动 — {d} ({now_et:%H:%M} ET)", ""]
     lines += regime_block(regime)
@@ -3791,6 +3839,10 @@ def render_open(results, regime, now_et, s: dict, insider_meta=None) -> str:
     lines += alerts or [("- 无异动 (gap/波动/价值区/财报/内部人买入 均未触发)"
                          if insider_meta is not None else
                          "- 无异动 (gap/波动/价值区/财报 均未触发)")]
+    # 修正段单独成节, 不进异动列表 —— 每天都有内容, 混进去"无异动"就永远不出了
+    rev = revisions_block(results, revisions_meta)
+    if rev:
+        lines += [""] + rev[:-1]
     lines += ["", "---",
               "开盘扫描只做提醒 — 右侧确认以收盘为准, 见尾盘报告。数据 ~15min 延迟。"]
     return "\n".join(lines)
@@ -4243,6 +4295,8 @@ def main() -> int:
                     help="email the report after writing it (SCAN_SMTP_* env)")
     ap.add_argument("--no-insider", action="store_true",
                     help="skip SEC Form 4 insider-buy fetch")
+    ap.add_argument("--no-revisions", action="store_true",
+                    help="skip Yahoo analyst EPS-revision fetch")
     ap.add_argument("--workers", type=int, default=4)
     args = ap.parse_args()
 
@@ -4325,6 +4379,13 @@ def main() -> int:
               + ("" if insider_meta.get("enabled")
                  else f" (未启用: {insider_meta.get('reason')})"))
 
+    # 分析师预期修正: 两个模式都拉 (报告都有这一段), 只有个股 (ETF/指数没有)
+    revisions_meta = None
+    if not args.no_revisions:
+        revisions_meta = attach_revisions(results, tickers, args.workers)
+        got = sum(1 for v in revisions_meta["by_symbol"].values() if v.get("data"))
+        print(f"  revisions: {got}/{len(revisions_meta['by_symbol'])} 只个股取到")
+
     ivdf = load_iv_history()
     if mode == "close":
         if manual:
@@ -4332,6 +4393,10 @@ def main() -> int:
                 r["state_since"] = state.get(r["symbol"], {}).get("since")
         else:
             ivdf = append_iv_history(results, d)
+            # 修正快照与 iv_history 同一个闸: 只有定时尾盘扫描写, 手工
+            # --force/--tickers 不写 (同一天手工跑的会占掉定时那一行)
+            if revisions_meta is not None:
+                snapshot_revisions(revisions_meta, d)
             # persist state transitions (close-basis only, per the playbook)
             for r in results:
                 if r["error"] or r["tech"] is None:
@@ -4353,9 +4418,11 @@ def main() -> int:
             _n = append_journal(journal_rows(results, d, mode, regime))
             if _n:
                 print(f"  journal: +{_n} 条推荐记录 -> {JOURNAL.name}")
-        report = render_close(results, regime, ivdf, now_et, insider_meta)
+        report = render_close(results, regime, ivdf, now_et, insider_meta,
+                              revisions_meta)
     else:
-        report = render_open(results, regime, now_et, settings, insider_meta)
+        report = render_open(results, regime, now_et, settings, insider_meta,
+                             revisions_meta)
 
     REPORTS.mkdir(exist_ok=True)
     report_path.write_text(report + "\n", encoding="utf-8")
