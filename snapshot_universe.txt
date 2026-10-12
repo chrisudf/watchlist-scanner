@@ -1,0 +1,23 @@
+# 分析师预期修正快照的扩展股票池 (revisions.py) —— 只进 data/eps_revisions.csv, 不进报告。
+# 目的: 给 todo.md #10 的回测加样本。watchlist 14 只、120 天只有约 70 个独立的 20 日样本,
+# 两组要差 4% 以上才显著; 文献里修正效应约每月 1%, 扩到标普 100 才进入能测出的量级。
+#
+# 标普 100 成分股。来源: Wikipedia "S&P 100" 成分表 (标注 as of 2026-09-21, 即 9 月调样后),
+# 2026-10-12 抓取。没找到第二个来源交叉核对 (iShares OEF 持仓下载返回 HTML, slickcharts 403)。
+# 这是开始积累那天定下的固定池, 以后指数调样不跟着改 —— 回测的样本池事先定死, 不引入
+# 前视偏差; 想加票直接加, 从加的那天起积累 (快照按日期 × 代码存, 不要求每天同一批)。
+#
+# Yahoo 代码格式: BRK.B 写成 BRK-B。GOOGL 不收: 预期和 GOOG 逐字相同, 两只都收等于
+# 同一个样本算两遍 (watchlist 里是 GOOG)。watchlist 里已有的个股不会重复取。
+# 格式: 空白或逗号分隔, # 后是注释。
+
+AAPL ABBV ABT ACN ADBE AMAT AMD AMGN AMT AMZN
+ANET AVGO AXP BA BAC BKNG BLK BMY BNY BRK-B
+C CAT CMCSA COF COP COST CRM CSCO CVS CVX
+DE DELL DHR DIS DUK EMR FDX GD GE GEV
+GILD GM GOOG GS HD IBM INTC INTU ISRG JNJ
+JPM KO LIN LLY LMT LOW LRCX MA MCD MDLZ
+MDT META MMM MO MRK MS MSFT MU NEE NFLX
+NOW NVDA ORCL PANW PEP PFE PG PLTR PM QCOM
+RTX SBUX SCHW SNDK SO T TMO TMUS TSLA TXN
+UBER UNH UNP UPS USB V VZ WFC WMT XOM

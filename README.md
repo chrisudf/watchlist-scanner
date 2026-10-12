@@ -417,6 +417,12 @@ watchlist 里的个股 (ETF/指数跳过) 出现**公开市场买入**时提示�
   (`src = yf`), 只缺结束日和 Normalized, 报告照常并出一行 ⚠️。
 - 取数失败合并成一条 ⚠️ —— 个股拿到空表也算失败 (yfinance 会把 HTTP 错误
   吞成空表), 不能当"没有修正"。
+- **快照池扩到标普 100** (`snapshot_universe.txt`): watchlist 14 只 × 120 天
+  只有约 70 个独立的 20 日样本, 测不出 1% 量级的效应。池里 watchlist 之外的
+  92 只也每天存一行, **只进快照不进报告**; 在尾盘报告和邮件发出之后才取 (2 并发,
+  实测 17 秒), 发信失败也照存。这一批的缺口记进 `data/eps_revisions_status.json`,
+  由下一份报告出一行 ⚠️ (6 天没跑也报)。池子是 10/12 定的固定名单, 以后指数调样
+  不跟着改。DELL / GE / LIN / PANW / UBER 在 Yahoo 没有 Normalized 口径。
 
 ## 推荐复盘 / 胜率 (`review.py`)
 

@@ -3198,14 +3198,17 @@ def attach_revisions(results, tickers, workers: int = 4) -> dict:
     return meta
 
 
-def revisions_block(results, meta) -> list[str]:
+def revisions_block(results, meta, today: date | None = None) -> list[str]:
     """开盘/尾盘报告的修正段。meta=None (--no-revisions) 整段不出。"""
     if meta is None:
         return []
+    today = today or datetime.now(ET).date()
+    stale = revisions.status_warning(DATA / revisions.STATUS_NAME, today)
     # 下次财报日: 修正扎堆在财报后, 读家数要知道它在财报周期的哪一段。
     # 收盘 --no-options 不拉财报日 (analyze_ticker 在期权链之前返回), 那时不写
     return revisions.report_block([(r["symbol"], r.get("revisions")) for r in results],
-                                  {r["symbol"]: r.get("earnings") for r in results})
+                                  {r["symbol"]: r.get("earnings") for r in results},
+                                  [stale] if stale else None)
 
 
 def snapshot_revisions(meta, d: str) -> None:
@@ -3221,6 +3224,32 @@ def snapshot_revisions(meta, d: str) -> None:
         return
     if n:
         print(f"  revisions: +{n} 行快照 -> {revisions.SNAPSHOT_NAME}")
+
+
+def snapshot_universe(meta, tickers, d: str, workers: int = 2) -> None:
+    """定时尾盘扫描的最后一步: 扩展股票池 (标普 100) 里 watchlist 之外的个股也存
+    一行快照, 只进 csv 不进报告。放在报告和邮件之后, 85 个额外请求不拖慢报告;
+    并发压到 2, 少惹 Yahoo 限流。watchlist 个股前面已经取过, 失败的也不在这里重试
+    (同一天再撞一次没意义)。结果记进状态文件, 缺口由下一份报告出 ⚠️。"""
+    extra = [s_ for s_ in revisions.load_universe(BASE / revisions.UNIVERSE_NAME)
+             if s_ not in meta["by_symbol"] and s_ not in tickers]
+    if not extra:
+        return
+    status = DATA / revisions.STATUS_NAME
+    try:
+        res = revisions.run(extra, workers=workers)["by_symbol"]
+        n = revisions.append_snapshot(revisions.snapshot_rows(res, d),
+                                      DATA / revisions.SNAPSHOT_NAME)
+        revisions.write_status(status, d, extra, res)
+        print(f"  revisions: 扩展快照 +{n} 行 "
+              f"({sum(1 for v in res.values() if v.get('data'))}/{len(extra)} 只)")
+    except Exception as e:      # noqa: BLE001
+        why = f"{type(e).__name__}: {e}"
+        print(f"  revisions: 扩展快照失败 ({why})", file=sys.stderr)
+        try:
+            revisions.write_status(status, d, extra, {}, crash=why)
+        except OSError:
+            pass
 
 
 def zone_invalid_for(cfg: dict, hist, prev_state: dict | None) -> str | None:
@@ -4450,6 +4479,7 @@ def main() -> int:
     print()
     print(report)
     print(f"\nREPORT {report_path}")
+    rc = 0
     if args.email:
         # 带上扫描时间: 主题重复时 Gmail 会把多封归进同一会话, 然后把
         # "重复"的正文折叠成 "Show quoted text" / 三个点 —— 报告正文每天
@@ -4467,8 +4497,12 @@ def main() -> int:
             ping_heartbeat()
         except Exception as e:
             print(f"EMAIL FAILED: {e}", file=sys.stderr)
-            return 1
-    return 0
+            rc = 1
+    # 扩展快照 (标普 100) 排在报告和邮件之后 —— 发信失败也照存, 快照与投递无关;
+    # 闸和 watchlist 那份快照一样: 只有定时尾盘扫描
+    if mode == "close" and not manual and revisions_meta is not None:
+        snapshot_universe(revisions_meta, tickers, d)
+    return rc
 
 
 if __name__ == "__main__":

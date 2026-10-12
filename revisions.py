@@ -37,6 +37,11 @@
 (eps_revisions / eps_trend / earnings_estimate / revenue_estimate), 只缺 endDate
 和 Normalized, 报告照常并出一行 ⚠️; 快照的 src 列记走的是哪条路 (raw / yf)。
 
+快照池 (10/12 用户拍板扩到标普 100): watchlist 个股之外, snapshot_universe.txt 里的
+股票也每天存一行, 只进快照不进报告 —— 14 只 × 120 天测不出 1% 量级的效应。这一批在
+尾盘报告和邮件发出之后才取 (多约 85 个请求, 不拖慢报告), 结果记进状态文件
+(eps_revisions_status.json), 有缺口由下一份报告出 ⚠️ (status_warning)。
+
 四个实测坑 (2026-10-12):
   1. ETF/指数没有这个模块, Yahoo 回 404, yfinance 公开接口默认吞掉异常、返回空表。
      所以 ETF/指数按 kind 直接不查 (静默)。个股拿到空表多半是取数失败被吞了
@@ -54,11 +59,13 @@
 from __future__ import annotations
 
 import csv
+import json
 import math
 import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date
 from pathlib import Path
 
 PERIODS = ("0q", "+1q", "0y", "+1y")
@@ -95,6 +102,11 @@ ONE_TIME_MIN_JUMP = 0.15    # 本财年 90 天变动的绝对值下限
 ONE_TIME_RATIO = 2.5        # 且大于下财年变动的这么多倍
 
 SNAPSHOT_NAME = "eps_revisions.csv"
+# 快照的扩展股票池 (标普 100, 仓库根目录): watchlist 之外的只进快照、不进报告,
+# 给回测加样本。取完把结果记进状态文件, 下一份报告据此提示缺口
+UNIVERSE_NAME = "snapshot_universe.txt"
+STATUS_NAME = "eps_revisions_status.json"
+STATUS_STALE_DAYS = 5       # 最长休市间隔 (周五 → 周一假日后的周二) 是 4 个日历日
 # 每行 = 一个 ET 交易日 × 一只个股。src = raw (私有接口, 全字段) / yf (退回公开接口,
 # 缺 end 和 norm_ 列)。"{period}_{键}" = 默认口径 + 营收 + end; "norm_{period}_{键}"
 # = Normalized 口径的 EPS 部分, 那天没取到就留空
@@ -379,10 +391,12 @@ def _sort_key(info: dict) -> tuple:
 
 
 def report_block(items: list[tuple[str, dict | None]],
-                 earnings: dict[str, str] | None = None) -> list[str]:
+                 earnings: dict[str, str] | None = None,
+                 extra_warnings: list[str] | None = None) -> list[str]:
     """[(symbol, info)] -> 报告段落: 标题、每只个股一行 (按净上调比例从高到低)、
     失败各合并成一条 ⚠️、说明。info=None (ETF/指数) 静默跳过。
-    earnings = {symbol: 下次财报日}, 可缺。"""
+    earnings = {symbol: 下次财报日}, 可缺; extra_warnings = 扩展快照的缺口提示
+    (status_warning), 排在本次的失败提示后面。"""
     earnings = earnings or {}
     body, failed, raw_failed, norm_failed = [], {}, {}, {}
     for sym, info in items:
@@ -417,6 +431,7 @@ def report_block(items: list[tuple[str, dict | None]],
     if norm_failed:
         lines.append(f"- ⚠️ Normalized 口径取不到: {join(norm_failed)} — 上面照常, "
                      "只是快照里缺这一套")
+    lines += extra_warnings or []
     if not (body or failed):
         lines.append("- 无 (没有个股)")
     lines += ["",
@@ -493,6 +508,62 @@ def append_snapshot(rows: list[dict], path: Path) -> int:
             w.writerows(new)
         os.replace(tmp, path)
     return len(new)
+
+
+def load_universe(path: Path) -> list[str]:
+    """扩展股票池文件 -> 代码列表 (大写、去重保序); # 后是注释, 空白或逗号分隔。
+    文件不在 = []。"""
+    if not path.exists():
+        return []
+    out = []
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        for sym in re.split(r"[\s,]+", raw_line.split("#", 1)[0].strip()):
+            sym = sym.upper()
+            if sym and sym not in out:
+                out.append(sym)
+    return out
+
+
+def write_status(path: Path, day: str, wanted: list[str], by_symbol: dict,
+                 crash: str | None = None) -> None:
+    """记下扩展快照这一轮存到了几只。它在报告发出之后才跑, 缺口只能留给下一份报告
+    说 (status_warning) —— 快照是以后回测的唯一来源, 缺了不能只躺在 cron log 里。"""
+    failed: dict[str, list[str]] = {}
+    for sym in wanted:
+        info = by_symbol.get(sym) or {}
+        if not info.get("data"):
+            failed.setdefault(info.get("error") or crash or "没取到", []).append(sym)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps({"date": day, "wanted": len(wanted),
+                               "got": len(wanted) - sum(map(len, failed.values())),
+                               "failed": failed}, ensure_ascii=False, indent=1),
+                   encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def status_warning(path: Path, today: date) -> str | None:
+    """上一轮扩展快照有缺口 / 太久没跑 -> 一行 ⚠️; 没有状态文件 (还没跑过) = None。"""
+    try:
+        st = json.loads(path.read_text(encoding="utf-8"))
+        day = date.fromisoformat(st["date"])
+        wanted, got = int(st["wanted"]), int(st["got"])
+        failed = st.get("failed") or {}
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        return f"- ⚠️ 扩展快照状态文件读不了 ({type(e).__name__}) — 查 data/{STATUS_NAME}"
+    if (today - day).days > STATUS_STALE_DAYS:
+        return (f"- ⚠️ 扩展快照 (标普 100) 最近一次是 {day.isoformat()}, 之后没跑 — "
+                "回测样本在断档, 查尾盘扫描的 cron log")
+    if got >= wanted:
+        return None
+    parts = []
+    for why, syms in failed.items():
+        shown = ", ".join(syms[:6]) + (f" 等 {len(syms)} 只" if len(syms) > 6 else "")
+        parts.append(f"{shown} ({why})")
+    return (f"- ⚠️ 扩展快照 (标普 100) {day.isoformat()} 只存到 {got}/{wanted} 只: "
+            f"{'; '.join(parts)} — 报告不受影响, 回测样本缺这几只这一天")
 
 
 # --------------------------------------------------------------------------

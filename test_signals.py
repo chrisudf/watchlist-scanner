@@ -5550,20 +5550,90 @@ class TestRevisionsSnapshot(unittest.TestCase):
                             if c.startswith(rv.NORM_PREFIX)))
 
 
+class TestRevisionsUniverse(unittest.TestCase):
+    """扩展快照池 (标普 100) 的文件、状态文件和缺口提示。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.status = self.dir / rv.STATUS_NAME
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_repo_universe_file(self):
+        u = rv.load_universe(Path(sc.BASE) / rv.UNIVERSE_NAME)
+        self.assertEqual(len(u), 100)                   # 101 行成分表去掉 GOOGL
+        self.assertEqual(len(u), len(set(u)))
+        self.assertIn("GOOG", u)
+        self.assertNotIn("GOOGL", u)                    # 和 GOOG 预期逐字相同
+        self.assertIn("BRK-B", u)                       # Yahoo 写法, 不是 BRK.B
+        self.assertTrue(all(re.fullmatch(r"[A-Z]{1,5}(-[A-Z])?", s) for s in u), u)
+
+    def test_load_universe_parsing(self):
+        p = self.dir / "u.txt"
+        p.write_text("# 注释 AAPL\nmsft, nvda  # 行尾注释\n\nNVDA\tBRK-B\n", encoding="utf-8")
+        self.assertEqual(rv.load_universe(p), ["MSFT", "NVDA", "BRK-B"])
+        self.assertEqual(rv.load_universe(self.dir / "missing.txt"), [])
+
+    def _write(self, by, wanted=("JPM", "XOM", "KO"), crash=None, day="2026-10-14"):
+        rv.write_status(self.status, day, list(wanted), by, crash=crash)
+
+    def test_gap_is_flagged(self):
+        ok = {"data": {"+1y": {}}}
+        self._write({"JPM": ok, "XOM": {"error": "Yahoo 返回空表"}})
+        st = json.loads(self.status.read_text(encoding="utf-8"))
+        self.assertEqual((st["wanted"], st["got"]), (3, 1))
+        w = rv.status_warning(self.status, date(2026, 10, 15))
+        self.assertIn("扩展快照 (标普 100) 2026-10-14 只存到 1/3 只: "
+                      "XOM (Yahoo 返回空表); KO (没取到)", w)
+        self._write({s_: ok for s_ in ("JPM", "XOM", "KO")})
+        self.assertIsNone(rv.status_warning(self.status, date(2026, 10, 15)))
+
+    def test_stale_missing_and_corrupt(self):
+        self._write({s_: {"data": {"+1y": {}}} for s_ in ("JPM", "XOM", "KO")},
+                    day="2026-10-09")                    # 周五
+        # 最长正常间隔是周五 → 周一假日后的周二 (4 天), 再留一天余量; 6 天没跑才报
+        self.assertIsNone(rv.status_warning(self.status, date(2026, 10, 14)))
+        self.assertIn("最近一次是 2026-10-09, 之后没跑",
+                      rv.status_warning(self.status, date(2026, 10, 15)))
+        self.assertIsNone(rv.status_warning(self.dir / "none.json", date(2026, 10, 15)))
+        self.status.write_text("{oops", encoding="utf-8")
+        self.assertIn("状态文件读不了", rv.status_warning(self.status, date(2026, 10, 15)))
+
+    def test_crash_and_long_lists(self):
+        wanted = [f"S{i}" for i in range(9)]
+        self._write({}, wanted=wanted, crash="RuntimeError: Too Many Requests")
+        w = rv.status_warning(self.status, date(2026, 10, 14))
+        self.assertIn("只存到 0/9 只: S0, S1, S2, S3, S4, S5 等 9 只 "
+                      "(RuntimeError: Too Many Requests)", w)
+
+
 class TestRevisionsMain(unittest.TestCase):
     """main() 的接线: 快照只在定时尾盘扫描写, --force/--tickers/开盘都不写;
-    --no-revisions 整段不拉不出。"""
+    --no-revisions 整段不拉不出; 扩展快照池在报告和邮件之后取。"""
+
+    UNIVERSE = ["SOFI", "QQQ", "JPM", "XOM"]    # SOFI 已在 watchlist, QQQ 是指数
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         self.reports, self.data = root / "reports", root / "data"
         self.asked = []
+        self.report_first = None
+        self.extra_boom = False
+        self.xom_fails = False
 
         def fake_run(symbols, workers=4):
             self.asked.append(list(symbols))
-            return {"by_symbol": {s_: {"data": rv.parse(*_rev_frames()), "flag": None}
-                                  for s_ in symbols}}
+            if "JPM" in symbols:            # 扩展快照那一轮
+                self.report_first = any(self.reports.glob("*-close.md"))
+                if self.extra_boom:
+                    raise RuntimeError("Too Many Requests")
+            return {"by_symbol": {
+                s_: ({"error": "Yahoo 返回空表"} if s_ == "XOM" and self.xom_fails
+                     else {"data": rv.parse(*_rev_frames()), "flag": None})
+                for s_ in symbols}}
 
         cfg = {**sc.TICKER_DEFAULTS, "value_zone": [13.0, 16.0]}
         tickers = {"SOFI": cfg, "QQQ": {**sc.TICKER_DEFAULTS, "kind": "index"}}
@@ -5578,7 +5648,8 @@ class TestRevisionsMain(unittest.TestCase):
             mock_attr(sc, "load_state", lambda: {}),
             mock_attr(sc, "save_state", lambda st: None),
             mock_attr(sc, "append_journal", lambda rows, path=None: 0),
-            mock_attr(sc.revisions, "run", fake_run)]
+            mock_attr(sc.revisions, "run", fake_run),
+            mock_attr(sc.revisions, "load_universe", lambda path: list(self.UNIVERSE))]
         for p_ in self.patches:
             p_.__enter__()
 
@@ -5614,19 +5685,55 @@ class TestRevisionsMain(unittest.TestCase):
     def test_tickers_subset_never_snapshots(self):
         self.assertEqual(self._main("--mode", "close", "--tickers", "SOFI"), 0)
         self.assertFalse(self._snap().exists())
+        self.assertEqual(self.asked, [["SOFI"]])     # 扩展池也不取
 
-    def test_scheduled_close_snapshots_stocks_only(self):
-        self.assertEqual(self._main("--mode", "close"), 0)
+    def _rows(self):
         import csv
         with self._snap().open(newline="", encoding="utf-8") as f:
-            got = list(csv.DictReader(f))
-        self.assertEqual([(r["date"], r["symbol"]) for r in got],
-                         [(self._today(), "SOFI")])
-        self.assertIn("## 分析师预期修正", self._report(f"{self._today()}-close.md"))
+            return [(r["date"], r["symbol"]) for r in csv.DictReader(f)]
+
+    def _status(self):
+        return json.loads((self.data / rv.STATUS_NAME).read_text(encoding="utf-8"))
+
+    def test_scheduled_close_snapshots_watchlist_then_universe(self):
+        self.assertEqual(self._main("--mode", "close"), 0)
+        # watchlist 个股先取 (报告要用), 扩展池只取 watchlist 之外的个股, 指数不取
+        self.assertEqual(self.asked, [["SOFI"], ["JPM", "XOM"]])
+        self.assertTrue(self.report_first)          # 扩展池在报告写盘之后
+        self.assertEqual(self._rows(), [(self._today(), s_) for s_ in ("SOFI", "JPM", "XOM")])
+        self.assertEqual((self._status()["wanted"], self._status()["got"]), (2, 2))
+        text = self._report(f"{self._today()}-close.md")
+        self.assertIn("## 分析师预期修正", text)
+        self.assertNotIn("JPM", text)               # 扩展池不进报告
+
+    def test_universe_runs_even_if_email_fails(self):
+        def boom(path, subject):
+            raise RuntimeError("smtp down")
+        with mock_attr(sc, "send_email_report", boom), \
+                mock_attr(sc, "resend_pending_reports", lambda d, t: None):
+            self.assertEqual(self._main("--mode", "close", "--email"), 1)
+        self.assertEqual(self._rows()[1:], [(self._today(), "JPM"), (self._today(), "XOM")])
+
+    def test_universe_gap_shows_in_next_report(self):
+        self.xom_fails = True
+        self.assertEqual(self._main("--mode", "close"), 0)
+        self.assertEqual((self._status()["wanted"], self._status()["got"]), (2, 1))
+        self.assertEqual(self._main("--mode", "open", "--force"), 0)
+        self.assertIn(f"⚠️ 扩展快照 (标普 100) {self._today()} 只存到 1/2 只: "
+                      "XOM (Yahoo 返回空表)", self._report(f"{self._today()}-open-manual.md"))
+
+    def test_universe_crash_is_recorded_not_raised(self):
+        self.extra_boom = True
+        self.assertEqual(self._main("--mode", "close"), 0)
+        self.assertEqual(self._rows(), [(self._today(), "SOFI")])
+        st = self._status()
+        self.assertEqual((st["wanted"], st["got"]), (2, 0))
+        self.assertEqual(st["failed"], {"RuntimeError: Too Many Requests": ["JPM", "XOM"]})
 
     def test_scheduled_open_shows_but_never_snapshots(self):
         self.assertEqual(self._main("--mode", "open"), 0)
         self.assertFalse(self._snap().exists())
+        self.assertEqual(self.asked, [["SOFI"]])
         self.assertIn("## 分析师预期修正", self._report(f"{self._today()}-open.md"))
 
     def test_no_revisions_flag(self):
