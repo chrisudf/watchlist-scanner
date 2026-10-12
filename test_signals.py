@@ -5275,7 +5275,8 @@ class TestRevisionsFetch(unittest.TestCase):
         got = self._fetch(_raw_boom, est_raises=True)
         self.assertEqual(got["data"]["+1y"]["down30"], 15)
         self.assertIsNone(got["data"]["+1y"]["n"])
-        self.assertEqual(got["ccy"], {"eps": None, "rev": "USD"})
+        # 家数表缺了, EPS 币种从趋势表拿 (PR #24 评审: 降级的日子别再丢币种)
+        self.assertEqual(got["ccy"], {"eps": "USD", "rev": "USD"})
 
 
 class TestRevisionsOneTime(unittest.TestCase):
@@ -5514,6 +5515,20 @@ class TestRevisionsSnapshot(unittest.TestCase):
         self.assertEqual((r["+1y_rev_n"], float(r["+1y_rev_avg"])), ("32", 28.96e9))
         self.assertEqual((r["norm_+1y_up30"], r["norm_+1y_n"]), ("5", "9"))
 
+    def test_append_path_only_reads_keys(self):
+        # PR #24 评审: 文件会长到上万行 × 145 列, 平常追加只该读 (date, symbol)
+        self.assertEqual(rv.append_snapshot(rv.snapshot_rows(self._by(), "2026-10-12"),
+                                            self.path), 1)
+
+        def no_full_rows(*a, **k):
+            raise AssertionError("追加路径把整行读进来了")
+        with mock_attr(rv.csv, "DictReader", no_full_rows):
+            self.assertEqual(rv.append_snapshot(rv.snapshot_rows(self._by(), "2026-10-12"),
+                                                self.path), 0)
+            self.assertEqual(rv.append_snapshot(rv.snapshot_rows(self._by(), "2026-10-13"),
+                                                self.path), 1)
+        self.assertEqual([r["date"] for r in self._read()[1]], ["2026-10-12", "2026-10-13"])
+
     def test_old_header_rewritten_as_union(self):
         self.path.parent.mkdir(parents=True)
         self.path.write_text("date,symbol,+1y_up30,legacy\n2026-10-09,NVDA,46,x\n",
@@ -5600,6 +5615,21 @@ class TestRevisionsUniverse(unittest.TestCase):
         self.assertIsNone(rv.status_warning(self.dir / "none.json", date(2026, 10, 15)))
         self.status.write_text("{oops", encoding="utf-8")
         self.assertIn("状态文件读不了", rv.status_warning(self.status, date(2026, 10, 15)))
+
+    def test_public_fallback_counts_as_degraded(self):
+        # PR #24 评审: 退回公开接口的行存了, 但缺 end 和 Normalized —— 不能算完整
+        ok = {"data": {"+1y": {}}, "src": "raw"}
+        yf = {"data": {"+1y": {}}, "src": "yf", "raw_error": "YFRateLimitError"}
+        self._write({"JPM": yf, "XOM": ok, "KO": ok})
+        st = json.loads(self.status.read_text(encoding="utf-8"))
+        self.assertEqual((st["got"], st["degraded"]), (3, {"YFRateLimitError": ["JPM"]}))
+        w = rv.status_warning(self.status, date(2026, 10, 15))
+        self.assertIn("2026-10-14 1 只退回公开接口、缺财年结束日和 Normalized: "
+                      "JPM (YFRateLimitError)", w)
+        self.assertNotIn("只存到", w)
+        self._write({"JPM": yf, "XOM": {"error": "Yahoo 返回空表"}, "KO": ok})
+        w = rv.status_warning(self.status, date(2026, 10, 15))
+        self.assertIn("只存到 2/3 只: XOM (Yahoo 返回空表)；1 只退回公开接口", w)
 
     def test_crash_and_long_lists(self):
         wanted = [f"S{i}" for i in range(9)]

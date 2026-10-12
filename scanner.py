@@ -3241,8 +3241,10 @@ def snapshot_universe(meta, tickers, d: str, workers: int = 2) -> None:
         n = revisions.append_snapshot(revisions.snapshot_rows(res, d),
                                       DATA / revisions.SNAPSHOT_NAME)
         revisions.write_status(status, d, extra, res)
+        fallback = sum(1 for v in res.values() if v.get("src") == "yf")
         print(f"  revisions: 扩展快照 +{n} 行 "
-              f"({sum(1 for v in res.values() if v.get('data'))}/{len(extra)} 只)")
+              f"({sum(1 for v in res.values() if v.get('data'))}/{len(extra)} 只"
+              + (f", 退回公开接口 {fallback}" if fallback else "") + ")")
     except Exception as e:      # noqa: BLE001
         why = f"{type(e).__name__}: {e}"
         print(f"  revisions: 扩展快照失败 ({why})", file=sys.stderr)

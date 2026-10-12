@@ -209,14 +209,15 @@ def _ccy_json(items) -> dict:
             "rev": (it.get("revenueEstimate") or {}).get("revenueCurrency")}
 
 
-def _ccy_df(est_df, revenue_df) -> dict:
-    """公开接口把币种放在 DataFrame 的 currency 列。"""
+def _ccy_df(est_df, revenue_df, trend_df=None) -> dict:
+    """公开接口把币种放在 DataFrame 的 currency 列。家数表是可选的, 它缺了 EPS 币种
+    就从趋势表拿 —— 退回公开接口本来就是降级的日子, 别再把币种也丢了。"""
     def first(df):
         if df is None or getattr(df, "empty", True) or "currency" not in df.columns:
             return None
         v = df["currency"].dropna()
         return str(v.iloc[0]) if len(v) else None
-    return {"eps": first(est_df), "rev": first(revenue_df)}
+    return {"eps": first(est_df) or first(trend_df), "rev": first(revenue_df)}
 
 
 def one_time_flag(data: dict) -> dict | None:
@@ -274,7 +275,7 @@ def _fetch_public(tk) -> tuple[dict, dict]:
             extra.append(getattr(tk, name))
         except Exception:               # noqa: BLE001
             extra.append(None)
-    return parse(rev, trend, *extra), _ccy_df(*extra)
+    return parse(rev, trend, *extra), _ccy_df(*extra, trend_df=trend)
 
 
 def fetch_one(sym: str, ticker_factory=_yf_ticker, raw_fetch=_fetch_raw) -> dict:
@@ -472,18 +473,28 @@ def snapshot_rows(by_symbol: dict, day: str) -> list[dict]:
     return rows
 
 
+def _snapshot_keys(path: Path) -> tuple[list[str] | None, set]:
+    """-> (表头, 已有的 (date, symbol))。逐行流式读, 只留两列 —— 文件会长到
+    180 天 × 106 只 ≈ 1.9 万行 × 145 列, 整行读进内存要上百 MB, 尾盘扫描一天还
+    调两次 (watchlist 一次、扩展池一次)。"""
+    if not path.exists():
+        return None, set()
+    with path.open(newline="", encoding="utf-8") as f:
+        rd = csv.reader(f)
+        header = next(rd, None)
+        if not header or "date" not in header or "symbol" not in header:
+            return header, set()
+        i, j = header.index("date"), header.index("symbol")
+        return header, {(r[i], r[j]) for r in rd if len(r) > max(i, j)}
+
+
 def append_snapshot(rows: list[dict], path: Path) -> int:
     """追加到快照 CSV -> 新写入的行数。(date, symbol) 已有的跳过 (同 iv_history)。
 
-    只增不改: 表头和 SNAPSHOT_FIELDS 一致就直接追加; 不一致 (以后加了列) 就按
-    新旧列的并集整表重写 (临时文件 + 原子替换), 旧行缺的列留空。"""
-    header, old = None, []
-    if path.exists():
-        with path.open(newline="", encoding="utf-8") as f:
-            rd = csv.DictReader(f)
-            header = rd.fieldnames
-            old = list(rd)
-    have = {(r.get("date"), r.get("symbol")) for r in old}
+    只增不改: 表头和 SNAPSHOT_FIELDS 一致就直接追加 (平常都走这条, 只读两列);
+    不一致 (以后加了列) 才整表读进来, 按新旧列的并集重写 (临时文件 + 原子替换),
+    旧行缺的列留空。"""
+    header, have = _snapshot_keys(path)
     new = []
     for r in rows:
         key = (r["date"], r["symbol"])
@@ -497,6 +508,10 @@ def append_snapshot(rows: list[dict], path: Path) -> int:
         with path.open("a", newline="", encoding="utf-8") as f:
             csv.DictWriter(f, SNAPSHOT_FIELDS, lineterminator="\n").writerows(new)
     else:
+        old = []
+        if header:
+            with path.open(newline="", encoding="utf-8") as f:
+                old = list(csv.DictReader(f))
         fields = list(header or []) + [c for c in SNAPSHOT_FIELDS
                                        if c not in (header or [])]
         tmp = path.with_name(path.name + ".tmp")
@@ -529,15 +544,19 @@ def write_status(path: Path, day: str, wanted: list[str], by_symbol: dict,
     """记下扩展快照这一轮存到了几只。它在报告发出之后才跑, 缺口只能留给下一份报告
     说 (status_warning) —— 快照是以后回测的唯一来源, 缺了不能只躺在 cron log 里。"""
     failed: dict[str, list[str]] = {}
+    degraded: dict[str, list[str]] = {}     # 存了, 但退回公开接口: 缺 end 和 Normalized
     for sym in wanted:
         info = by_symbol.get(sym) or {}
         if not info.get("data"):
             failed.setdefault(info.get("error") or crash or "没取到", []).append(sym)
+        elif info.get("src") == "yf":
+            degraded.setdefault(info.get("raw_error") or "原因不明", []).append(sym)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps({"date": day, "wanted": len(wanted),
                                "got": len(wanted) - sum(map(len, failed.values())),
-                               "failed": failed}, ensure_ascii=False, indent=1),
+                               "failed": failed, "degraded": degraded},
+                              ensure_ascii=False, indent=1),
                    encoding="utf-8")
     os.replace(tmp, path)
 
@@ -549,6 +568,7 @@ def status_warning(path: Path, today: date) -> str | None:
         day = date.fromisoformat(st["date"])
         wanted, got = int(st["wanted"]), int(st["got"])
         failed = st.get("failed") or {}
+        degraded = st.get("degraded") or {}
     except FileNotFoundError:
         return None
     except (OSError, ValueError, KeyError, TypeError) as e:
@@ -556,14 +576,23 @@ def status_warning(path: Path, today: date) -> str | None:
     if (today - day).days > STATUS_STALE_DAYS:
         return (f"- ⚠️ 扩展快照 (标普 100) 最近一次是 {day.isoformat()}, 之后没跑 — "
                 "回测样本在断档, 查尾盘扫描的 cron log")
-    if got >= wanted:
+    if got >= wanted and not degraded:
         return None
-    parts = []
-    for why, syms in failed.items():
-        shown = ", ".join(syms[:6]) + (f" 等 {len(syms)} 只" if len(syms) > 6 else "")
-        parts.append(f"{shown} ({why})")
-    return (f"- ⚠️ 扩展快照 (标普 100) {day.isoformat()} 只存到 {got}/{wanted} 只: "
-            f"{'; '.join(parts)} — 报告不受影响, 回测样本缺这几只这一天")
+
+    def fmt(groups):
+        parts = []
+        for why, syms in groups.items():
+            shown = ", ".join(syms[:6]) + (f" 等 {len(syms)} 只" if len(syms) > 6 else "")
+            parts.append(f"{shown} ({why})")
+        return "; ".join(parts)
+    segs = []
+    if got < wanted:
+        segs.append(f"只存到 {got}/{wanted} 只: {fmt(failed)}")
+    if degraded:
+        n = sum(map(len, degraded.values()))
+        segs.append(f"{n} 只退回公开接口、缺财年结束日和 Normalized: {fmt(degraded)}")
+    return (f"- ⚠️ 扩展快照 (标普 100) {day.isoformat()} {'；'.join(segs)} — "
+            "报告不受影响, 回测样本这一天不全")
 
 
 # --------------------------------------------------------------------------
