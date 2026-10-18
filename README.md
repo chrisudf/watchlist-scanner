@@ -69,6 +69,7 @@ launchd 每天在 8 个固定布里斯班时点触发 (23:45/00:45/01:30 开盘�
 .venv/bin/python insider.py SOFI HOOD                          # 单看内部人买入 (也用来预热缓存)
 .venv/bin/python revisions.py MCD NVDA                         # 单看分析师预期修正 (不写快照)
 .venv/bin/python mnav.py                                       # 单看 BTC 财库 mNAV 段 (不写历史)
+.venv/bin/python research/mnav_backtest.py                     # mNAV 回测全表 (联网 ~20MB)
 .venv/bin/python scanner.py --mode insider --force             # 晚间内部人检查 (窗口外强制跑)
 ```
 
