@@ -6198,5 +6198,175 @@ class TestMnavReport(unittest.TestCase):
             self.assertEqual([r["date"] for r in got], ["2026-10-01", "2026-10-16"])
             self.assertEqual(got[0]["m_dil"], "")
 
+
+class TestMnavScanner(unittest.TestCase):
+    """接线: [mnav.*] 随 settings 走; attach 降级; 两份报告都有这一段; --no-mnav;
+    历史只在定时尾盘扫描写。"""
+
+    TOML = ("[tickers.QQQ]\nkind = \"index\"\n"
+            "[mnav.MSTR]\ndebt_b = 6.714\npref_b = 13.748\nusd_b = 5.518\n"
+            "claims_asof = \"2026-10-16\"\n")
+
+    def _load(self, text):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "watchlist.toml"
+            p.write_text(text, encoding="utf-8")
+            return sc.load_config(p)
+
+    def test_load_config_accepts_mnav_table(self):
+        s, t = self._load(self.TOML)
+        self.assertEqual(list(s["mnav"]), ["MSTR"])
+        self.assertEqual(s["mnav"]["MSTR"]["st_ticker"], "MSTR")
+        s, t = self._load("[tickers.QQQ]\nkind = \"index\"\n")
+        self.assertNotIn("mnav", s)
+        with self.assertRaises(ValueError) as cm:
+            self._load("[mnav.MSTR]\ndebt_b = 1\npref_b = 1\n[tickers.QQQ]\n")
+        self.assertIn("claims_asof", str(cm.exception))
+        with self.assertRaises(ValueError) as cm:
+            self._load("[mnavs.MSTR]\ndebt_b = 1\n[tickers.QQQ]\n")
+        self.assertIn("[mnav.*]", str(cm.exception))
+
+    def test_repo_config_has_mstr(self):
+        s, _ = sc.load_config()
+        self.assertIn("MSTR", s.get("mnav", {}))
+
+    def _results(self):
+        mk = TestRenderOpenZoneAlert._r
+        rs = [mk(TestRenderOpenZoneAlert(), s_, 18.0, None) for s_ in ("SOFI", "QQQ")]
+        rs.append(mk(TestRenderOpenZoneAlert(), "MSTR", 120.0, None))
+        return rs
+
+    def test_attach_passes_live_close_and_degrades(self):
+        self.assertIsNone(sc.attach_mnav(dict(sc.SETTINGS_DEFAULTS), self._results(), _MN_TODAY))
+        settings = {**sc.SETTINGS_DEFAULTS, "mnav": {"MSTR": _mn_cfg()}}
+        seen = {}
+
+        def fake_run(cfgs, **kw):
+            seen.update(kw)
+            return {"by_symbol": {"MSTR": {"error": "x"}}, "cfgs": cfgs, "warnings": []}
+        with mock_attr(sc.mnav, "run", fake_run):
+            meta = sc.attach_mnav(settings, self._results(), _MN_TODAY)
+        self.assertEqual(seen["live_px"], {"MSTR": 120.0})
+        self.assertEqual(seen["today"], _MN_TODAY)
+        self.assertIs(seen["holidays"], sc.NYSE_HOLIDAYS)
+        self.assertEqual(seen["cache_path"].name, mn.CACHE_NAME)
+        self.assertEqual(meta["cfgs"], settings["mnav"])
+        rs = self._results()
+        rs[2]["stale_data"] = "x"                           # 陈旧日线不当 live 价
+        with mock_attr(sc.mnav, "run", fake_run):
+            sc.attach_mnav(settings, rs, _MN_TODAY)
+        self.assertEqual(seen["live_px"], {})
+
+        def boom(*a, **k):
+            raise KeyError("companies")
+        with mock_attr(sc.mnav, "run", boom):
+            meta = sc.attach_mnav(settings, self._results(), _MN_TODAY)
+        self.assertIn("mNAV 模块异常", meta["by_symbol"]["MSTR"]["error"])
+        text = "\n".join(sc.mnav_block(meta))
+        self.assertIn("mNAV 取不到", text)
+
+    def test_render_both_reports(self):
+        h = _st_hist()
+        cfg = _mn_cfg()
+        a = mn.assess(mn.frame(h), cfg, today=_MN_TODAY, live_px=_mn_px(0.75, h))
+        meta = {"by_symbol": {"MSTR": a}, "cfgs": {"MSTR": cfg}, "warnings": [],
+                "timestamp": "2026-10-16T20:00:00+00:00", "from_cache": False}
+        rs = self._results()[:2]
+        now = datetime(2026, 10, 16, 9, 45, tzinfo=sc.ET)
+        text = sc.render_open(rs, dict(TestRenderOpenZoneAlert.REGIME), now,
+                              sc.SETTINGS_DEFAULTS, None, None, meta)
+        self.assertIn("## BTC 财库 mNAV", text)
+        self.assertIn("无异动", text)                        # 不进异动列表
+        self.assertLess(text.index("## BTC 财库 mNAV"), text.index("\n---"))
+        text = sc.render_open(rs, dict(TestRenderOpenZoneAlert.REGIME), now, sc.SETTINGS_DEFAULTS)
+        self.assertNotIn("mNAV", text)
+        for r in rs:
+            r.update({"tech": None, "state": "NO_DATA", "csp": None, "leap": None,
+                      "iv30": None, "spread": None, "ladder": None, "error": None})
+        now = datetime(2026, 10, 16, 15, 45, tzinfo=sc.ET)
+        text = sc.render_close(rs, dict(TestRenderOpenZoneAlert.REGIME), pd.DataFrame(), now,
+                               None, None, meta)
+        self.assertIn("## BTC 财库 mNAV", text)
+        self.assertIn("🟢 现价已在 T1 档内", text)
+        text = sc.render_close(rs, dict(TestRenderOpenZoneAlert.REGIME), pd.DataFrame(), now)
+        self.assertNotIn("mNAV", text)
+
+
+class TestMnavMain(unittest.TestCase):
+    """main(): --no-mnav 不拉不出; 历史只有定时尾盘扫描写 (--force 不写, 开盘不写)。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.reports, self.data = root / "reports", root / "data"
+        self.calls = []
+        h = _st_hist()
+        cfg = _mn_cfg()
+        a = mn.assess(mn.frame(h), cfg, today=_MN_TODAY, live_px=_mn_px(0.88, h))
+        a["st_version"] = "v1"
+        self.meta = {"by_symbol": {"MSTR": a}, "cfgs": {"MSTR": cfg}, "warnings": [],
+                     "timestamp": "2026-10-16T20:00:00+00:00", "from_cache": False, "version": "v1"}
+
+        def fake_run(cfgs, **kw):
+            self.calls.append(kw)
+            return dict(self.meta)
+        settings = {**sc.SETTINGS_DEFAULTS, "mnav": {"MSTR": cfg}}
+        tickers = {"QQQ": {**sc.TICKER_DEFAULTS, "kind": "index"}}
+        self.patches = [
+            mock_attr(sc, "REPORTS", self.reports), mock_attr(sc, "DATA", self.data),
+            mock_attr(sc, "IV_HISTORY", self.data / "iv_history.csv"),
+            mock_attr(sc, "load_config", lambda: (dict(settings), dict(tickers))),
+            mock_attr(sc, "fetch_regime", lambda s: dict(TestRenderOpenZoneAlert.REGIME)),
+            mock_attr(sc, "batch_history", lambda syms: {s_: None for s_ in syms}),
+            mock_attr(sc, "market_is_live", lambda: True),
+            mock_attr(sc, "next_earnings", lambda tk: None),
+            mock_attr(sc, "load_state", lambda: {}),
+            mock_attr(sc, "save_state", lambda st: None),
+            mock_attr(sc, "append_journal", lambda rows, path=None: 0),
+            mock_attr(sc.mnav, "run", fake_run)]
+        for p_ in self.patches:
+            p_.__enter__()
+
+    def tearDown(self):
+        for p_ in reversed(self.patches):
+            p_.__exit__()
+        self.tmp.cleanup()
+
+    def _main(self, *argv):
+        import contextlib
+        with mock_attr(sys, "argv", ["scanner.py", "--no-insider", "--no-options",
+                                     "--no-revisions", *argv]), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            return sc.main()
+
+    def _hist(self):
+        return self.data / mn.HISTORY_NAME
+
+    def test_scheduled_close_writes_history_and_block(self):
+        self.assertEqual(self._main("--mode", "close"), 0)
+        self.assertEqual(len(self.calls), 1)
+        self.assertTrue(self._hist().exists())
+        self.assertEqual(self._hist().read_text(encoding="utf-8").count("\n"), 2)
+        md = next(self.reports.glob("*-close.md")).read_text(encoding="utf-8")
+        self.assertIn("## BTC 财库 mNAV", md)
+        self.assertIn("稀释 mNAV **0.880**", md)
+
+    def test_force_and_open_do_not_write_history(self):
+        self.assertEqual(self._main("--mode", "close", "--force"), 0)
+        self.assertFalse(self._hist().exists())
+        self.assertIn("## BTC 财库 mNAV",
+                      next(self.reports.glob("*-close-manual.md")).read_text(encoding="utf-8"))
+        self.assertEqual(self._main("--mode", "open"), 0)
+        self.assertFalse(self._hist().exists())
+        self.assertIn("## BTC 财库 mNAV",
+                      next(self.reports.glob("*-open.md")).read_text(encoding="utf-8"))
+
+    def test_no_mnav_flag(self):
+        self.assertEqual(self._main("--mode", "close", "--no-mnav"), 0)
+        self.assertEqual(self.calls, [])
+        self.assertFalse(self._hist().exists())
+        self.assertNotIn("mNAV", next(self.reports.glob("*-close.md")).read_text(encoding="utf-8"))
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

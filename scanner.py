@@ -56,6 +56,7 @@ import pandas as pd
 import yfinance as yf
 
 import insider
+import mnav
 import revisions
 
 # ETFs have no earnings calendar — silence yfinance's 404 chatter
@@ -307,13 +308,13 @@ def load_config(path: Path = CONFIG_FILE) -> tuple[dict, dict]:
     TypeError, 或者阈值默认值顶着你以为改过的名字继续生效。"""
     with open(path, "rb") as f:
         raw = tomllib.load(f)
-    unknown_top = set(raw) - {"settings", "tickers"}
+    unknown_top = set(raw) - {"settings", "tickers", "mnav"}
     if unknown_top:
         # [setting] / [ticker.QQQ] 这类表名手滑不会报错, 整段配置连同
         # 你以为改过的每个阈值一起被静默忽略 (PR #10 评审)
         raise ValueError(
             f"顶层未知表 (typo?): {', '.join('[' + k + ']' for k in sorted(unknown_top))} "
-            f"— 只认 [settings] 与 [tickers.*]")
+            f"— 只认 [settings] / [tickers.*] / [mnav.*]")
     settings_raw = raw.get("settings", {})
     unknown = set(settings_raw) - set(SETTINGS_DEFAULTS)
     if unknown:
@@ -335,6 +336,11 @@ def load_config(path: Path = CONFIG_FILE) -> tuple[dict, dict]:
             raise ValueError(f"[settings] {k} 类型错误: 期望与默认值 "
                              f"{default!r} 同类, 得到 {v!r}")
     settings = {**SETTINGS_DEFAULTS, **settings_raw}
+    # BTC 财库 mNAV (mnav.py): [mnav.MSTR] 这类表随 settings 走 (键 "mnav"), 不在
+    # SETTINGS_DEFAULTS 白名单里 —— 它不是 [settings] 的键, 是另一张顶层表;
+    # 缺省不设 (整段不出), 设了就在这里按 mnav.validate_config 的规矩炸
+    if "mnav" in raw:
+        settings["mnav"] = mnav.validate_config(raw["mnav"], datetime.now(ET).date())
     tickers = {}
     for sym, tcfg in raw.get("tickers", {}).items():
         unknown = set(tcfg) - set(TICKER_DEFAULTS)
@@ -3254,6 +3260,49 @@ def snapshot_universe(meta, tickers, d: str, workers: int = 2) -> None:
             pass
 
 
+# --------------------------------------------------------------------------
+# BTC 财库 mNAV (mnav.py) — 只做提示, 不进状态机/门控/票据
+# --------------------------------------------------------------------------
+
+def attach_mnav(settings: dict, results, today: date) -> dict | None:
+    """[mnav.*] 配了才跑 -> mnav.run 的 meta (含 cfgs); 没配 = None (整段不出)。
+    标的恰好也在 watchlist 里时, 今天的股价用扫描器自己的收盘 (网站的是延迟的)。
+    整段包在 try 里, 同 attach_insider / attach_revisions: 附加信息自己出 bug 也
+    只能降级成报告里一行 ⚠️。"""
+    cfgs = settings.get("mnav") or {}
+    if not cfgs:
+        return None
+    live = {r["symbol"]: r["tech"]["close"] for r in results
+            if r["symbol"] in cfgs and r.get("tech") and not r.get("stale_data")}
+    try:
+        return mnav.run(cfgs, cache_path=DATA / mnav.CACHE_NAME, today=today,
+                        holidays=NYSE_HOLIDAYS, live_px=live)
+    except Exception as e:      # noqa: BLE001
+        return {"by_symbol": {s_: {"error": f"mNAV 模块异常: {type(e).__name__}: {e}"}
+                              for s_ in cfgs},
+                "cfgs": cfgs, "version": None, "timestamp": None, "warnings": [],
+                "from_cache": False}
+
+
+def mnav_block(meta) -> list[str]:
+    """开盘/尾盘报告的 mNAV 段。meta=None (--no-mnav / 未配置) 整段不出。"""
+    return mnav.report_block(meta)
+
+
+def snapshot_mnav(meta, d: str) -> None:
+    """每天一行 data/mnav_history.csv —— 网站的股本会事后跳变, 留一份"当天看到
+    的"读数; 闸同 iv_history / 修正快照: 只有定时尾盘扫描写。"""
+    if not meta:
+        return
+    try:
+        n = mnav.append_history(mnav.history_rows(meta, d), DATA / mnav.HISTORY_NAME)
+    except Exception as e:      # noqa: BLE001
+        print(f"  mnav: 历史写入失败 ({type(e).__name__}: {e})", file=sys.stderr)
+        return
+    if n:
+        print(f"  mnav: +{n} 行 -> {mnav.HISTORY_NAME}")
+
+
 def zone_invalid_for(cfg: dict, hist, prev_state: dict | None) -> str | None:
     """晚间检查用的 zone 作废判定 —— 与 analyze_ticker 同一口径 (state 里
     的粘性作废 + zone_asof 之后的拆股), 只读不写: 晚间不推进任何状态。"""
@@ -3642,7 +3691,7 @@ def zone_position(close: float, zone) -> str:
 
 
 def render_close(results, regime, ivdf, now_et, insider_meta=None,
-                 revisions_meta=None) -> str:
+                 revisions_meta=None, mnav_meta=None) -> str:
     d = now_et.strftime("%Y-%m-%d")
     lines = [f"# 左右侧 watchlist 扫描 — {d} 尾盘 "
              f"({now_et:%H:%M} ET)", ""]
@@ -3689,6 +3738,7 @@ def render_close(results, regime, ivdf, now_et, insider_meta=None,
         ""]
     lines += insider_block(results, insider_meta)
     lines += revisions_block(results, revisions_meta)
+    lines += mnav_block(mnav_meta)
 
     detail = [r for r in ordered
               if r["state"] in ("CONFIRMED", "TREND", "LEFT_ZONE", "NEAR_ZONE")
@@ -3826,7 +3876,7 @@ def render_close(results, regime, ivdf, now_et, insider_meta=None,
 
 
 def render_open(results, regime, now_et, s: dict, insider_meta=None,
-                revisions_meta=None) -> str:
+                revisions_meta=None, mnav_meta=None) -> str:
     d = now_et.strftime("%Y-%m-%d")
     lines = [f"# 开盘异动 — {d} ({now_et:%H:%M} ET)", ""]
     lines += regime_block(regime)
@@ -3876,6 +3926,10 @@ def render_open(results, regime, now_et, s: dict, insider_meta=None,
     rev = revisions_block(results, revisions_meta)
     if rev:
         lines += [""] + rev[:-1]
+    # mNAV 段同理: 每天都有内容, 单独成节
+    mn = mnav_block(mnav_meta)
+    if mn:
+        lines += [""] + mn[:-1]
     lines += ["", "---",
               "开盘扫描只做提醒 — 右侧确认以收盘为准, 见尾盘报告。数据 ~15min 延迟。"]
     return "\n".join(lines)
@@ -4330,6 +4384,8 @@ def main() -> int:
                     help="skip SEC Form 4 insider-buy fetch")
     ap.add_argument("--no-revisions", action="store_true",
                     help="skip Yahoo analyst EPS-revision fetch")
+    ap.add_argument("--no-mnav", action="store_true",
+                    help="skip StrategyTracker mNAV fetch ([mnav.*] in watchlist.toml)")
     ap.add_argument("--workers", type=int, default=4)
     args = ap.parse_args()
 
@@ -4422,6 +4478,18 @@ def main() -> int:
               f" (Normalized {sum(1 for v in by if v.get('normalized'))}"
               + (f", 退回公开接口 {fallback}" if fallback else "") + ")")
 
+    # BTC 财库 mNAV: 两个模式都出 (开盘看的是前一日收盘的读数), 只在配了 [mnav.*] 时
+    mnav_meta = None
+    if not args.no_mnav:
+        mnav_meta = attach_mnav(settings, results, now_et.date())
+        if mnav_meta is not None:
+            for sym, a in mnav_meta["by_symbol"].items():
+                print(f"  mnav: {sym} "
+                      + (f"取不到 ({a['error']})" if a.get("error") else
+                         f"稀释 {a['m_dil']:.3f} 基本 {a['m_basic']:.3f} "
+                         f"EV {a['m_ev']:.2f} 桶 {a['bucket']}"
+                         + (" (缓存)" if mnav_meta.get("from_cache") else "")))
+
     ivdf = load_iv_history()
     if mode == "close":
         if manual:
@@ -4433,6 +4501,7 @@ def main() -> int:
             # --force/--tickers 不写 (同一天手工跑的会占掉定时那一行)
             if revisions_meta is not None:
                 snapshot_revisions(revisions_meta, d)
+            snapshot_mnav(mnav_meta, d)
             # persist state transitions (close-basis only, per the playbook)
             for r in results:
                 if r["error"] or r["tech"] is None:
@@ -4455,10 +4524,10 @@ def main() -> int:
             if _n:
                 print(f"  journal: +{_n} 条推荐记录 -> {JOURNAL.name}")
         report = render_close(results, regime, ivdf, now_et, insider_meta,
-                              revisions_meta)
+                              revisions_meta, mnav_meta)
     else:
         report = render_open(results, regime, now_et, settings, insider_meta,
-                             revisions_meta)
+                             revisions_meta, mnav_meta)
 
     REPORTS.mkdir(exist_ok=True)
     report_path.write_text(report + "\n", encoding="utf-8")

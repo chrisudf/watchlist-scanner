@@ -149,3 +149,17 @@ notes = "SpaceX Class A (2026-06-12 IPO $135, Nasdaq); 10/16 收 146.03 (10/6 �
 
 # 剔除: TQQQ / SOXL (杠杆 ETF, 按你的要求忽略;
 # 2x ETF 只在剧本"趋势中段"章节里作为工具出现, 不是扫描对象)
+
+# BTC 财库公司 mNAV (mnav.py, 2026-10-17): 只做提示, 不进状态机/门控/票据。
+# 不配这张表整段不出。标的不必在 [tickers] 里 (在的话今天的股价用扫描器自己的收盘)。
+#   debt_b / pref_b / usd_b = 可转债面值 / 优先股清算价值 / USD Reserve+USD Cash ($B),
+#   抄 strategy.com 首页 Debt / Pref / USD Reserve / USD Cash (或每周 8-K), 改数字时同步
+#   claims_asof; 超过 claims_stale_days (默认 45) 天报告提醒。
+#   阈值默认 = 2026-10-17 回测: T1 = min(企业价值 ≤ t1_ev, 稀释 ≤ t1_dil), T2 稀释 ≤ t2_dil,
+#   T3 稀释 ≤ t3_dil (2026 低点 0.63); trap = 历史最坏桶 (不入场); take_profit = 止盈带。
+[mnav.MSTR]
+debt_b = 6.714
+pref_b = 13.748
+usd_b = 5.518
+claims_asof = "2026-10-16"
+notes = "10/16 官网: 市值 57,769M + 债 6,714 + 优先股 13,748 − 美元 5,518 = EV 72,713M, 官网首页 mNAV 1.08x 是 7/23 起的新口径 (股价 ÷ 每股净 BTC), 与此处 EV 口径 1.05 只在 1.0 附近重合; 2026-07/08 公司在稀释 0.65–0.80 ATM 卖股 ~$3.2B 建 USD Reserve"
