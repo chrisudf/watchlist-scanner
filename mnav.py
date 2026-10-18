@@ -685,7 +685,11 @@ def main(argv: list[str]) -> int:
     if not cfgs:
         print("watchlist.toml 没有 [mnav.*] 配置 (或过滤后为空)")
         return 1
-    meta = run(cfgs, cache_path=base / "data" / CACHE_NAME, today=today)
+    # 2026 起的 NYSE 假日表在 scanner 里 (PAST_HOLIDAYS 只到 2025); 不传的话 2026 的 8 个
+    # 休市日被当成交易日 —— 7/3 那行稀释 0.76, "<0.8" 会多数一天 (50 vs 扫描器的 49)
+    from scanner import NYSE_HOLIDAYS
+    meta = run(cfgs, cache_path=base / "data" / CACHE_NAME, today=today,
+               holidays=NYSE_HOLIDAYS)
     print("\n".join(report_block(meta)))
     return 0
 

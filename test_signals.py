@@ -6368,5 +6368,23 @@ class TestMnavMain(unittest.TestCase):
         self.assertFalse(self._hist().exists())
         self.assertNotIn("mNAV", next(self.reports.glob("*-close.md")).read_text(encoding="utf-8"))
 
+
+class TestMnavCli(unittest.TestCase):
+    """python mnav.py 也要拿 scanner 的 2026 假日表 — 漏传时 2026 的 8 个休市日被当成交易日,
+    10/19 实跑 "<0.8" 数成 50 天 (扫描器 / 回测脚本是 49, 多的是 7/3 稀释 0.76 那行)。"""
+
+    def test_cli_passes_nyse_holidays(self):
+        import contextlib
+        seen = {}
+
+        def fake_run(cfgs, **kw):
+            seen.update(kw)
+            return {"by_symbol": {s_: {"error": "x"} for s_ in cfgs}, "cfgs": cfgs,
+                    "warnings": []}
+        with mock_attr(mn, "run", fake_run), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(mn.main([]), 0)
+        self.assertIs(seen["holidays"], sc.NYSE_HOLIDAYS)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
