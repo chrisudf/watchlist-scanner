@@ -6,3 +6,4 @@ __pycache__/
 # (+ eps_revisions_status.json)
 # —— 都是只增不改的本地历史, 每台机器各自一份, 不进版本库
 data/
+# (+ mnav_strategytracker.json 缓存 / mnav_history.csv)

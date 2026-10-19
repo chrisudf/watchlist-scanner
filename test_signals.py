@@ -5773,5 +5773,618 @@ class TestRevisionsMain(unittest.TestCase):
         self.assertNotIn("分析师", self._report(f"{self._today()}-close.md"))
 
 
+
+# ---------------------------------------------------------------------------
+# BTC 财库 mNAV (mnav.py, 2026-10-17) — 只做提示, 不进门控
+# ---------------------------------------------------------------------------
+
+import mnav as mn  # noqa: E402
+
+_MN_TODAY = date(2026, 10, 16)
+
+
+def _mn_cfg(**over):
+    raw = {"debt_b": 6.714, "pref_b": 13.748, "usd_b": 5.518,
+           "claims_asof": "2026-10-16", **over}
+    return mn.validate_config({"MSTR": raw}, _MN_TODAY)["MSTR"]
+
+
+def _st_hist(n=70, start="2026-08-08", px=None, btc=None, holdings=848_250.0,
+             sb=422_198_735.0, sd=451_796_592.0):
+    """StrategyTracker historicalData 的样子: 日历天 (含周末), 两个 mNAV 列由输入算出。
+    默认 70 个日历日止于 _MN_TODAY (2026-10-16), 股价 = 让稀释 mNAV 恒为 0.95 的常数。"""
+    dates = pd.date_range(start, periods=n, freq="D")
+    btc = list(btc) if btc is not None else [80_000.0] * n
+    if px is None:
+        px = [0.95 * holdings * b / sd for b in btc]
+    px = list(px)
+    return {"dates": [d.strftime("%Y-%m-%d") for d in dates],
+            "stock_prices": px, "btc_prices": btc, "btc_balance": [holdings] * n,
+            "total_outstanding_shares": [sb] * n, "diluted_shares_outstanding": [sd] * n,
+            "nav_premium_basic": [p * sb / (holdings * b) for p, b in zip(px, btc)],
+            "nav_premium_diluted": [p * sd / (holdings * b) for p, b in zip(px, btc)]}
+
+
+def _mn_px(m, hist, i=-1):
+    """让稀释 mNAV = m 的股价 (按 hist 第 i 行的持币/股本/BTC)。"""
+    return m * hist["btc_balance"][i] * hist["btc_prices"][i] / hist["diluted_shares_outstanding"][i]
+
+
+class TestMnavConfig(unittest.TestCase):
+    def test_minimal_config_normalizes(self):
+        c = mn.validate_config({"mstr": {"debt_b": 6.7, "pref_b": 13.7, "usd_b": 5.5,
+                                         "claims_asof": date(2026, 10, 16)}}, _MN_TODAY)
+        self.assertEqual(list(c), ["MSTR"])
+        self.assertEqual(c["MSTR"]["st_ticker"], "MSTR")
+        self.assertEqual(c["MSTR"]["claims_asof"], "2026-10-16")
+        self.assertEqual(c["MSTR"]["trap"], [0.8, 0.9])
+        self.assertEqual(c["MSTR"]["t1_ev"], 0.97)
+
+    def test_empty_is_empty(self):
+        self.assertEqual(mn.validate_config(None, _MN_TODAY), {})
+        self.assertEqual(mn.validate_config({}, _MN_TODAY), {})
+
+    def test_rejects_bad_entries(self):
+        bad = [
+            ({"MSTR": {"debt_b": 1, "pref_b": 1, "claims_asof": "2026-10-16", "dept_b": 2}}, "未知键"),
+            ({"MSTR": {"debt_b": 1, "pref_b": 1}}, "claims_asof"),
+            ({"MSTR": {"debt_b": 1, "pref_b": 1, "claims_asof": "2027-01-01"}}, "在未来"),
+            ({"MSTR": {"debt_b": -1, "pref_b": 1, "claims_asof": "2026-10-16"}}, "非负数"),
+            ({"MSTR": {"debt_b": "6.7", "pref_b": 1, "claims_asof": "2026-10-16"}}, "非负数"),
+            ({"MSTR": {"debt_b": 1, "pref_b": 1, "claims_asof": "2026-10-16", "t2_dil": 0.9}}, "顺序"),
+            ({"MSTR": {"debt_b": 1, "pref_b": 1, "claims_asof": "2026-10-16", "trap": [0.9, 0.8]}}, "trap"),
+            ({"MSTR": {"debt_b": 1, "pref_b": 1, "claims_asof": "2026-10-16", "break_lookback": 2.5}}, "正整数"),
+            ({"MSTR": 6.7}, "一张表"),
+            ({"MSTR": {"debt_b": 1, "pref_b": 1, "claims_asof": "2026-10-16"},
+              "mstr": {"debt_b": 1, "pref_b": 1, "claims_asof": "2026-10-16"}}, "重复"),
+        ]
+        for raw, why in bad:
+            with self.assertRaises(ValueError, msg=why) as cm:
+                mn.validate_config(raw, _MN_TODAY)
+            self.assertIn(why, str(cm.exception))
+
+
+class TestMnavMath(unittest.TestCase):
+    H, SB, SD, BTC = 848_250.0, 422_198_735.0, 451_796_592.0, 81_500.0
+
+    def test_bucket_edges(self):
+        self.assertEqual(mn.bucket(0.69), "<0.7")
+        self.assertEqual(mn.bucket(0.7), "0.7-0.8")
+        self.assertEqual(mn.bucket(0.8), "0.8-0.9")
+        self.assertEqual(mn.bucket(0.899), "0.8-0.9")
+        self.assertEqual(mn.bucket(0.95), "0.9-1.0")
+        self.assertEqual(mn.bucket(1.0), "1.0-1.2")
+        self.assertEqual(mn.bucket(5.0), "≥1.2")
+        self.assertEqual(set(mn.BUCKET_NOTE), {lab for _, lab in mn.BUCKET_EDGES})
+
+    def test_round_trips(self):
+        px = 136.83
+        m = mn.mnav(px, self.SD, self.H, self.BTC)
+        self.assertAlmostEqual(mn.price_at(m, self.H, self.SD, self.BTC), px, places=9)
+        claims = 6.714 + 13.748 - 5.518
+        p = mn.parity_price(self.H, self.BTC, claims, self.SB)
+        self.assertAlmostEqual(mn.ev_mnav(p, self.SB, claims, self.H, self.BTC), 1.0, places=9)
+        p97 = mn.parity_price(self.H, self.BTC, claims, self.SB, 0.97)
+        self.assertAlmostEqual(mn.ev_mnav(p97, self.SB, claims, self.H, self.BTC), 0.97, places=9)
+        # 2026-10-16 实测: 平价 $128.3, 稀释 0.894
+        self.assertAlmostEqual(p, 128.3, delta=0.2)
+        self.assertAlmostEqual(m, 0.894, delta=0.001)
+
+    def test_ladder_takes_lower_of_ev_and_diluted(self):
+        cfg = _mn_cfg()
+        claims = cfg["debt_b"] + cfg["pref_b"] - cfg["usd_b"]
+        lad = mn.ladder(self.H, self.SB, self.SD, self.BTC, claims, cfg)
+        for i in range(3):
+            self.assertAlmostEqual(lad["t1"][i], min(lad["t1_ev_px"][i], lad["t1_dil_px"][i]))
+            self.assertEqual(lad["t1_bind"][i], "EV" if lad["t1_ev_px"][i] <= lad["t1_dil_px"][i] else "稀释")
+        # 今天稀释线更低 ($122 vs EV 0.97 $123); BTC 跌 20% 后 EV 线更低 (净债权是固定美元)
+        self.assertEqual(lad["t1_bind"][0], "稀释")
+        self.assertEqual(lad["t1_bind"][2], "EV")
+        self.assertAlmostEqual(lad["t1"][0], 122.4, delta=0.3)
+        self.assertTrue(lad["t1"][0] > lad["t1"][1] > lad["t1"][2])
+        self.assertTrue(lad["t1"][0] > lad["t2"][0] > lad["t3"][0])
+
+    def test_episodes_merge_small_gaps(self):
+        idx = pd.bdate_range("2026-01-05", periods=30)
+        vals = [False] * 30
+        for i in (3, 4, 5, 9, 10, 20):       # 3-5 与 9-10 隔 3 个交易日 → 同一段; 20 单独
+            vals[i] = True
+        runs = mn.episodes(pd.Series(vals, index=idx))
+        self.assertEqual([(n) for _, _, n in runs], [5, 1])
+        self.assertEqual(runs[0][0], idx[3].date())
+        self.assertEqual(runs[0][1], idx[10].date())
+        self.assertEqual(mn.episodes(pd.Series([False] * 5, index=idx[:5])), [])
+
+    def test_threshold_stats(self):
+        idx = pd.bdate_range("2026-01-05", periods=10)
+        s = pd.Series([1.1, 0.95, 0.85, 0.75, 0.65, 0.55, 0.85, 0.95, 1.05, 0.79], index=idx)
+        st = mn.threshold_stats(s)
+        self.assertEqual((st[0.8]["days"], st[0.8]["episodes"]), (4, 1))   # 3-5 与 9 隔 3 行 → 同段
+        self.assertEqual((st[0.6]["days"], st[0.6]["episodes"]), (1, 1))
+        self.assertEqual(st[1.0]["days"], 8)
+
+    def test_first_break_and_recross(self):
+        idx = pd.bdate_range("2026-01-05", periods=30)
+        s = pd.Series([0.95] * 29 + [0.88], index=idx)
+        self.assertTrue(mn.first_break_below(s, 0.9, 20))
+        self.assertFalse(mn.first_break_below(s, 0.8, 20))
+        s2 = s.copy(); s2.iloc[-5] = 0.89                # 5 天前已经破过 → 不是首次
+        self.assertFalse(mn.first_break_below(s2, 0.9, 20))
+        self.assertFalse(mn.first_break_below(s.iloc[-10:], 0.9, 20))   # 样本不足
+        r = pd.Series([0.95] * 20 + [0.78] * 5 + [0.81], index=idx[:26])
+        self.assertTrue(mn.recross_above(r, 0.8, 5))
+        self.assertFalse(mn.recross_above(r, 0.9, 5))
+        r2 = pd.Series([0.95] * 20 + [0.78] * 4 + [0.81, 0.82], index=idx[:26])
+        self.assertFalse(mn.recross_above(r2, 0.8, 5))   # 前一天已经在上方
+
+    def test_btc_trend_and_dilution(self):
+        s = pd.Series(np.linspace(70_000, 80_000, 60))
+        tr = mn.btc_trend(s)
+        self.assertTrue(tr["above20"] and tr["above50"])
+        self.assertAlmostEqual(tr["px"], 80_000)
+        self.assertIsNone(mn.btc_trend(s.iloc[-10:])["sma20"])
+        h = _st_hist(n=80)
+        h["diluted_shares_outstanding"] = [400e6] * 70 + [440e6] * 10
+        df = mn.trading_rows(mn.frame(h))
+        self.assertAlmostEqual(mn.dilution_pct(df, 20), (400 / 440 - 1) * 100, places=6)
+        self.assertIsNone(mn.dilution_pct(df, 500))
+        self.assertEqual(mn.last_change_date(mn.frame(h).diluted_shares_outstanding),
+                         pd.Timestamp(h["dates"][70]).date())
+
+
+class TestMnavFrame(unittest.TestCase):
+    def test_frame_drops_pre_adoption_and_bad_rows(self):
+        h = _st_hist(n=10)
+        h["btc_balance"][0] = 0.0
+        h["total_outstanding_shares"][1] = None
+        df = mn.frame(h)
+        self.assertEqual(len(df), 8)
+        self.assertEqual(df.index[0], pd.Timestamp(h["dates"][2]))
+        h2 = _st_hist(n=10); h2["btc_prices"] = h2["btc_prices"][:-1]
+        with self.assertRaises(ValueError):
+            mn.frame(h2)
+
+    def test_trading_rows_drop_weekends_and_holidays(self):
+        h = _st_hist(n=14, start="2026-09-01")      # 周二起两周, 含 9/7 劳动节
+        df = mn.frame(h)
+        td = mn.trading_rows(df, sc.NYSE_HOLIDAYS)
+        self.assertEqual(len(td), 9)
+        self.assertNotIn(pd.Timestamp("2026-09-07"), td.index)
+        self.assertTrue(all(d.weekday() < 5 for d in td.index))
+
+
+class TestMnavPastHolidays(unittest.TestCase):
+    def test_past_holidays_are_weekdays_before_scanner_table(self):
+        self.assertTrue(all(d.weekday() < 5 for d in mn.PAST_HOLIDAYS))
+        self.assertTrue(all(d < min(sc.NYSE_HOLIDAYS) for d in mn.PAST_HOLIDAYS))
+        self.assertIn(date(2025, 1, 9), mn.PAST_HOLIDAYS)        # Carter 国丧日
+        h = _st_hist(n=14, start="2025-01-06")
+        td = mn.trading_rows(mn.frame(h))                        # 不传 2026 表也剔 2025 的
+        self.assertNotIn(pd.Timestamp("2025-01-09"), td.index)
+        self.assertEqual(len(td), 9)                             # 10 个工作日 − 1/9
+
+
+class _FakeST:
+    """data.strategytracker.com 的两个文件: latest.json 与全量文件。"""
+
+    def __init__(self, hist, version="20261016T200000Z", extra_company=True):
+        self.version, self.calls = version, []
+        full = {"timestamp": "2026-10-16T20:00:00+00:00",
+                "companies": {"MSTR": {"historicalData": {**hist, "use_ev": [False] * len(hist["dates"])},
+                                       "processedMetrics": {"stockPriceDate": hist["dates"][-1],
+                                                            "companyName": "Strategy", "junk": 1}}}}
+        if extra_company:
+            full["companies"]["3350.T"] = {"historicalData": hist}
+        self.full = json.dumps(full).encode()
+
+    def __call__(self, url):
+        self.calls.append(url)
+        if url.endswith("latest.json"):
+            return json.dumps({"version": self.version,
+                               "files": {"full": f"all.v{self.version}.json"}}).encode()
+        return self.full
+
+
+class TestMnavFetch(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cache = Path(self.tmp.name) / "data" / mn.CACHE_NAME
+        self.hist = _st_hist(n=30)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_cache_by_version_and_subset_only(self):
+        st = _FakeST(self.hist)
+        d1 = mn.fetch_companies(["MSTR"], self.cache, get=st)
+        self.assertFalse(d1["from_cache"])
+        self.assertEqual(len(st.calls), 2)
+        cached = json.loads(self.cache.read_text(encoding="utf-8"))
+        self.assertEqual(list(cached["companies"]), ["MSTR"])          # 别的公司不存
+        self.assertEqual(set(cached["companies"]["MSTR"]["historicalData"]), set(mn.HIST_COLS))
+        self.assertNotIn("junk", cached["companies"]["MSTR"])
+        d2 = mn.fetch_companies(["MSTR"], self.cache, get=st)
+        self.assertTrue(d2["from_cache"])
+        self.assertEqual(len(st.calls), 3)                              # 只多了 latest.json
+        st.version = "20261017T060000Z"
+        d3 = mn.fetch_companies(["MSTR"], self.cache, get=st)
+        self.assertFalse(d3["from_cache"])
+        self.assertEqual(d3["version"], st.version)
+
+    def test_failure_falls_back_to_cache_with_warning(self):
+        mn.fetch_companies(["MSTR"], self.cache, get=_FakeST(self.hist))
+
+        def boom(url):
+            raise OSError("timed out")
+        d = mn.fetch_companies(["MSTR"], self.cache, get=boom)
+        self.assertTrue(d["from_cache"])
+        self.assertEqual(len(d["warnings"]), 1)
+        self.assertIn("timed out", d["warnings"][0])
+        self.assertIn("缓存", d["warnings"][0])
+
+    def test_failure_without_cache_raises(self):
+        def boom(url):
+            raise OSError("timed out")
+        with self.assertRaises(RuntimeError):
+            mn.fetch_companies(["MSTR"], self.cache, get=boom)
+        # 网站没有这家公司也算取数失败 (不能静默少一家)
+        with self.assertRaises(RuntimeError) as cm:
+            mn.fetch_companies(["MSTR", "NOPE"], self.cache, get=_FakeST(self.hist))
+        self.assertIn("NOPE", str(cm.exception))
+
+
+class TestMnavAssess(unittest.TestCase):
+    def _assess(self, hist, today=None, **kw):
+        return mn.assess(mn.frame(hist), kw.pop("cfg", _mn_cfg()), today=today or _MN_TODAY,
+                         holidays=sc.NYSE_HOLIDAYS, **kw)
+
+    def test_first_break_of_trap_today(self):
+        h = _st_hist()                                   # 0.95 一路
+        a = self._assess(h, live_px=_mn_px(0.88, h))
+        self.assertAlmostEqual(a["m_dil"], 0.88, places=6)
+        self.assertEqual(a["px_src"], "live")
+        self.assertEqual(a["bucket"], "0.8-0.9")
+        self.assertTrue(a["flags"]["trap"])
+        self.assertTrue(a["flags"]["break_trap"])
+        self.assertFalse(a["flags"]["break_t1"])
+        self.assertIsNone(a["flags"]["tier"])
+        self.assertEqual(a["asof"], h["dates"][-1])
+        self.assertAlmostEqual(a["claims_pct"], 14.944e9 / (848_250 * 80_000) * 100, places=3)
+        self.assertEqual(a["warnings"], [])
+
+    def test_break_is_not_first_when_already_below(self):
+        h = _st_hist()
+        px = list(h["stock_prices"])
+        px[-6:] = [_mn_px(0.88, h)] * 6                     # 上周就破了
+        a = self._assess(_st_hist(px=px))
+        self.assertTrue(a["flags"]["trap"])
+        self.assertFalse(a["flags"]["break_trap"])
+
+    def test_tiers_and_take_profit_and_recross(self):
+        h = _st_hist()
+        a = self._assess(h, live_px=_mn_px(0.69, h))
+        self.assertEqual(a["flags"]["tier"], "T2")
+        self.assertTrue(a["flags"]["break_t1"])            # 直接从 0.95 跌到 0.69: 也是首次破 0.8
+        a = self._assess(h, live_px=_mn_px(0.62, h))
+        self.assertEqual(a["flags"]["tier"], "T3")
+        # 止盈提醒要有"近期到过 T1 线"的前提: 一直 0.95 的历史里涨到 0.92 不提醒 (溢价年份天天提醒没意义)
+        a = self._assess(h, live_px=_mn_px(0.92, h))
+        self.assertFalse(a["flags"]["take_profit"])
+        self.assertIsNone(a["flags"]["tier"])
+        dip = list(h["stock_prices"])
+        dip[-30:-25] = [_mn_px(0.75, h)] * 5                # 一个月前到过 0.75
+        hd = _st_hist(px=dip)
+        self.assertTrue(self._assess(hd, live_px=_mn_px(0.92, hd))["flags"]["take_profit"])
+        self.assertTrue(self._assess(hd, live_px=_mn_px(0.97, hd))["flags"]["take_profit"])  # 跳过带也提醒
+        self.assertFalse(self._assess(hd, live_px=_mn_px(0.85, hd))["flags"]["take_profit"])
+        h120 = _st_hist(n=120, start="2026-06-19")          # 120 个日历日 ≈ 85 个交易日, 仍止于 10/16
+        old = list(h120["stock_prices"])
+        old[:5] = [_mn_px(0.75, h120)] * 5                  # 四个月前到过 (>60 个交易日) → 不提醒
+        ho = _st_hist(n=120, start="2026-06-19", px=old)
+        self.assertFalse(self._assess(ho, live_px=_mn_px(0.92, ho))["flags"]["take_profit"])
+        px = list(h["stock_prices"])
+        px[-8:] = [_mn_px(0.75, h)] * 8                     # 含周末共 8 个日历日 ≥5 个交易日在 0.8 下
+        h2 = _st_hist(px=px)
+        a = self._assess(h2, live_px=_mn_px(0.81, h2))
+        self.assertTrue(a["flags"]["recross_t1"])
+        self.assertFalse(a["flags"]["break_t1"])
+
+    def test_weekend_dips_do_not_count(self):
+        # 只有周末行 (股价沿用周五、BTC 周末涨) 低于 0.8 → 交易日统计里一天都没有
+        h = _st_hist(n=26, start="2026-09-14")       # 止于周五 10/9
+        btc = list(h["btc_prices"])
+        for i, d in enumerate(pd.to_datetime(h["dates"])):
+            if d.weekday() >= 5:
+                btc[i] = 80_000 * 0.95 / 0.75              # 周末 BTC 大涨 → 网站 mNAV 0.75
+        h = _st_hist(n=26, start="2026-09-14", px=h["stock_prices"], btc=btc)
+        a = self._assess(h, today=date(2026, 10, 9))
+        self.assertEqual(a["stats"][0.8]["days"], 0)
+        self.assertAlmostEqual(mn.frame(h).nav_premium_diluted.min(), 0.75, places=9)
+
+    def test_staleness_warnings(self):
+        h = _st_hist()
+        a = self._assess(h, cfg=_mn_cfg(claims_asof="2026-08-01"))
+        self.assertEqual(len(a["warnings"]), 1)
+        self.assertIn("76 天没更新", a["warnings"][0])
+        a = self._assess(h, today=date(2026, 10, 23))      # 网站落后 7 天
+        self.assertTrue(any("落后 7 天" in w for w in a["warnings"]))
+
+    def test_run_wraps_fetch_and_per_symbol_errors(self):
+        tmp = tempfile.TemporaryDirectory()
+        cache = Path(tmp.name) / mn.CACHE_NAME
+        cfgs = {"MSTR": _mn_cfg(), "MTPLF": _mn_cfg(st_ticker="3350.T")}
+        meta = mn.run(cfgs, cache_path=cache, today=_MN_TODAY, get=_FakeST(_st_hist()))
+        self.assertEqual(meta["cfgs"], cfgs)
+        self.assertNotIn("error", meta["by_symbol"]["MSTR"])
+        self.assertNotIn("error", meta["by_symbol"]["MTPLF"])
+        self.assertEqual(meta["by_symbol"]["MSTR"]["st_version"], "20261016T200000Z")
+
+        def boom(url):
+            raise OSError("timed out")
+        cache.unlink()
+        meta = mn.run(cfgs, cache_path=cache, today=_MN_TODAY, get=boom)
+        self.assertIn("无缓存", meta["by_symbol"]["MSTR"]["error"])
+        self.assertIn("无缓存", meta["by_symbol"]["MTPLF"]["error"])
+        tmp.cleanup()
+
+
+class TestMnavReport(unittest.TestCase):
+    def _meta(self, m=0.88, dip=False, **cfg_over):
+        h = _st_hist()
+        if dip:                                              # 一个月前到过 0.75 (止盈提醒的前提)
+            px = list(h["stock_prices"]); px[-30:-25] = [_mn_px(0.75, h)] * 5
+            h = _st_hist(px=px)
+        cfg = _mn_cfg(**cfg_over)
+        a = mn.assess(mn.frame(h), cfg, today=_MN_TODAY, live_px=_mn_px(m, h))
+        a["st_version"] = "v1"
+        return {"by_symbol": {"MSTR": a}, "cfgs": {"MSTR": cfg}, "version": "v1",
+                "timestamp": "2026-10-16T20:00:00+00:00", "warnings": [], "from_cache": False}
+
+    def test_none_renders_nothing(self):
+        self.assertEqual(mn.report_block(None), [])
+        self.assertEqual(mn.report_block({"by_symbol": {}, "cfgs": {}}), [])
+
+    def test_block_contents(self):
+        text = "\n".join(mn.report_block(self._meta()))
+        self.assertIn("## BTC 财库 mNAV (StrategyTracker)", text)
+        self.assertIn("稀释 mNAV **0.880**", text)
+        self.assertIn("历史最坏的桶, 不入场", text)
+        self.assertIn("⚠️ 今天首次收盘跌破 0.9", text)
+        self.assertIn("T1 $", text)
+        self.assertIn("止盈 0.9–0.95", text)
+        self.assertIn("数据 StrategyTracker 2026-10-16T20:00Z", text)
+        self.assertNotIn("(缓存)", text)
+        self.assertNotIn("右侧", text)
+
+    def test_block_flags_and_warnings(self):
+        meta = self._meta(0.69, claims_asof="2026-08-01")
+        meta["warnings"] = ["StrategyTracker 取数失败 (OSError: timed out), 用的是 x 的缓存"]
+        meta["from_cache"] = True
+        text = "\n".join(mn.report_block(meta))
+        self.assertIn("🟢 现价已在 T2 档内", text)
+        text97 = "\n".join(mn.report_block(self._meta(0.97, dip=True)))
+        self.assertIn("🔔 已高于止盈带上沿 0.95", text97)
+        self.assertIn("🔔 在止盈带 0.9–0.95 内", "\n".join(mn.report_block(self._meta(0.92, dip=True))))
+        self.assertNotIn("🔔", "\n".join(mn.report_block(self._meta(0.92))))
+        self.assertIn("天没更新", text)
+        self.assertIn("取数失败", text)
+        self.assertIn("(缓存)", text)
+        meta = self._meta()
+        meta["by_symbol"]["MSTR"] = {"error": "RuntimeError: x"}
+        text = "\n".join(mn.report_block(meta))
+        self.assertIn("⚠️ **MSTR** mNAV 取不到: RuntimeError: x", text)
+
+    def test_history_rows_and_append(self):
+        meta = self._meta()
+        rows = mn.history_rows(meta, "2026-10-16")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["flags"], "trap,break_trap")
+        self.assertEqual(rows[0]["px_src"], "live")
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "data" / mn.HISTORY_NAME
+            self.assertEqual(mn.append_history(rows, p), 1)
+            self.assertEqual(mn.append_history(rows, p), 0)         # 同一天不重复
+            rows2 = mn.history_rows(meta, "2026-10-19")
+            self.assertEqual(mn.append_history(rows2, p), 1)
+            with p.open(newline="", encoding="utf-8") as f:
+                got = list(__import__("csv").DictReader(f))
+            self.assertEqual([r["date"] for r in got], ["2026-10-16", "2026-10-19"])
+            self.assertEqual(list(got[0]), list(mn.HISTORY_FIELDS))
+            # 表头变了 (旧文件少列) → 重写, 旧行保留
+            p.write_text("date,symbol,px\n2026-10-01,MSTR,100\n", encoding="utf-8")
+            self.assertEqual(mn.append_history(rows, p), 1)
+            with p.open(newline="", encoding="utf-8") as f:
+                got = list(__import__("csv").DictReader(f))
+            self.assertEqual([r["date"] for r in got], ["2026-10-01", "2026-10-16"])
+            self.assertEqual(got[0]["m_dil"], "")
+
+
+class TestMnavScanner(unittest.TestCase):
+    """接线: [mnav.*] 随 settings 走; attach 降级; 两份报告都有这一段; --no-mnav;
+    历史只在定时尾盘扫描写。"""
+
+    TOML = ("[tickers.QQQ]\nkind = \"index\"\n"
+            "[mnav.MSTR]\ndebt_b = 6.714\npref_b = 13.748\nusd_b = 5.518\n"
+            "claims_asof = \"2026-10-16\"\n")
+
+    def _load(self, text):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "watchlist.toml"
+            p.write_text(text, encoding="utf-8")
+            return sc.load_config(p)
+
+    def test_load_config_accepts_mnav_table(self):
+        s, t = self._load(self.TOML)
+        self.assertEqual(list(s["mnav"]), ["MSTR"])
+        self.assertEqual(s["mnav"]["MSTR"]["st_ticker"], "MSTR")
+        s, t = self._load("[tickers.QQQ]\nkind = \"index\"\n")
+        self.assertNotIn("mnav", s)
+        with self.assertRaises(ValueError) as cm:
+            self._load("[mnav.MSTR]\ndebt_b = 1\npref_b = 1\n[tickers.QQQ]\n")
+        self.assertIn("claims_asof", str(cm.exception))
+        with self.assertRaises(ValueError) as cm:
+            self._load("[mnavs.MSTR]\ndebt_b = 1\n[tickers.QQQ]\n")
+        self.assertIn("[mnav.*]", str(cm.exception))
+
+    def test_repo_config_has_mstr(self):
+        s, _ = sc.load_config()
+        self.assertIn("MSTR", s.get("mnav", {}))
+
+    def _results(self):
+        mk = TestRenderOpenZoneAlert._r
+        rs = [mk(TestRenderOpenZoneAlert(), s_, 18.0, None) for s_ in ("SOFI", "QQQ")]
+        rs.append(mk(TestRenderOpenZoneAlert(), "MSTR", 120.0, None))
+        return rs
+
+    def test_attach_passes_live_close_and_degrades(self):
+        self.assertIsNone(sc.attach_mnav(dict(sc.SETTINGS_DEFAULTS), self._results(), _MN_TODAY))
+        settings = {**sc.SETTINGS_DEFAULTS, "mnav": {"MSTR": _mn_cfg()}}
+        seen = {}
+
+        def fake_run(cfgs, **kw):
+            seen.update(kw)
+            return {"by_symbol": {"MSTR": {"error": "x"}}, "cfgs": cfgs, "warnings": []}
+        with mock_attr(sc.mnav, "run", fake_run):
+            meta = sc.attach_mnav(settings, self._results(), _MN_TODAY)
+        self.assertEqual(seen["live_px"], {"MSTR": 120.0})
+        self.assertEqual(seen["today"], _MN_TODAY)
+        self.assertIs(seen["holidays"], sc.NYSE_HOLIDAYS)
+        self.assertEqual(seen["cache_path"].name, mn.CACHE_NAME)
+        self.assertEqual(meta["cfgs"], settings["mnav"])
+        rs = self._results()
+        rs[2]["stale_data"] = "x"                           # 陈旧日线不当 live 价
+        with mock_attr(sc.mnav, "run", fake_run):
+            sc.attach_mnav(settings, rs, _MN_TODAY)
+        self.assertEqual(seen["live_px"], {})
+
+        def boom(*a, **k):
+            raise KeyError("companies")
+        with mock_attr(sc.mnav, "run", boom):
+            meta = sc.attach_mnav(settings, self._results(), _MN_TODAY)
+        self.assertIn("mNAV 模块异常", meta["by_symbol"]["MSTR"]["error"])
+        text = "\n".join(sc.mnav_block(meta))
+        self.assertIn("mNAV 取不到", text)
+
+    def test_render_both_reports(self):
+        h = _st_hist()
+        cfg = _mn_cfg()
+        a = mn.assess(mn.frame(h), cfg, today=_MN_TODAY, live_px=_mn_px(0.75, h))
+        meta = {"by_symbol": {"MSTR": a}, "cfgs": {"MSTR": cfg}, "warnings": [],
+                "timestamp": "2026-10-16T20:00:00+00:00", "from_cache": False}
+        rs = self._results()[:2]
+        now = datetime(2026, 10, 16, 9, 45, tzinfo=sc.ET)
+        text = sc.render_open(rs, dict(TestRenderOpenZoneAlert.REGIME), now,
+                              sc.SETTINGS_DEFAULTS, None, None, meta)
+        self.assertIn("## BTC 财库 mNAV", text)
+        self.assertIn("无异动", text)                        # 不进异动列表
+        self.assertLess(text.index("## BTC 财库 mNAV"), text.index("\n---"))
+        text = sc.render_open(rs, dict(TestRenderOpenZoneAlert.REGIME), now, sc.SETTINGS_DEFAULTS)
+        self.assertNotIn("mNAV", text)
+        for r in rs:
+            r.update({"tech": None, "state": "NO_DATA", "csp": None, "leap": None,
+                      "iv30": None, "spread": None, "ladder": None, "error": None})
+        now = datetime(2026, 10, 16, 15, 45, tzinfo=sc.ET)
+        text = sc.render_close(rs, dict(TestRenderOpenZoneAlert.REGIME), pd.DataFrame(), now,
+                               None, None, meta)
+        self.assertIn("## BTC 财库 mNAV", text)
+        self.assertIn("🟢 现价已在 T1 档内", text)
+        text = sc.render_close(rs, dict(TestRenderOpenZoneAlert.REGIME), pd.DataFrame(), now)
+        self.assertNotIn("mNAV", text)
+
+
+class TestMnavMain(unittest.TestCase):
+    """main(): --no-mnav 不拉不出; 历史只有定时尾盘扫描写 (--force 不写, 开盘不写)。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.reports, self.data = root / "reports", root / "data"
+        self.calls = []
+        h = _st_hist()
+        cfg = _mn_cfg()
+        a = mn.assess(mn.frame(h), cfg, today=_MN_TODAY, live_px=_mn_px(0.88, h))
+        a["st_version"] = "v1"
+        self.meta = {"by_symbol": {"MSTR": a}, "cfgs": {"MSTR": cfg}, "warnings": [],
+                     "timestamp": "2026-10-16T20:00:00+00:00", "from_cache": False, "version": "v1"}
+
+        def fake_run(cfgs, **kw):
+            self.calls.append(kw)
+            return dict(self.meta)
+        settings = {**sc.SETTINGS_DEFAULTS, "mnav": {"MSTR": cfg}}
+        tickers = {"QQQ": {**sc.TICKER_DEFAULTS, "kind": "index"}}
+        self.patches = [
+            mock_attr(sc, "REPORTS", self.reports), mock_attr(sc, "DATA", self.data),
+            mock_attr(sc, "IV_HISTORY", self.data / "iv_history.csv"),
+            mock_attr(sc, "load_config", lambda: (dict(settings), dict(tickers))),
+            mock_attr(sc, "fetch_regime", lambda s: dict(TestRenderOpenZoneAlert.REGIME)),
+            mock_attr(sc, "batch_history", lambda syms: {s_: None for s_ in syms}),
+            mock_attr(sc, "market_is_live", lambda: True),
+            mock_attr(sc, "next_earnings", lambda tk: None),
+            mock_attr(sc, "load_state", lambda: {}),
+            mock_attr(sc, "save_state", lambda st: None),
+            mock_attr(sc, "append_journal", lambda rows, path=None: 0),
+            mock_attr(sc.mnav, "run", fake_run)]
+        for p_ in self.patches:
+            p_.__enter__()
+
+    def tearDown(self):
+        for p_ in reversed(self.patches):
+            p_.__exit__()
+        self.tmp.cleanup()
+
+    def _main(self, *argv):
+        import contextlib
+        with mock_attr(sys, "argv", ["scanner.py", "--no-insider", "--no-options",
+                                     "--no-revisions", *argv]), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            return sc.main()
+
+    def _hist(self):
+        return self.data / mn.HISTORY_NAME
+
+    def test_scheduled_close_writes_history_and_block(self):
+        self.assertEqual(self._main("--mode", "close"), 0)
+        self.assertEqual(len(self.calls), 1)
+        self.assertTrue(self._hist().exists())
+        self.assertEqual(self._hist().read_text(encoding="utf-8").count("\n"), 2)
+        md = next(self.reports.glob("*-close.md")).read_text(encoding="utf-8")
+        self.assertIn("## BTC 财库 mNAV", md)
+        self.assertIn("稀释 mNAV **0.880**", md)
+
+    def test_force_and_open_do_not_write_history(self):
+        self.assertEqual(self._main("--mode", "close", "--force"), 0)
+        self.assertFalse(self._hist().exists())
+        self.assertIn("## BTC 财库 mNAV",
+                      next(self.reports.glob("*-close-manual.md")).read_text(encoding="utf-8"))
+        self.assertEqual(self._main("--mode", "open"), 0)
+        self.assertFalse(self._hist().exists())
+        self.assertIn("## BTC 财库 mNAV",
+                      next(self.reports.glob("*-open.md")).read_text(encoding="utf-8"))
+
+    def test_no_mnav_flag(self):
+        self.assertEqual(self._main("--mode", "close", "--no-mnav"), 0)
+        self.assertEqual(self.calls, [])
+        self.assertFalse(self._hist().exists())
+        self.assertNotIn("mNAV", next(self.reports.glob("*-close.md")).read_text(encoding="utf-8"))
+
+
+class TestMnavCli(unittest.TestCase):
+    """python mnav.py 也要拿 scanner 的 2026 假日表 — 漏传时 2026 的 8 个休市日被当成交易日,
+    10/19 实跑 "<0.8" 数成 50 天 (扫描器 / 回测脚本是 49, 多的是 7/3 稀释 0.76 那行)。"""
+
+    def test_cli_passes_nyse_holidays(self):
+        import contextlib
+        seen = {}
+
+        def fake_run(cfgs, **kw):
+            seen.update(kw)
+            return {"by_symbol": {s_: {"error": "x"} for s_ in cfgs}, "cfgs": cfgs,
+                    "warnings": []}
+        with mock_attr(mn, "run", fake_run), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(mn.main([]), 0)
+        self.assertIs(seen["holidays"], sc.NYSE_HOLIDAYS)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
