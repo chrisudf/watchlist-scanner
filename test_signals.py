@@ -6487,6 +6487,14 @@ class TestShortsideParse(unittest.TestCase):
         prev0 = ss.parse_finra([_finra_rec("NEW", "2026-10-15", 500, 0, 0.5)])
         self.assertIsNone(prev0["NEW"]["chg"])
 
+    def test_finra_dtc_floor_is_recomputed(self):
+        # 10/28 实测: DRAM 1,636 万 ÷ 日均 3,261 万 = 0.50 天, FINRA 写 1.00
+        rec = {**_finra_rec("DRAM", "2026-10-15", 16_360_000, 12_470_000, 1.0),
+               "averageDailyVolumeQuantity": 32_610_000}
+        self.assertAlmostEqual(ss.parse_finra([rec])["DRAM"]["dtc"], 0.5017, places=3)
+        no_adv = _finra_rec("DRAM", "2026-10-15", 16_360_000, 12_470_000, 1.0)
+        self.assertEqual(ss.parse_finra([no_adv])["DRAM"]["dtc"], 1.0)   # 没有日均量才退回
+
     def test_shares_cn(self):
         self.assertEqual(ss.shares_cn(150_000), "15万")
         self.assertEqual(ss.shares_cn(2_800_000), "280万")
@@ -6575,11 +6583,18 @@ class TestShortsideBlock(unittest.TestCase):
         lines = self._block(_ss_meta())
         self.assertEqual(lines[0], "## 空头面 (FINRA 空头股数 / IBKR 借券费)")
         self.assertIn("- 回补天数 (FINRA 10-15 结算, 括号内较上期): "
-                      "SOFI 4.8 (+2%) · QQQ 2.4 (+16%) · COHR 1.2 (-18%)", lines)
+                      "SOFI 4.8 (+2%) · COHR 1.2 (-18%)", lines)
+        self.assertIn("- ETF/指数: QQQ 2.4 (+16%) —— 含申赎和对冲盘, 一期变动比个股大得多",
+                      lines)
         self.assertIn("- 借券费 (IBKR 10-28 01:18 ET): 0.28–0.33%, 都是普通券; "
                       "可借最少 330万股 (COHR)", lines)
         self.assertFalse([l for l in lines if "⚠️" in l and l.startswith("-")])
         self.assertIn("IBKR 借券文件里没有: QQQ (多半借不到)", "\n".join(lines))
+
+    def test_funds_only_line_carries_the_date(self):
+        lines = self._block(_ss_meta(symbols=("QQQ",)))
+        self.assertIn("- 回补天数 · ETF/指数 (FINRA 10-15 结算, 括号内较上期): QQQ 2.4 (+16%)"
+                      " —— 含申赎和对冲盘, 一期变动比个股大得多", lines)
 
     def test_fee_range_collapses_after_rounding(self):
         # 10/28 冒烟: QQQ 0.3285 / SOFI 0.3325 印成了 "0.33–0.33%"
@@ -6749,7 +6764,8 @@ class TestShortsideMain(unittest.TestCase):
         self.assertEqual(self.asked, [["SOFI", "QQQ"]])     # ETF/指数也查 (只是不出旗标)
         text = self._report(f"{self._today()}-close.md")
         self.assertIn("## 空头面", text)
-        self.assertIn("SOFI 4.8 (+2%) · QQQ 2.4 (+16%)", text)
+        self.assertIn("SOFI 4.8 (+2%)", text)
+        self.assertIn("- ETF/指数: QQQ 2.4 (+16%)", text)
         rows = self._snap().read_text(encoding="utf-8").splitlines()[1:]
         self.assertEqual([r_.split(",")[:2] for r_ in rows], [[self._today(), "SOFI"]])
 

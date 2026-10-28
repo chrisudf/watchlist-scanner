@@ -156,16 +156,21 @@ def fetch_finra(symbols: list[str], today: date, timeout: float,
 def parse_finra(records: list[dict]) -> dict[str, dict]:
     """FINRA 记录 -> {SYM: 最新一期 {"date", "si", "prev", "chg", "dtc", "split"}}。
     chg (%) 用两期股数自己算; 上期为 0 或带拆股标记时 = None (拆股前后的股数
-    不可比, 变化率没有意义)。"""
+    不可比, 变化率没有意义)。dtc 也自己算 (空头股数 ÷ 日均成交量): FINRA 的
+    daysToCoverQuantity 最低只写 1.00 —— 10/28 实测 DRAM 1,636 万 ÷ 3,261 万 = 0.50
+    也写成 1.00 (上市以来 13 期全是 1.00), GLD 过去一年 25 期里 8 期是。没有日均量
+    时才退回 FINRA 的值。"""
     latest = {}
     for r in records:
         sym, d = r.get("symbolCode"), r.get("settlementDate")
         if not sym or not d or (sym in latest and latest[sym]["date"] >= d):
             continue
         si, prev = r.get("currentShortPositionQuantity"), r.get("previousShortPositionQuantity")
+        adv = r.get("averageDailyVolumeQuantity")
         split = bool(r.get("stockSplitFlag"))
         latest[sym] = {"date": d, "si": si, "prev": prev, "split": split,
-                       "dtc": r.get("daysToCoverQuantity"),
+                       "dtc": (si / adv if si is not None and adv
+                               else r.get("daysToCoverQuantity")),
                        "chg": ((si / prev - 1) * 100
                                if si is not None and prev and not split else None)}
     return latest
@@ -282,8 +287,18 @@ def report_block(items: list[tuple[str, str, dict | None]], meta: dict, s: dict,
     if si_items:
         si_items.sort(key=lambda x: -(x[2].get("dtc") or 0.0))
         d = meta.get("si_date")
-        lines.append(f"- 回补天数 (FINRA {d[5:] if d else '?'} 结算, 括号内较上期): "
-                     + " · ".join(_si_part(sym, v) for sym, _, v in si_items))
+        when = f"FINRA {d[5:] if d else '?'} 结算, 括号内较上期"
+        # ETF/指数单列一行: 它们的空头一期变动比个股大得多 (过去一年单期变动中位数
+        # GLD 12%、DRAM 38%, SOFI 4%), 混在一起排, 一眼看去 GLD +72% 最扎眼, 其实是常态
+        stocks = [x for x in si_items if x[1] == "stock"]
+        funds = [x for x in si_items if x[1] != "stock"]
+        if stocks:
+            lines.append(f"- 回补天数 ({when}): "
+                         + " · ".join(_si_part(sym, v) for sym, _, v in stocks))
+        if funds:
+            lead = "ETF/指数" if stocks else f"回补天数 · ETF/指数 ({when})"
+            lines.append(f"- {lead}: " + " · ".join(_si_part(sym, v) for sym, _, v in funds)
+                         + " —— 含申赎和对冲盘, 一期变动比个股大得多")
         if _stale(d, today, SI_STALE_DAYS):
             lines.append(f"- ⚠️ FINRA 最新一期是 {d}, 超过 {SI_STALE_DAYS} 天 —— 数据可能断更")
 
