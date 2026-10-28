@@ -367,6 +367,21 @@ class TestRegimeBlock(unittest.TestCase):
             self.assertNotIn("3.04", note)
             self.assertNotIn("历史级", note)
 
+    def test_move_is_reading_only(self):
+        # MOVE 只显示读数: 没有背离线, MOVE 再高也不出 ⚠️; 取不到时只报
+        # 失败原因, 不写"门未生效" (它本来就没有门)
+        text = self._regime(vix=15.0, vvix={"value": 95.0, "as_of": "2026-10-27"},
+                            move={"value": 130.0, "as_of": "2026-10-27"})
+        self.assertIn("MOVE 130.0 (读数, 不进门控, as of 2026-10-27)", text)
+        self.assertIn("VVIX **95.0** (停牌线 110", text)
+        self.assertNotIn("背离", text)
+        self.assertFalse([ln for ln in text.splitlines()
+                          if "⚠️" in ln and "MOVE" in ln])
+        text = self._regime(vvix={"value": 95.0, "as_of": "2026-10-27"},
+                            move={"error": "stale (最新 2026-10-20)"})
+        self.assertIn("MOVE 获取失败 (stale (最新 2026-10-20))", text)
+        self.assertNotIn("门未生效", text)
+
 
 class TestActionLabel(unittest.TestCase):
     def _r(self, **kw):
@@ -940,9 +955,9 @@ class TestVXCurve(unittest.TestCase):
                          "PARTIAL_BACKWARDATION")
 
     @staticmethod
-    def _gates(stage, vx, vvix=None, move=None, vix_level=16.0, s=None):
-        return sc.assess_vol_gates(stage, vx, vvix or {}, move or {},
-                                   vix_level, s or sc.SETTINGS_DEFAULTS)
+    def _gates(stage, vx, vvix=None, s=None):
+        return sc.assess_vol_gates(stage, vx, vvix or {},
+                                   s or sc.SETTINGS_DEFAULTS)
 
     def test_gates_full_backwardation_halts(self):
         vx = {"state": "FULL_BACKWARDATION", "m1": 28.0, "m2": 25.0,
@@ -971,8 +986,7 @@ class TestVXCurve(unittest.TestCase):
 
     def test_gates_degrade_on_feed_error(self):
         # 数据坏 = 门失效, 不硬拦
-        g = self._gates("NORMAL", {"error": "HTTPError: 503"},
-                        {"error": "x"}, {"error": "y"})
+        g = self._gates("NORMAL", {"error": "HTTPError: 503"}, {"error": "x"})
         self.assertEqual((g["halt_csp"], g["halt_new_longs"], g["warnings"]),
                          (None, None, []))
 
@@ -996,19 +1010,11 @@ class TestVXCurve(unittest.TestCase):
                         {"value": 150.0, "as_of": "x"})
         self.assertIn("全曲线倒挂", g["halt_csp"])
 
-    def test_move_divergence_warns_not_halts(self):
-        # MOVE 破线且 VIX 平静 = 债波先行预警; VIX 已经起来就不是背离
-        vx = {"state": "CONTANGO", "m1": 17.0, "m2": 19.0, "as_of": "x"}
-        g = self._gates("NORMAL", vx, move={"value": 105.0, "as_of": "x"},
-                        vix_level=16.0)
-        self.assertTrue(any("MOVE" in w for w in g["warnings"]))
-        self.assertIsNone(g["halt_csp"])
-        g = self._gates("NORMAL", vx, move={"value": 105.0, "as_of": "x"},
-                        vix_level=22.0)
-        self.assertEqual(g["warnings"], [])
-        g = self._gates("NORMAL", vx, move={"value": 95.0, "as_of": "x"},
-                        vix_level=16.0)
-        self.assertEqual(g["warnings"], [])
+    def test_move_has_no_gate_settings(self):
+        # 2026-10-28 删了 MOVE 背离预警 (回测无预警价值, lesson.md): MOVE
+        # 只剩读数。再加 MOVE 门之前先补事件统计, 别凭案例上线
+        self.assertFalse([k for k in sc.SETTINGS_DEFAULTS if "move_" in k
+                          and k != "move_alert_pct"])
 
 
 class TestVXHaltScope(unittest.TestCase):
@@ -1018,7 +1024,7 @@ class TestVXHaltScope(unittest.TestCase):
     def _gates(self, stage, halt=True, m1=28.0, m2=25.0):
         s = dict(sc.SETTINGS_DEFAULTS, vx_full_backwardation_halt=halt)
         vx = dict(self.VX, m1=m1, m2=m2)
-        return sc.assess_vol_gates(stage, vx, {}, {}, 16.0, s)
+        return sc.assess_vol_gates(stage, vx, {}, s)
 
     def test_override_only_releases_panic_stage_csp(self):
         # 三轮评审 (Copilot, critical): 开关的语义是"放行**剧本恐慌档**

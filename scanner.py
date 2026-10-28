@@ -240,8 +240,6 @@ SETTINGS_DEFAULTS = {
     "vx_full_backwardation_halt": True,  # VX 全曲线倒挂 = 停开新票 (21/22 crash filter)
     "vx_curve_contracts": 5,             # 曲线形态看前 N 个月度合约
     "vvix_halt": 110.0,          # NORMAL 期 VVIX >= 此值 = 停开新 CSP
-    "move_divergence": 100.0,    # MOVE > 此值且 VIX 平静 = 债波先行预警
-    "move_calm_vix_max": 18.0,   # "VIX 平静"的上限
     "rr_dte": [20, 60],          # 25Δ risk reversal 取样窗口 (取最接近 35 DTE)
     "rr_delta_tol": 0.10,        # 链上找不到 |Δ-0.25|<=tol 的行权价 = 无读数
     "rr_invert_min_pts": 1.0,    # RR < -此值才亮倒挂旗标 (延迟报价噪声地板)
@@ -953,6 +951,7 @@ def fetch_vvix() -> dict:
 
 def fetch_move() -> dict:
     """^MOVE (ICE BofA 美债波动率) — 只有 Yahoo 源, 无 CBOE 兜底。
+    只在市场状态行显示读数, 不进门控 (见 assess_vol_gates 末尾注释)。
     Yahoo 指数 feed 会断更 (见 ^VIX3M 前科): 最新点老于 5 个交易日
     按 error 报, 不当读数用. -> {'value','as_of'} or {'error'}."""
     try:
@@ -972,8 +971,7 @@ def fetch_move() -> dict:
         return {"error": f"{type(e).__name__}: {e}"}
 
 
-def assess_vol_gates(stage: str, vx: dict, vvix: dict, move: dict,
-                     vix_level: float, s: dict) -> dict:
+def assess_vol_gates(stage: str, vx: dict, vvix: dict, s: dict) -> dict:
     """Cross-signal gates layered on top of the VIX/VIX3M stage machine.
     -> {"halt_csp": str|None, "halt_new_longs": str|None, "warnings": [...]}
     halt_csp 拦新 CSP 票, halt_new_longs 拦 LEAP/回踩 spread —
@@ -1017,15 +1015,10 @@ def assess_vol_gates(stage: str, vx: dict, vvix: dict, move: dict,
                     f"{s['vvix_halt']:g} 而 regime 仍 NORMAL — vol-of-vol "
                     "抢跑 (对冲拥挤/裂缝先兆): 停开新 CSP, 等 VVIX 回落"
                     "或 regime 表态")
-    # MOVE 背离预警: 债波先行于股波 (2023-03 SVB: MOVE 130→200 两天,
-    # VIX 晚数日; 2025-04 basis trade: MOVE ~172 先到) — 预警不拦票。
-    m = move.get("value")
-    if m is not None and m > s["move_divergence"] \
-            and vix_level < s["move_calm_vix_max"]:
-        warnings.append(
-            f"MOVE {m:.1f} > {s['move_divergence']:g} 而 VIX 仅 "
-            f"{vix_level:.1f} — 债券波动率先行 (2023-03 SVB / 2025-04 "
-            "序列): 缩短 put 名义, 对冲前移到长期限指数 put")
+    # MOVE 不进门控。原"MOVE > 100 且 VIX < 18 = 债波先行"预警 2026-10-28
+    # 删除: 2002 年以来 11 段预警后 63 天内 VIX >= 25 的比例低于对照
+    # (13% vs 31%), 卖 put 不差反好; 引用的 SVB / 2025-04 两例两次 VIX
+    # 都 >= 18, 规则不会亮, 且是 VIX 先动 (lesson.md 2026-10-28)。
     return {"halt_csp": halt_csp, "halt_new_longs": halt_longs,
             "warnings": warnings}
 
@@ -1078,13 +1071,12 @@ def fetch_regime(s: dict) -> dict:
     vx = fetch_vx_curve(s["vx_curve_contracts"])
     vvix = fetch_vvix()
     move = fetch_move()
-    gates = assess_vol_gates(stage, vx, vvix, move, float(vix.iloc[-1]), s)
+    gates = assess_vol_gates(stage, vx, vvix, s)
     return {
         "vix": float(vix.iloc[-1]), "vix3m": float(vix3m.iloc[-1]),
         "vxn": vxn_last,
         "vvix": vvix, "move": move,
-        "gate_lines": {"vvix_halt": s["vvix_halt"],
-                       "move_divergence": s["move_divergence"]},
+        "gate_lines": {"vvix_halt": s["vvix_halt"]},
         "ratio": cur, "ratio_prev": prev,
         "crossed_up": prev <= 1.0 < cur, "crossed_down": prev > 1.0 >= cur,
         "stage": stage,
@@ -3615,7 +3607,12 @@ def regime_block(regime: dict) -> list[str]:
             f"— {vx_label} (结算 {vx['as_of']})")
     vvix, move = regime.get("vvix") or {}, regime.get("move") or {}
     if vvix or move:
-        def _gauge(d, name, line_val, line_label):
+        def _gauge(d, name, line_val=None, line_label=None):
+            if line_label is None:   # 纯读数 (MOVE): 没有门, 取不到也不影响门控
+                if d.get("error"):
+                    return f"{name} 获取失败 ({d['error']})"
+                return (f"{name} {d['value']:.1f} (读数, 不进门控, "
+                        f"as of {d['as_of']})")
             if d.get("error"):
                 # 与 VX 错误行同规格: 带原因 + 明示门未生效 (README 承诺)
                 return (f"{name} 获取失败 ({d['error']}) — "
@@ -3625,7 +3622,7 @@ def regime_block(regime: dict) -> list[str]:
         gl = regime.get("gate_lines", SETTINGS_DEFAULTS)
         lines.append(
             "- " + _gauge(vvix, "VVIX", gl["vvix_halt"], "停牌线")
-            + " | " + _gauge(move, "MOVE", gl["move_divergence"], "背离线"))
+            + " | " + _gauge(move, "MOVE"))
     for w in regime.get("gate_warnings", []):
         lines.append(f"- ⚠️ {w}")
     # 两道硬门可能同时活跃且消息不同 (如 VVIX 拦 CSP + VX 拦 LEAP/spread
