@@ -553,6 +553,38 @@ class TestEmailHtml(unittest.TestCase):
         h = sc.md_to_email_html(md)
         self.assertIn("text-align:right", h)         # 数字列右对齐才好比
         self.assertIn("text-align:left", h)          # 文本列仍左对齐
+        self.assertIn('<td class="wl-c wl-r wl-n">709.24</td>', h)
+        self.assertIn('<td class="wl-c">QQQ</td>', h)
+
+    def test_header_follows_its_column_alignment(self):
+        # 10/28 用户截图: 表头一律左对齐、数字格右对齐, 整列对不上; ">1000万" 不算
+        # 数字, 那一列左右乱跳
+        md = ("| 标的 | 空头占流通股 | 可借 |\n|---|---|---|\n"
+              "| SOFI | 17.2% | >1000万 |\n| GLD (ETF) | — | 780万 |")
+        h = sc.md_to_email_html(md)
+        self.assertIn('<th class="wl-h">标的</th>', h)
+        self.assertIn('<th class="wl-h wl-r">空头占流通股</th>', h)
+        self.assertIn('<th class="wl-h wl-r">可借</th>', h)
+        self.assertIn('<td class="wl-c wl-r wl-n">&gt;1000万</td>', h)
+        self.assertIn('<td class="wl-c wl-r wl-n">—</td>', h)       # 占位格跟着列走
+
+    def test_separator_markers_override_inference(self):
+        md = "| 标的 | 较上期 |\n|---|--:|\n| SOFI | +2% |\n| XYZ | 拆股 |"
+        h = sc.md_to_email_html(md)
+        self.assertIn('<td class="wl-c wl-r wl-n">拆股</td>', h)    # 听 --: 的, 不因一格文字翻成左对齐
+        md2 = "| 标的 | 收盘 |\n|:--|:--|\n| QQQ | 709.24 |"
+        self.assertIn('<td class="wl-c">709.24</td>', sc.md_to_email_html(md2))
+
+    def test_wide_table_styles_live_inside_the_media_query(self):
+        # 宽表只在 min-width 媒体查询生效时显示, 单元格样式放在同一个媒体查询里:
+        # 逐格内联每格 100+ 字节, 10/28 空头面表把邮件推到 102KB
+        h = sc.md_to_email_html("| 标的 | 收盘 |\n|---|---|\n| QQQ | 709.24 |")
+        style = h[h.index("<style>"):h.index("</style>")]
+        media = style[style.index("@media"):]
+        self.assertIn(".wl-c{", media)
+        self.assertIn(".wl-r{text-align:right", media)
+        table = h[h.index("<table"):h.index("</table>")]
+        self.assertNotIn('<td style=', table)
 
     def test_status_marks_become_colored_cards(self):
         for mark, bar in (("⛔", "#dc2626"), ("🟢", "#16a34a"),
@@ -6521,7 +6553,7 @@ class TestShortsideFetch(unittest.TestCase):
         self.assertNotIn("sortFields", body)       # 按代码过滤时 FINRA 不许排序
         self.assertEqual(body["domainFilters"][0]["values"], ["AAPL", "SOFI"])
         rng = body["dateRangeFilters"][0]
-        self.assertEqual((rng["startDate"], rng["endDate"]), ("2026-09-13", "2026-10-28"))
+        self.assertEqual((rng["startDate"], rng["endDate"]), ("2025-09-23", "2026-10-28"))  # 400 天: 最新一期 + 一年基准
 
     def test_empty_finra_body_means_no_records(self):
         with mock_attr(ss.urllib.request, "urlopen", lambda req, timeout: io.BytesIO(b"")):
@@ -6614,7 +6646,8 @@ class TestShortsideShares(unittest.TestCase):
                 self.info = {"quoteType": "EQUITY", "sharesOutstanding": 100e6} \
                     if sym == "OK" else {}
         got = ss.fetch_shares(["OK", "BAD", "EMPTY"], workers=2, ticker_factory=Tk)
-        self.assertEqual(got, {"OK": {"shares": 100e6, "basis": "out"}, "BAD": None, "EMPTY": None})
+        self.assertEqual(got, {"OK": {"shares": 100e6, "basis": "out", "since": None},
+                               "BAD": None, "EMPTY": None})
 
     def test_pct_and_failure_isolated_in_run(self):
         meta = _ss_meta()
@@ -6625,11 +6658,78 @@ class TestShortsideShares(unittest.TestCase):
         self.assertEqual(meta["by_symbol"]["SOFI"]["si"]["dtc"], 4.75)   # 另外两个源照常
 
 
+def _semimonthly(n, end=date(2026, 10, 15)):
+    """往前 n 个半月结算日 (15 号 / 月底), 由早到晚, 最后一个 = end。"""
+    out, d = [], end
+    while len(out) < n:
+        out.append(d)
+        if d.day == 15:
+            d = d.replace(day=1) - timedelta(days=1)       # 上月月底
+        else:
+            d = d.replace(day=15)
+    return [x.isoformat() for x in reversed(out)]
+
+
+class TestShortsideBaseline(unittest.TestCase):
+    """自身基准: 同样的占比对不同的票意义不同, 跟它自己过去一年比。"""
+
+    def _info(self, sis, since=None, splits=(), shares=1000.0, end=date(2026, 10, 15)):
+        dates = _semimonthly(len(sis), end)
+        recs = [_finra_rec("XX", d, si, sis[i - 1] if i else si, 1.0,
+                           "Y" if i in splits else None) for i, (d, si) in enumerate(zip(dates, sis))]
+        v = ss.parse_finra(recs)["XX"]
+        return {"si": v, "shares": {"shares": shares, "basis": "float", "since": since}}
+
+    def test_median_and_rank_over_one_year(self):
+        info = self._info(list(range(100, 124)))          # 24 期一路涨, 现在 = 一年最高
+        b = ss.si_baseline(info)
+        self.assertEqual(b["n"], 24)
+        self.assertAlmostEqual(b["median"], 11.15)        # 中位 111.5 股 ÷ 1000 股
+        self.assertEqual(b["rank"], 100)
+        flag = ss.si_flag(info["si"], _SS_S, ss.si_pct(info), b)
+        self.assertIn("空头创一年新高 (一年中位 11.2%)", flag)
+
+    def test_window_is_one_year(self):
+        # 36 期, 只算最近 24 期; 早年的极端值不进中位数
+        b = ss.si_baseline(self._info([10_000] * 12 + list(range(100, 124))))
+        self.assertEqual(b["n"], 24)
+        self.assertAlmostEqual(b["median"], 11.15)
+
+    def test_reused_ticker_history_is_cut_at_listing(self):
+        # SPCX: 2026-03 以前是一只 SPAC ETF, 6/12 SpaceX 上市才是现在这只
+        sis = [5] * 15 + [150, 160, 170, 155, 165, 160, 158, 162, 167]
+        dates = _semimonthly(len(sis))
+        self.assertEqual(dates[-9], "2026-06-15")          # 同 FINRA 实况: SpaceX 第一期 6/15
+        self.assertIsNone(ss.si_baseline(self._info(sis, since="2026-06-12")))   # 9 期 < 12
+        b = ss.si_baseline(self._info(sis))                                      # 不截会混进 ETF
+        self.assertLess(b["median"], 1.0)
+
+    def test_split_cuts_earlier_periods(self):
+        sis = [10] * 10 + [100] * 14                       # 第 10 期拆股 1:10
+        b = ss.si_baseline(self._info(sis, splits=(10,)))
+        self.assertEqual(b["n"], 14)
+        self.assertAlmostEqual(b["median"], 10.0)
+
+    def test_short_history_has_no_baseline(self):
+        self.assertIsNone(ss.si_baseline(self._info(list(range(11)))))
+        self.assertIsNone(ss.si_baseline({"si": None, "shares": None}))
+        self.assertIsNone(ss.si_baseline(None))
+
+    def test_table_row_shows_baseline_and_flags_new_high_for_stocks_only(self):
+        info = self._info(list(range(100, 124)), shares=1000.0)
+        meta = {"si_date": "2026-10-15", "borrow_asof": None, "errors": {}}
+        text = "\n".join(ss.report_block([("XX", "stock", info), ("YY", "etf", info)],
+                                         meta, _SS_S, _SS_TODAY))
+        self.assertIn("| XX | 12.3% | 11.2% | 100 | 1.0 |", text)
+        self.assertIn("- ⚠️ **XX** 空头创一年新高", text)
+        self.assertNotIn("**YY**", text)                   # ETF 只列数
+
+
 class TestShortsideBlock(unittest.TestCase):
     def _block(self, meta, kinds=None, today=_SS_TODAY):
         return ss.report_block(_ss_items(meta, kinds), meta, _SS_S, today)
 
-    HEAD = "| 标的 | 空头占流通股 | 回补天数 | 较上期 | 借券费 | 可借 |"
+    HEAD = ss.TABLE_HEAD
 
     def test_table_rows_stocks_by_pct_then_funds(self):
         lines = self._block(_ss_meta())
@@ -6637,9 +6737,9 @@ class TestShortsideBlock(unittest.TestCase):
         self.assertIn("- FINRA 10-15 结算 (每月两期) · IBKR 借券 10-28 01:18 ET", lines)
         i = lines.index(self.HEAD)
         self.assertEqual(lines[i + 2:i + 5], [
-            "| SOFI | 17.2% | 4.8 | +2% | 0.33% | >1000万 |",
-            "| COHR | 4.6% | 1.2 | -18% | 0.28% | 330万 |",
-            "| QQQ (指数) | 11.7% | 2.4 | +16% | — | — |"])     # ETF/指数排在个股后面
+            "| SOFI | 17.2% | — | — | 4.8 | +2% | 0.33% | >1000万 |",
+            "| COHR | 4.6% | — | — | 1.2 | -18% | 0.28% | 330万 |",
+            "| QQQ (指数) | 11.7% | — | — | 2.4 | +16% | — | — |"])     # ETF/指数排在个股后面; 历史不满 12 期不算基准
         text = "\n".join(lines)
         self.assertIn("- ⚠️ **SOFI** 空头占流通股 17.2% (FINRA 10-15)", text)
         self.assertNotIn("**QQQ**", text)                  # 指数不出旗标
@@ -6653,7 +6753,7 @@ class TestShortsideBlock(unittest.TestCase):
         self.assertIn("- ⚠️ **BYND** 难借券: 借券费 24.6%、可借只剩 1万股", text)
         self.assertIn("- ⚠️ **BYND** 空头占流通股 30.0%、回补 6.1 天、空头较上期 +50% "
                       "(FINRA 10-15)", text)
-        self.assertIn("| GLD (ETF) | 4.0% | 2.1 | +72% | — | — |", text)   # ETF 照列数
+        self.assertIn("| GLD (ETF) | 4.0% | — | — | 2.1 | +72% | — | — |", text)   # ETF 照列数
         self.assertNotIn("**GLD**", text)                                   # 但不出旗标
 
     def test_errors_and_missing_records(self):
@@ -6663,7 +6763,7 @@ class TestShortsideBlock(unittest.TestCase):
         self.assertIn("- ⚠️ IBKR 借券费取不到 (TimeoutError: timed out) —— 只缺这一项", text)
         self.assertIn("- ⚠️ Yahoo 股本 (空头占流通股那一列)取不到 (RuntimeError: yfinance down)", text)
         self.assertIn("- FINRA 没有记录: QQQ, COHR", text)
-        self.assertIn("| SOFI | — | 4.8 | +2% | — | — |", text)
+        self.assertIn("| SOFI | — | — | — | 4.8 | +2% | — | — |", text)
         self.assertNotIn("借券文件里没有", text)     # 文件没取到 ≠ 文件里没有
 
     def test_nothing_fetched_has_no_table(self):
@@ -6814,8 +6914,8 @@ class TestShortsideMain(unittest.TestCase):
         self.assertEqual(self.asked, [["SOFI", "QQQ"]])     # ETF/指数也查 (只是不出旗标)
         text = self._report(f"{self._today()}-close.md")
         self.assertIn("## 空头面", text)
-        self.assertIn("| SOFI | 17.2% | 4.8 | +2% | 0.33% | >1000万 |", text)
-        self.assertIn("| QQQ (指数) | 11.7% | 2.4 | +16% | — | — |", text)
+        self.assertIn("| SOFI | 17.2% | — | — | 4.8 | +2% | 0.33% | >1000万 |", text)
+        self.assertIn("| QQQ (指数) | 11.7% | — | — | 2.4 | +16% | — | — |", text)
         # 空头面紧跟市场状态, 在概览表前面 (10/28 用户要的位置)
         self.assertLess(text.index("## 市场状态"), text.index("## 空头面"))
         self.assertLess(text.index("## 空头面"), text.index("## 概览"))

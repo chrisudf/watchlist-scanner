@@ -4066,29 +4066,69 @@ def _mark_style(text: str):
 
 
 def _is_numeric_cell(s: str) -> bool:
+    """17.2% / +2% / -0.0% / 3.6x / 16.40 / >1000万 / 280万 这类。"""
     import re
-    return bool(re.fullmatch(r"[+\-—–]?[\d.,]*%?x?", s.strip())) and any(
-        c.isdigit() for c in s)
+    return bool(re.fullmatch(r"[><~]?[+\-−–]?\d[\d,]*(?:\.\d+)?(?:%|x|万|亿)?",
+                             s.strip()))
 
 
-def _html_table(rows: list[list[str]]) -> str:
+_CELL_BLANK = ("", "—", "-")
+
+
+def _col_right(head: list[str], body: list[list[str]],
+               aligns: list[str | None] | None = None) -> list[bool]:
+    """每列右对齐与否 —— **按列定, 表头跟着列走** (10/28 用户截图: 表头一律左对齐、
+    数字格右对齐, 整列对不上; ">1000万" 又不算数字, 那一列左右乱跳)。分隔行写了
+    `--:` / `:--` 就听它的; 没写就看数据: 这一列非空的格子全是数字才右对齐。"""
+    out = []
+    for j in range(len(head)):
+        a = aligns[j] if aligns and j < len(aligns) else None
+        if a is not None:
+            out.append(a == "right")
+            continue
+        vals = [r[j].strip() for r in body if j < len(r) and r[j].strip() not in _CELL_BLANK]
+        out.append(bool(vals) and all(_is_numeric_cell(v) for v in vals))
+    return out
+
+
+def _sep_aligns(line: str) -> list[str | None]:
+    """markdown 分隔行 -> 每列 "right" (--:) / "left" (:--) / None (没写)。"""
+    out = []
+    for c in _split_row(line):
+        c = c.strip()
+        out.append("right" if c.endswith(":") and not c.startswith(":")
+                   else "left" if c.startswith(":") else None)
+    return out
+
+
+# 宽表的单元格样式放进 <head> 的 <style>, 而且就放在那条 min-width 媒体查询里:
+# 宽表本来就只在这条媒体查询生效时才显示 (默认 display:none), 样式和"显示"同生
+# 同灭, 不会出现"表出来了样式没了"。逐格内联要 100+ 字节, 10/28 加空头面表后
+# 邮件涨到 102KB, 正好压在 Gmail 截断线上 (test_html_stays_well_under_gmail_clip_limit)
+_WIDE_TABLE_CSS = (
+    ".wl-h{padding:7px 9px;font-weight:600;font-size:12px;color:#475569;"
+    "border-bottom:2px solid #cbd5e1;text-align:left}"
+    ".wl-c{padding:7px 9px;border-bottom:1px solid #e2e8f0}"
+    ".wl-z{background:#f8fafc}"
+    ".wl-r{text-align:right!important}"
+    f".wl-n{{font-family:{_MONO}}}")
+
+
+def _html_table(rows: list[list[str]], aligns: list[str | None] | None = None) -> str:
     """真表格 + 横向滚动。概览表有 11 列, 手机上必须能横拖, 否则挤成一团。"""
     head, body = rows[0], rows[1:]
-    # 字体/字号/颜色由 <table> 继承下去 — 逐 cell 重复这些会让正文膨胀
-    # 到 Gmail 的 102KB 截断线附近 (实测 15 只标的就到 76KB)
+    right = _col_right(head, body, aligns)
+    # 字体/字号/颜色由 <table> 继承下去, 单元格只挂 class (样式见 _WIDE_TABLE_CSS)
     th = "".join(
-        f'<th style="padding:7px 9px;font-weight:600;font-size:12px;'
-        f'color:#475569;border-bottom:2px solid #cbd5e1">{_md_inline(c)}</th>'
-        for c in head)
+        f'<th class="wl-h{" wl-r" if right[j] else ""}">{_md_inline(c)}</th>'
+        for j, c in enumerate(head))
     trs = []
     for i, row in enumerate(body):
-        bg = "#ffffff" if i % 2 == 0 else "#f8fafc"
         tds = "".join(
-            f'<td style="padding:7px 9px;border-bottom:1px solid #e2e8f0'
-            + (f';text-align:right;font-family:{_MONO}"'
-               if _is_numeric_cell(c) else '"')
-            + f'>{_md_inline(c)}</td>' for c in row)
-        trs.append(f'<tr style="background:{bg}">{tds}</tr>')
+            f'<td class="wl-c{" wl-r wl-n" if j < len(right) and right[j] else ""}">'
+            f'{_md_inline(c)}</td>' for j, c in enumerate(row))
+        zebra = ' class="wl-z"' if i % 2 else ""
+        trs.append(f"<tr{zebra}>{tds}</tr>")
     # 默认给**卡片**, 宽表靠 @media (min-width) 在大屏才出现 —— 默认状态
     # 要选那个"CSS 全被剥掉时仍然可读"的。反过来 (默认宽表) 实测在 Gmail
     # 手机版就是一张截断的表, 而卡片在桌面上只是不如表格紧凑, 仍然能读。
@@ -4175,11 +4215,12 @@ def md_to_email_html(md: str) -> str:
         if stripped.startswith("|") and i + 1 < len(lines) \
                 and _is_table_sep(lines[i + 1]):
             rows = [_split_row(stripped)]
+            aligns = _sep_aligns(lines[i + 1])
             i += 2
             while i < len(lines) and lines[i].strip().startswith("|"):
                 rows.append(_split_row(lines[i]))
                 i += 1
-            out.append(_html_table(rows))
+            out.append(_html_table(rows, aligns))
             continue
 
         # 标题
@@ -4267,6 +4308,7 @@ def md_to_email_html(md: str) -> str:
         ".wl-narrow{display:none!important}"
         ".wl-outer{padding:14px!important}"
         ".wl-inner{padding:18px 20px!important}"
+        + _WIDE_TABLE_CSS +
         "}</style>")
     body = (
         f'<div class="wl-outer" style="margin:0;padding:8px;'

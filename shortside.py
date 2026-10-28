@@ -8,8 +8,9 @@
     频率, 没有更快的官方数 (更快的借券日报 SEC 10c-1a 推迟到 2029 才公开)。报告看
     **空头占流通股**、**回补天数** (空头股数 ÷ 日均成交量) 和较上期变化。公开 API
     不用 key; 按代码过滤时**不能带排序** (报错要求 settlementDate 用 EQUAL), 所以用
-    domainFilters 一次拿全部代码、dateRangeFilters 圈近 45 天, 在本地取最新一期。
-    没有匹配记录时 FINRA 回的是**空响应体**, 不是 []。
+    domainFilters 一次拿全部代码、dateRangeFilters 圈近 400 天, 在本地取最新一期,
+    同一批数据再算每只自己过去一年的基准 (si_baseline)。没有匹配记录时 FINRA 回的
+    是**空响应体**, 不是 []。
   - Yahoo 股本 (yfinance info, 只当分母): 个股用流通股; 流通股缺失或比总股本还大
     时用总股本 (多股份类 / ADR 口径对不上: 10/28 GOOG 流通股 108.8 亿含 A 类、总股本
     55.3 亿只算 C 类; TSM 流通股 378 亿是普通股、总股本 51.9 亿是折成 ADR)。ETF 用
@@ -41,23 +42,30 @@ from __future__ import annotations
 import csv
 import json
 import sys
+import statistics
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 IBKR_URL = "ftp://shortstock:@ftp2.interactivebrokers.com/usa.txt"
 IBKR_COLUMNS = ("SYM", "REBATERATE", "FEERATE", "AVAILABLE")
 FINRA_URL = ("https://api.finra.org/data/group/otcMarket/name/"
              "consolidatedShortInterest")
-FINRA_LOOKBACK_DAYS = 45     # 最新一期最老约 30 天 (半个月间隔 + 约 8 个交易日公布), 留余量
+# 一个请求同时拿最新一期和一年历史 (自身基准): 最新一期最老约 30 天 (半个月间隔 +
+# 约 8 个交易日公布), 再往前一年 = 400 天; 18 只约 450 行
+FINRA_LOOKBACK_DAYS = 400
+BASE_DAYS = 365              # 自身基准的窗口: 最新结算日往前一年 (24 期)
+BASE_MIN_N = 12              # 不满半年 (12 期) 的不算基准, 显示 —
 SI_STALE_DAYS = 35           # 最新结算日老于此 = FINRA 可能断更
 BORROW_STALE_DAYS = 4        # IBKR 文件日期老于此 (周五晚 → 周一 + 一个假日) = 断更
 SNAPSHOT_NAME = "borrow_history.csv"
 SNAPSHOT_FIELDS = ["date", "symbol", "fee", "rebate", "avail", "avail_plus", "asof"]
 
 NOTE = ("> 空头占流通股 = 空头股数 ÷ Yahoo 流通股 (多股份类/ADR 口径对不上时用总股本, "
-        "ETF 用资产 ÷ 净值估算份额); 回补天数 = 空头股数 ÷ 日均成交量 (按平常成交量, 空头"
+        "ETF 用资产 ÷ 净值估算份额); 一年中位 / 一年分位 = 这只票自己过去一年 (24 期) 的"
+        "空头中位数和现在排第几 (100 = 一年最高; 按现在的股本折算, 上市不满半年不算) —— "
+        "同样的占比对不同的票意义不同, 先跟它自己比; 回补天数 = 空头股数 ÷ 日均成交量 (按平常成交量, 空头"
         "全部买回要几天); 较上期 = 空头股数比上一期 (FINRA 每月两期, 结算日后约 8 个交易日"
         "公布)。借券费 = IBKR 给自家客户的年化费率 (普通券约 0.25%), 可借 = IBKR 自己能借出"
         "的股数。个股按占比从高到低排, ETF/指数排后面: 它们的空头含申赎和对冲盘, 一期变动"
@@ -136,7 +144,7 @@ def fetch_ibkr(timeout: float, opener=urllib.request.urlopen) -> tuple[dict, str
 
 def finra_request(symbols: list[str], today: date,
                   lookback: int = FINRA_LOOKBACK_DAYS) -> dict:
-    return {"limit": max(100, len(symbols) * 6),
+    return {"limit": max(200, len(symbols) * 30),
             "domainFilters": [{"fieldName": "symbolCode", "values": sorted(symbols)}],
             "dateRangeFilters": [{"fieldName": "settlementDate",
                                   "startDate": (today - timedelta(days=lookback)).isoformat(),
@@ -161,25 +169,32 @@ def fetch_finra(symbols: list[str], today: date, timeout: float,
 
 
 def parse_finra(records: list[dict]) -> dict[str, dict]:
-    """FINRA 记录 -> {SYM: 最新一期 {"date", "si", "prev", "chg", "dtc", "split"}}。
-    chg (%) 用两期股数自己算; 上期为 0 或带拆股标记时 = None (拆股前后的股数
-    不可比, 变化率没有意义)。dtc 也自己算 (空头股数 ÷ 日均成交量): FINRA 的
+    """FINRA 记录 -> {SYM: 最新一期 {"date", "si", "prev", "chg", "dtc", "split",
+    "hist"}}, hist = 这只票全部期的 [(结算日, 空头股数, 拆股标记)] (按日期排, 给
+    si_baseline 用)。chg (%) 用两期股数自己算; 上期为 0 或带拆股标记时 = None (拆股
+    前后的股数不可比, 变化率没有意义)。dtc 也自己算 (空头股数 ÷ 日均成交量): FINRA 的
     daysToCoverQuantity 最低只写 1.00 —— 10/28 实测 DRAM 1,636 万 ÷ 3,261 万 = 0.50
     也写成 1.00 (上市以来 13 期全是 1.00), GLD 过去一年 25 期里 8 期是。没有日均量
     时才退回 FINRA 的值。"""
-    latest = {}
+    latest, hist = {}, {}
     for r in records:
         sym, d = r.get("symbolCode"), r.get("settlementDate")
-        if not sym or not d or (sym in latest and latest[sym]["date"] >= d):
+        if not sym or not d:
             continue
         si, prev = r.get("currentShortPositionQuantity"), r.get("previousShortPositionQuantity")
-        adv = r.get("averageDailyVolumeQuantity")
         split = bool(r.get("stockSplitFlag"))
+        if si is not None:
+            hist.setdefault(sym, {})[d] = (d, si, split)
+        if sym in latest and latest[sym]["date"] >= d:
+            continue
+        adv = r.get("averageDailyVolumeQuantity")
         latest[sym] = {"date": d, "si": si, "prev": prev, "split": split,
                        "dtc": (si / adv if si is not None and adv
                                else r.get("daysToCoverQuantity")),
                        "chg": ((si / prev - 1) * 100
                                if si is not None and prev and not split else None)}
+    for sym, v in latest.items():
+        v["hist"] = sorted(hist.get(sym, {}).values())
     return latest
 
 
@@ -200,18 +215,30 @@ def shares_basis(info: dict) -> tuple[float | None, str | None]:
     return (out, "out") if out else (None, None)
 
 
+def first_trade(info: dict) -> str | None:
+    """yfinance info 的 firstTradeDateMilliseconds -> ISO 日期 (当前这只证券的上市日)。"""
+    ms = info.get("firstTradeDateMilliseconds")
+    try:
+        return datetime.fromtimestamp(ms / 1000, timezone.utc).date().isoformat() if ms else None
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
 def fetch_shares(symbols: list[str], workers: int = 4, ticker_factory=None) -> dict:
-    """-> {sym: {"shares", "basis"} | None}。单只取不到 = None (那一格显示 —), 不抛。"""
+    """-> {sym: {"shares", "basis", "since"} | None}; since = 上市日 (截自身基准的
+    历史用)。单只取不到 = None (那一格显示 —), 不抛。"""
     if ticker_factory is None:
         import yfinance as yf
         ticker_factory = yf.Ticker
 
     def one(sym):
         try:
-            n, basis = shares_basis(ticker_factory(sym).info or {})
+            info = ticker_factory(sym).info or {}
+            n, basis = shares_basis(info)
         except Exception:       # noqa: BLE001
             return sym, None
-        return sym, ({"shares": n, "basis": basis} if n else None)
+        return sym, ({"shares": n, "basis": basis, "since": first_trade(info)}
+                     if n else None)
 
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         return dict(pool.map(one, symbols))
@@ -222,6 +249,33 @@ def si_pct(info: dict | None) -> float | None:
     si = ((info or {}).get("si") or {}).get("si")
     sh = ((info or {}).get("shares") or {}).get("shares")
     return si / sh * 100 if si is not None and sh else None
+
+
+def si_baseline(info: dict | None) -> dict | None:
+    """这只票**自己**过去一年的空头 -> {"median": 中位占比 %, "rank": 现在排第几
+    分位 (0-100, 100 = 一年最高), "n": 期数}; 不满 BASE_MIN_N 期 = None。
+
+    同样 17% 对 SOFI 和 NVDA 意义不同 (10/28: SOFI 一年中位 12.8%, NVDA 1.2%), 横比
+    绝对值不如跟自己比。分母统一用现在的股本 (一年里大量增发/回购的票有偏差)。
+    只取上市日之后的期 —— 代码会被重复使用: SPCX 在 2026-03 以前是一只 SPAC ETF,
+    FINRA 历史里混着那只 ETF 的空头 (10/28 实测), 公司改名则不影响 (MSTR 2025-08
+    改名, 不能按 FINRA 的公司名截)。拆股那一期之前的股数不可比, 也截掉。"""
+    v, sh = (info or {}).get("si"), (info or {}).get("shares")
+    if not v or not sh or not v.get("hist") or v.get("si") is None:
+        return None
+    latest, since = date.fromisoformat(v["date"]), sh.get("since")
+    rows = [r for r in v["hist"]
+            if (latest - date.fromisoformat(r[0])).days < BASE_DAYS
+            and r[0] <= v["date"] and (not since or r[0] >= since)]
+    splits = [i for i, r in enumerate(rows) if r[2]]
+    if splits:
+        rows = rows[splits[-1]:]
+    if len(rows) < BASE_MIN_N:
+        return None
+    xs = [r[1] for r in rows]
+    return {"median": statistics.median(xs) / sh["shares"] * 100,
+            "rank": sum(1 for x in xs if x <= v["si"]) / len(xs) * 100,
+            "n": len(xs)}
 
 
 # --------------------------------------------------------------------------
@@ -295,14 +349,18 @@ def carry_line(b: dict | None, s: dict) -> str:
     return f"↳ {desc} —— 不是难借券, 这次背离另有原因 (股息/除权/报价), 先核对再下单"
 
 
-def si_flag(v: dict | None, s: dict, pct: float | None = None) -> str | None:
-    """只给个股 (调用方按 kind 判断): 空头占流通股 >= short_pct_warn%、回补天数 >=
-    short_dtc_warn 或空头较上期 >= +short_chg_warn% -> 原因; 否则 None。"""
+def si_flag(v: dict | None, s: dict, pct: float | None = None,
+            base: dict | None = None) -> str | None:
+    """只给个股 (调用方按 kind 判断): 空头占流通股 >= short_pct_warn%、创自身一年
+    新高 (base["rank"] = 100)、回补天数 >= short_dtc_warn 或空头较上期 >=
+    +short_chg_warn% -> 原因; 否则 None。"""
     if not v:
         return None
     parts = []
     if pct is not None and pct >= s["short_pct_warn"]:
         parts.append(f"空头占流通股 {pct:.1f}%")
+    if base and base["rank"] >= 100:
+        parts.append(f"空头创一年新高 (一年中位 {base['median']:.1f}%)")
     if v.get("dtc") is not None and v["dtc"] >= s["short_dtc_warn"]:
         parts.append(f"回补 {v['dtc']:.1f} 天")
     if v.get("chg") is not None and v["chg"] >= s["short_chg_warn"]:
@@ -327,16 +385,24 @@ def _stale(d: str | None, today: date, days: int) -> bool:
 KIND_LABEL = {"index": "指数", "etf": "ETF"}
 
 
+TABLE_HEAD = ("| 标的 | 空头占流通股 | 一年中位 | 一年分位 | 回补天数 | 较上期 "
+              "| 借券费 | 可借 |")
+# 数字列显式右对齐 (--:): "较上期" 偶尔是"拆股"两个字, 靠数据推断会让整列翻成左对齐
+TABLE_SEP = "|---|--:|--:|--:|--:|--:|--:|--:|"
+
+
 def _row(sym: str, kind: str, info: dict | None) -> str:
-    """表格一行: 标的 | 空头占流通股 | 回补天数 | 较上期 | 借券费 | 可借。缺的格子写 —。"""
+    """表格一行, 列见 TABLE_HEAD。缺的格子写 —。"""
     info = info or {}
     v, b = info.get("si") or {}, info.get("borrow")
-    pct = si_pct(info)
+    pct, base = si_pct(info), si_baseline(info)
     label = f"{sym} ({KIND_LABEL[kind]})" if kind in KIND_LABEL else sym
     chg = ("拆股" if v.get("split") else
            f"{v['chg']:+.0f}%" if v.get("chg") is not None else "—")
     cells = [label,
              f"{pct:.1f}%" if pct is not None else "—",
+             f"{base['median']:.1f}%" if base else "—",
+             f"{base['rank']:.0f}" if base else "—",
              f"{v['dtc']:.1f}" if v.get("dtc") is not None else "—",
              chg,
              f"{b['fee']:.2f}%" if b else "—",
@@ -360,8 +426,7 @@ def report_block(items: list[tuple[str, str, dict | None]], meta: dict, s: dict,
     if rows:
         lines.append(f"- FINRA {d[5:] if d else '?'} 结算 (每月两期) · "
                      f"IBKR 借券 {asof[5:] + ' ET' if asof else '?'}")
-        lines += ["", "| 标的 | 空头占流通股 | 回补天数 | 较上期 | 借券费 | 可借 |",
-                  "|---|---|---|---|---|---|"]
+        lines += ["", TABLE_HEAD, TABLE_SEP]
         lines += [_row(*x) for x in rows]
         lines.append("")
     if _stale(d, today, SI_STALE_DAYS):
@@ -373,7 +438,8 @@ def report_block(items: list[tuple[str, str, dict | None]], meta: dict, s: dict,
         b = info.get("borrow")
         if why := borrow_flag(b, s):
             lines.append(f"- ⚠️ **{sym}** 难借券: {why} —— 做空拥挤, put 贵、call 便宜都不是白捡的")
-        if kind == "stock" and (why := si_flag(info.get("si"), s, si_pct(info))):
+        if kind == "stock" and (why := si_flag(info.get("si"), s, si_pct(info),
+                                               si_baseline(info))):
             lines.append(f"- ⚠️ **{sym}** {why}")
 
     for key, name in (("si", "FINRA 空头股数"), ("borrow", "IBKR 借券费"),
