@@ -304,7 +304,7 @@ def report_block(items: list[tuple[str, str, dict | None]], meta: dict, s: dict,
             avail = f"可借最少 {shares_cn(t['avail'])}股 ({t_sym})"
         else:
             avail = "可借都超过 1000万股"
-        lead = "其余" if flagged else ""
+        lead = "其余 " if flagged else ""
         lines.append(f"- 借券费 ({when}): {lead}{rng}, {what}; {avail}")
     for sym, b, why in flagged:
         lines.append(f"- ⚠️ **{sym}** 难借券: {why} —— 做空拥挤, put 贵、call 便宜都不是白捡的")

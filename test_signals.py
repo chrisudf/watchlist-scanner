@@ -6598,7 +6598,7 @@ class TestShortsideBlock(unittest.TestCase):
         self.assertIn("- ⚠️ **BYND** 回补 6.1 天、空头较上期 +50% (FINRA 10-15)", text)
         self.assertIn("GLD 2.1 (+72%)", text)       # ETF 照列数
         self.assertNotIn("**GLD**", text)           # 但不出旗标
-        self.assertIn("- 借券费 (IBKR 10-28 01:18 ET): 其余0.33%, 都是普通券", text)
+        self.assertIn("- 借券费 (IBKR 10-28 01:18 ET): 其余 0.33%, 都是普通券", text)
 
     def test_errors_and_missing_records(self):
         meta = _ss_meta(ibkr_fail=TimeoutError("timed out"), recs=_FINRA_RECS[:2])
