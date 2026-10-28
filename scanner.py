@@ -266,7 +266,9 @@ SETTINGS_DEFAULTS = {
     # 阈值是经验值, 未回测: IBKR 普通券 0.25%, >= 5% 算难借券; 可借 < 10 万股算借
     # 不到 (10/28 全美最紧的几只里 QNT 还剩 20 万、IONQ 25 万, 都不亮); 回补天数
     # >= 5 天、空头较上期 >= +30% 只给个股亮旗标 (ETF 的空头含申赎和对冲盘)。
-    # 10/28 watchlist 回补最高 SOFI 4.75 天, 一只都不亮
+    # 10/28 watchlist 回补最高 SOFI 4.75 天。空头占流通股 >= 15% 也只给个股亮
+    # (常见说法 10% 以上算高、20% 以上很高, 取中间); 10/28 只有 SOFI 17.2% 亮
+    "short_pct_warn": 15.0,
     "short_fee_warn": 5.0,
     "short_avail_warn": 100000,
     "short_dtc_warn": 5.0,
@@ -3768,6 +3770,8 @@ def render_close(results, regime, ivdf, now_et, insider_meta=None,
              f"({now_et:%H:%M} ET)", ""]
     lines += action_block(results)
     lines += regime_block(regime)
+    # 空头面紧跟市场状态 (10/28 用户要的): 和市场状态一样是背景读数, 先看再看个股
+    lines += shortside_block(results, shortside_meta, now_et.date())
 
     ordered = by_actionability(results)
     lines += ["## 概览 (按可操作性排序)", "",
@@ -3809,7 +3813,6 @@ def render_close(results, regime, ivdf, now_et, insider_meta=None,
         ""]
     lines += insider_block(results, insider_meta)
     lines += revisions_block(results, revisions_meta)
-    lines += shortside_block(results, shortside_meta, now_et.date())
     lines += mnav_block(mnav_meta)
 
     detail = [r for r in ordered
@@ -3994,14 +3997,15 @@ def render_open(results, regime, now_et, s: dict, insider_meta=None,
     lines += alerts or [("- 无异动 (gap/波动/价值区/财报/内部人买入 均未触发)"
                          if insider_meta is not None else
                          "- 无异动 (gap/波动/价值区/财报 均未触发)")]
+    # 空头面紧跟市场状态 (这里市场状态下面就是异动列表, 不能插在两者之间, 否则异动会
+    # 落进空头面的标题下)。和修正段一样单独成节、不进异动列表
+    ss = shortside_block(results, shortside_meta, now_et.date())
+    if ss:
+        lines += [""] + ss[:-1]
     # 修正段单独成节, 不进异动列表 —— 每天都有内容, 混进去"无异动"就永远不出了
     rev = revisions_block(results, revisions_meta)
     if rev:
         lines += [""] + rev[:-1]
-    # 空头面同理 (半月一期的数, 天天都有内容)
-    ss = shortside_block(results, shortside_meta, now_et.date())
-    if ss:
-        lines += [""] + ss[:-1]
     # mNAV 段同理: 每天都有内容, 单独成节
     mn = mnav_block(mnav_meta)
     if mn:

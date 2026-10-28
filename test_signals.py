@@ -6431,8 +6431,13 @@ _SS_TODAY = date(2026, 10, 28)
 _SS_S = dict(sc.SETTINGS_DEFAULTS)
 
 
+# 分母 (股本): SOFI 用 10/28 Yahoo 的流通股; QQQ/GLD 用资产 ÷ 净值
+_SS_SHARES = {"SOFI": 1_276_000_000, "QQQ": 700_700_000, "COHR": 195_000_000,
+              "BYND": 300_000_000, "GLD": 384_000_000}
+
+
 def _ss_meta(symbols=("SOFI", "QQQ", "COHR"), ibkr_fail=None, finra_fail=None,
-             recs=None, text=_IBKR_TXT):
+             recs=None, text=_IBKR_TXT, shares_fail=None):
     def ibkr(timeout):
         if ibkr_fail:
             raise ibkr_fail
@@ -6442,7 +6447,13 @@ def _ss_meta(symbols=("SOFI", "QQQ", "COHR"), ibkr_fail=None, finra_fail=None,
         if finra_fail:
             raise finra_fail
         return list(_FINRA_RECS if recs is None else recs)
-    return _SS_RUN(list(symbols), _SS_TODAY, ibkr=ibkr, finra=finra)
+
+    def shares(symbols):
+        if shares_fail:
+            raise shares_fail
+        return {s_: {"shares": _SS_SHARES[s_], "basis": "float"}
+                for s_ in symbols if s_ in _SS_SHARES}
+    return _SS_RUN(list(symbols), _SS_TODAY, ibkr=ibkr, finra=finra, shares=shares)
 
 
 def _ss_items(meta, kinds=None):
@@ -6567,6 +6578,8 @@ class TestShortsideFlags(unittest.TestCase):
         self.assertIn("(FINRA 10-15)", ss.si_flag({**v, "chg": 35.0}, _SS_S))
         self.assertIsNone(ss.si_flag({**v, "chg": -40.0}, _SS_S))   # 空头在减不报
         self.assertIsNone(ss.si_flag(None, _SS_S))
+        self.assertIsNone(ss.si_flag(v, _SS_S, pct=14.9))
+        self.assertTrue(ss.si_flag(v, _SS_S, pct=17.2).startswith("空头占流通股 17.2% (FINRA 10-15)"))
 
     def test_carry_line(self):
         self.assertIn("不是难借券", ss.carry_line(self.rows["SOFI"], _SS_S))
@@ -6575,34 +6588,62 @@ class TestShortsideFlags(unittest.TestCase):
         self.assertIn("没有这个代码", ss.carry_line(None, _SS_S))
 
 
+class TestShortsideShares(unittest.TestCase):
+    def test_basis_picks_float_out_or_aum(self):
+        self.assertEqual(ss.shares_basis({"quoteType": "EQUITY", "sharesOutstanding": 1_292e6,
+                                          "floatShares": 1_276e6}), (1_276e6, "float"))
+        # GOOG: 流通股 108.8 亿含 A 类, 总股本 55.3 亿只算 C 类 -> 用总股本
+        self.assertEqual(ss.shares_basis({"quoteType": "EQUITY", "sharesOutstanding": 5_527e6,
+                                          "floatShares": 10_880e6}), (5_527e6, "out"))
+        self.assertEqual(ss.shares_basis({"quoteType": "EQUITY", "sharesOutstanding": 404e6}),
+                         (404e6, "out"))
+        # ETF: sharesOutstanding 是旧数, 用资产 ÷ 净值
+        n, basis = ss.shares_basis({"quoteType": "ETF", "sharesOutstanding": 393e6,
+                                    "totalAssets": 498_946e6, "navPrice": 712.04})
+        self.assertEqual(basis, "aum")
+        self.assertAlmostEqual(n / 1e6, 700.7, places=1)
+        self.assertEqual(ss.shares_basis({"quoteType": "ETF", "sharesOutstanding": 393e6}),
+                         (None, None))
+        self.assertEqual(ss.shares_basis({}), (None, None))
+
+    def test_fetch_isolates_failures(self):
+        class Tk:
+            def __init__(self, sym):
+                if sym == "BAD":
+                    raise ConnectionError("Too Many Requests")
+                self.info = {"quoteType": "EQUITY", "sharesOutstanding": 100e6} \
+                    if sym == "OK" else {}
+        got = ss.fetch_shares(["OK", "BAD", "EMPTY"], workers=2, ticker_factory=Tk)
+        self.assertEqual(got, {"OK": {"shares": 100e6, "basis": "out"}, "BAD": None, "EMPTY": None})
+
+    def test_pct_and_failure_isolated_in_run(self):
+        meta = _ss_meta()
+        self.assertAlmostEqual(ss.si_pct(meta["by_symbol"]["SOFI"]), 219.64 / 1276 * 100, places=3)
+        meta = _ss_meta(shares_fail=RuntimeError("yfinance down"))
+        self.assertEqual(meta["errors"], {"shares": "RuntimeError: yfinance down"})
+        self.assertIsNone(ss.si_pct(meta["by_symbol"]["SOFI"]))
+        self.assertEqual(meta["by_symbol"]["SOFI"]["si"]["dtc"], 4.75)   # 另外两个源照常
+
+
 class TestShortsideBlock(unittest.TestCase):
     def _block(self, meta, kinds=None, today=_SS_TODAY):
         return ss.report_block(_ss_items(meta, kinds), meta, _SS_S, today)
 
-    def test_all_calm(self):
+    HEAD = "| 标的 | 空头占流通股 | 回补天数 | 较上期 | 借券费 | 可借 |"
+
+    def test_table_rows_stocks_by_pct_then_funds(self):
         lines = self._block(_ss_meta())
         self.assertEqual(lines[0], "## 空头面 (FINRA 空头股数 / IBKR 借券费)")
-        self.assertIn("- 回补天数 (FINRA 10-15 结算, 括号内较上期): "
-                      "SOFI 4.8 (+2%) · COHR 1.2 (-18%)", lines)
-        self.assertIn("- ETF/指数: QQQ 2.4 (+16%) —— 含申赎和对冲盘, 一期变动比个股大得多",
-                      lines)
-        self.assertIn("- 借券费 (IBKR 10-28 01:18 ET): 0.28–0.33%, 都是普通券; "
-                      "可借最少 330万股 (COHR)", lines)
-        self.assertFalse([l for l in lines if "⚠️" in l and l.startswith("-")])
-        self.assertIn("IBKR 借券文件里没有: QQQ (多半借不到)", "\n".join(lines))
-
-    def test_funds_only_line_carries_the_date(self):
-        lines = self._block(_ss_meta(symbols=("QQQ",)))
-        self.assertIn("- 回补天数 · ETF/指数 (FINRA 10-15 结算, 括号内较上期): QQQ 2.4 (+16%)"
-                      " —— 含申赎和对冲盘, 一期变动比个股大得多", lines)
-
-    def test_fee_range_collapses_after_rounding(self):
-        # 10/28 冒烟: QQQ 0.3285 / SOFI 0.3325 印成了 "0.33–0.33%"
-        text = _IBKR_TXT.replace("COHR|USD|COHERENT CORP|584127832|XXXXXXXG1076|3.6010|0.2790",
-                                 "COHR|USD|COHERENT CORP|584127832|XXXXXXXG1076|3.6010|0.3285")
-        lines = self._block(_ss_meta(symbols=("SOFI", "COHR"), text=text))
-        self.assertIn("- 借券费 (IBKR 10-28 01:18 ET): 0.33%, 都是普通券; "
-                      "可借最少 330万股 (COHR)", lines)
+        self.assertIn("- FINRA 10-15 结算 (每月两期) · IBKR 借券 10-28 01:18 ET", lines)
+        i = lines.index(self.HEAD)
+        self.assertEqual(lines[i + 2:i + 5], [
+            "| SOFI | 17.2% | 4.8 | +2% | 0.33% | >1000万 |",
+            "| COHR | 4.6% | 1.2 | -18% | 0.28% | 330万 |",
+            "| QQQ (指数) | 11.7% | 2.4 | +16% | — | — |"])     # ETF/指数排在个股后面
+        text = "\n".join(lines)
+        self.assertIn("- ⚠️ **SOFI** 空头占流通股 17.2% (FINRA 10-15)", text)
+        self.assertNotIn("**QQQ**", text)                  # 指数不出旗标
+        self.assertIn("IBKR 借券文件里没有: QQQ (多半借不到)", text)
 
     def test_flags_htb_and_crowded_stock_but_not_etf(self):
         recs = _FINRA_RECS + [_finra_rec("BYND", "2026-10-15", 90_000_000, 60_000_000, 6.1),
@@ -6610,17 +6651,26 @@ class TestShortsideBlock(unittest.TestCase):
         meta = _ss_meta(symbols=("SOFI", "BYND", "GLD"), recs=recs)
         text = "\n".join(self._block(meta))
         self.assertIn("- ⚠️ **BYND** 难借券: 借券费 24.6%、可借只剩 1万股", text)
-        self.assertIn("- ⚠️ **BYND** 回补 6.1 天、空头较上期 +50% (FINRA 10-15)", text)
-        self.assertIn("GLD 2.1 (+72%)", text)       # ETF 照列数
-        self.assertNotIn("**GLD**", text)           # 但不出旗标
-        self.assertIn("- 借券费 (IBKR 10-28 01:18 ET): 其余 0.33%, 都是普通券", text)
+        self.assertIn("- ⚠️ **BYND** 空头占流通股 30.0%、回补 6.1 天、空头较上期 +50% "
+                      "(FINRA 10-15)", text)
+        self.assertIn("| GLD (ETF) | 4.0% | 2.1 | +72% | — | — |", text)   # ETF 照列数
+        self.assertNotIn("**GLD**", text)                                   # 但不出旗标
 
     def test_errors_and_missing_records(self):
-        meta = _ss_meta(ibkr_fail=TimeoutError("timed out"), recs=_FINRA_RECS[:2])
+        meta = _ss_meta(ibkr_fail=TimeoutError("timed out"), recs=_FINRA_RECS[:2],
+                        shares_fail=RuntimeError("yfinance down"))
         text = "\n".join(self._block(meta))
         self.assertIn("- ⚠️ IBKR 借券费取不到 (TimeoutError: timed out) —— 只缺这一项", text)
+        self.assertIn("- ⚠️ Yahoo 股本 (空头占流通股那一列)取不到 (RuntimeError: yfinance down)", text)
         self.assertIn("- FINRA 没有记录: QQQ, COHR", text)
+        self.assertIn("| SOFI | — | 4.8 | +2% | — | — |", text)
         self.assertNotIn("借券文件里没有", text)     # 文件没取到 ≠ 文件里没有
+
+    def test_nothing_fetched_has_no_table(self):
+        meta = _ss_meta(ibkr_fail=TimeoutError("t"), finra_fail=TimeoutError("t"))
+        lines = self._block(meta)
+        self.assertNotIn(self.HEAD, lines)
+        self.assertEqual(lines[-2:], [ss.NOTE, ""])
 
     def test_stale_sources_warn(self):
         old = [_finra_rec("SOFI", "2026-08-29", 1, 1, 1.0)]
@@ -6764,8 +6814,11 @@ class TestShortsideMain(unittest.TestCase):
         self.assertEqual(self.asked, [["SOFI", "QQQ"]])     # ETF/指数也查 (只是不出旗标)
         text = self._report(f"{self._today()}-close.md")
         self.assertIn("## 空头面", text)
-        self.assertIn("SOFI 4.8 (+2%)", text)
-        self.assertIn("- ETF/指数: QQQ 2.4 (+16%)", text)
+        self.assertIn("| SOFI | 17.2% | 4.8 | +2% | 0.33% | >1000万 |", text)
+        self.assertIn("| QQQ (指数) | 11.7% | 2.4 | +16% | — | — |", text)
+        # 空头面紧跟市场状态, 在概览表前面 (10/28 用户要的位置)
+        self.assertLess(text.index("## 市场状态"), text.index("## 空头面"))
+        self.assertLess(text.index("## 空头面"), text.index("## 概览"))
         rows = self._snap().read_text(encoding="utf-8").splitlines()[1:]
         self.assertEqual([r_.split(",")[:2] for r_ in rows], [[self._today(), "SOFI"]])
 
@@ -6776,7 +6829,10 @@ class TestShortsideMain(unittest.TestCase):
 
     def test_open_shows_but_never_snapshots(self):
         self.assertEqual(self._main("--mode", "open"), 0)
-        self.assertIn("## 空头面", self._report(f"{self._today()}-open.md"))
+        text = self._report(f"{self._today()}-open.md")
+        self.assertIn("## 空头面", text)
+        # 开盘报告里市场状态下面紧跟着异动列表 —— 空头面排在它后面, 异动不能落进空头面标题下
+        self.assertLess(text.index("无异动"), text.index("## 空头面"))
         self.assertFalse(self._snap().exists())
 
     def test_no_shortside_flag(self):
