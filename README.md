@@ -66,8 +66,10 @@ launchd 每天在 8 个固定布里斯班时点触发 (23:45/00:45/01:30 开盘�
 .venv/bin/python scanner.py --mode close --force --no-insider   # 不拉内部人数据
 .venv/bin/python scanner.py --mode close --force --no-revisions # 不拉分析师预期修正
 .venv/bin/python scanner.py --mode close --force --no-mnav      # 不拉 StrategyTracker mNAV
+.venv/bin/python scanner.py --mode close --force --no-shortside # 不拉 FINRA 空头 / IBKR 借券费
 .venv/bin/python insider.py SOFI HOOD                          # 单看内部人买入 (也用来预热缓存)
 .venv/bin/python revisions.py MCD NVDA                         # 单看分析师预期修正 (不写快照)
+.venv/bin/python shortside.py SOFI QQQ                         # 单看空头面 (不写快照)
 .venv/bin/python mnav.py                                       # 单看 BTC 财库 mNAV 段 (不写历史)
 .venv/bin/python research/mnav_backtest.py                     # mNAV 回测全表 (联网 ~20MB)
 .venv/bin/python scanner.py --mode insider --force             # 晚间内部人检查 (窗口外强制跑)
@@ -426,6 +428,46 @@ watchlist 里的个股 (ETF/指数跳过) 出现**公开市场买入**时提示�
   实测 17 秒), 发信失败也照存。这一批的缺口记进 `data/eps_revisions_status.json`,
   由下一份报告出一行 ⚠️ (6 天没跑也报)。池子是 10/12 定的固定名单, 以后指数调样
   不跟着改。DELL / GE / LIN / PANW / UBER 在 Yahoo 没有 Normalized 口径。
+
+## 空头面 (FINRA 空头股数 / IBKR 借券费, 2026-10)
+
+开盘/尾盘报告各一段"空头面", 全部标的 (含 ETF/指数) 两行。**只做提示, 未经回测,
+不进状态机、不当门控、不改任何票据**:
+
+```
+- 回补天数 (FINRA 10-15 结算, 括号内较上期): SOFI 4.8 (+2%) · ISRG 4.0 (-1%) · AAPL 3.7 (+9%) · … · GLD 2.1 (+72%) · … · DRAM 1.0 (+31%)
+- 借券费 (IBKR 10-28 01:18 ET): 0.25–0.43%, 都是普通券; 可借最少 370万股 (COHR)
+```
+
+- **回补天数** = 空头股数 ÷ 日均成交量, 从高到低排; 括号内 = 空头股数较上一期
+  (拆股的那期写"拆股", 不算变化率)。不算占流通股比例: yfinance 给 ETF 的份额是
+  旧数 (10/25 QQQ 给 3.93 亿, 资产 ÷ 净值约 7.08 亿)。FINRA 每月两期 (月中、月底
+  结算日), 结算日后约 8 个交易日公布 —— 这一行半个月才变一次。
+- **借券费** = IBKR 给自家客户的年化费率 (普通券 0.25%) 和可借股数。没亮旗标的
+  汇总成一个区间; 全部 ≤ 0.5% 时写"都是普通券"。
+- **⚠️ 旗标** (阈值是经验值, 在 `[settings]` 里改):
+  - 难借券: 费率 ≥ `short_fee_warn` (5%) 或可借 < `short_avail_warn` (10 万股) ——
+    报告段一行, 标的详情里再加一行。期权按借券费压低了 forward, put 贵、call 便宜,
+    卖 put 的高年化里有一块是借券补偿, 不是白拿的波动率溢价。
+  - 空头拥挤 (**只给个股**): 回补 ≥ `short_dtc_warn` (5 天) 或空头较上期 ≥
+    `short_chg_warn` (+30%)。ETF/指数的空头含 AP 申赎和对冲盘, 只列数不出旗标。
+  - 依据: 借券费高的票后续收益明显偏差 (Drechsler & Drechsler 2014 等), 回补天数
+    高的也偏差 (Hong 等的 days-to-cover 研究) —— 都是全市场横截面的结论, 对单只
+    票噪声很大。10/28 watchlist 18 只全是普通券 (0.25–0.43%)、回补最高 SOFI 4.75
+    天, 一只都不亮; 全美费率 ≥ 10% 的有 3,666 只, 多是小票和杠杆单股 ETF。
+- **接在"持有成本异常"后面**: forward 反解现货与日线收盘背离 > 1.5% 时, 原来的提示
+  只能说"常见于难借券, 下单前核对券商的借券费率"。现在下一行直接给 IBKR 的费率:
+  难借券 → "背离来自借券成本"; 普通券 → "不是难借券, 这次背离另有原因 (股息/除权/
+  报价), 先核对再下单"; 文件里没有这个代码 → "多半借不到"。IBKR 没取到时原句不动。
+- **快照**: IBKR 只给当下、没有历史, 定时尾盘扫描每天把 watchlist 的费率追加一行到
+  `data/borrow_history.csv` (手动跑不写)。FINRA 有历史, 不用存。
+- **取数** (两个请求, 各自失败互不影响, 失败只出一行 ⚠️):
+  - FINRA `consolidatedShortInterest` 公开 API, 不用 key, 一次 POST 拿全部代码。按代码
+    过滤时**不能带排序** (报错要求 settlementDate 用 EQUAL), 所以用 `domainFilters` +
+    近 45 天的 `dateRangeFilters`, 在本地取最新一期; 没有匹配记录时回**空响应体**。
+  - IBKR 公共 FTP `ftp://shortstock:@ftp2.interactivebrokers.com/usa.txt` (约 1.8MB,
+    2 万行, 几分钟一更; 首行时间是美东)。**主机是 ftp2** —— ftp3 在 2026-10-28 本机和
+    droplet 都连不上。按表头列名取值, 表头缺列直接报错, 不会静默读成空表。
 
 ## BTC 财库 mNAV (StrategyTracker, 2026-10)
 
@@ -861,7 +903,7 @@ LEAP 段除了聚合数还给**逐笔明细**: 标的 / 入手日期 / 到期日
   不同到期全印 17.2528), 曲线形态只用月度合约。
 - 25Δ RR 用 Yahoo 延迟报价的 mid 反解 IV, 单日读数仍有 ~1 pt 漂移
 - 股票日线与期权链来自不同 Yahoo 端点, 可能不同步。**日线 bar 的日期落后于期权链 `max(lastTradeDate)` 的日期 = 硬拦** (⏸ 停出该标的所有票): 收盘价、右侧状态与票据全都建立在过期价格上。判据用日期而非价差 —— 难借券的高借券费会让 forward 合法地低于现货数个百分点 (`F = S·e^((r-q-b)T)`), 价差判据分不开"陈旧"和"难借", 硬拦会永久误伤那些标的
-- 日线**不**陈旧却仍有大幅 forward/现货背离 (超 `rr_spot_gap_warn` = 1.5%; 35 DTE 的正常持有成本约 0.3%) → ⚠️ 提示持有成本异常, 常见于难借券: 做空拥挤的信号, 且卖 put 的净收益会被借券成本侵蚀
+- 日线**不**陈旧却仍有大幅 forward/现货背离 (超 `rr_spot_gap_warn` = 1.5%; 35 DTE 的正常持有成本约 0.3%) → ⚠️ 提示持有成本异常, 常见于难借券: 做空拥挤的信号, 且卖 put 的净收益会被借券成本侵蚀。下一行接 IBKR 的实际借券费, 说清背离是不是借券造成的 (见「空头面」)
   (旗标已设 −1.0 pts 噪声地板) — 倒挂旗标亮了先在
   moomoo/IBKR vol lab 实查 risk reversal 再行动; 链稀疏 (|Δ−0.25|>0.10
   无行权价) 时宁可无读数也不硬凑。

@@ -58,6 +58,7 @@ import yfinance as yf
 import insider
 import mnav
 import revisions
+import shortside
 
 # ETFs have no earnings calendar — silence yfinance's 404 chatter
 import logging
@@ -261,6 +262,16 @@ SETTINGS_DEFAULTS = {
     # rebate 可能触发, 但那种标的本来也值得看一眼 (2026-09-04 实测: 陈旧
     # 一天的日线造成 2.0%~16.5% 的差, 3% 会漏掉 MSFT 这档)
     "rr_spot_gap_warn": 0.015,
+    # 空头面 (shortside.py, 2026-10-28): FINRA 空头股数 + IBKR 借券费, 只做提示。
+    # 阈值是经验值, 未回测: IBKR 普通券 0.25%, >= 5% 算难借券; 可借 < 10 万股算借
+    # 不到 (10/28 全美最紧的几只里 QNT 还剩 20 万、IONQ 25 万, 都不亮); 回补天数
+    # >= 5 天、空头较上期 >= +30% 只给个股亮旗标 (ETF 的空头含申赎和对冲盘)。
+    # 10/28 watchlist 回补最高 SOFI 4.75 天, 一只都不亮
+    "short_fee_warn": 5.0,
+    "short_avail_warn": 100000,
+    "short_dtc_warn": 5.0,
+    "short_chg_warn": 30.0,
+    "short_timeout_s": 30,
     # zone 生命周期腐烂检测 (2026-09-05 zone 评审: 手工 zone 会烂 —
     # 4/15 旧锚在三周~一个月内作废而扫描器全程无感)
     "zone_asof_stale_days": 60,      # zone_asof 距今超此天数 = 超龄复核提醒
@@ -2825,8 +2836,9 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
         # 侵蚀。陈旧那条路已经在上面硬拦掉了, 到这里的都是真背离
         if stale_msg is None and gap is not None \
                 and abs(gap) >= s["rr_spot_gap_warn"] * 100:
+            # 前缀是 attach_shortside 找这条的钩子: 拿到 IBKR 费率后在它后面接一行
             r["notes"].append(
-                f"期权 forward 反解现货 ~{rr['fwd_spot']:.2f} vs 日线收盘 "
+                f"{CARRY_NOTE_PREFIX} ~{rr['fwd_spot']:.2f} vs 日线收盘 "
                 f"{tech['close']:.2f} ({gap:+.1f}%), 而日线并不陈旧 — 持有成本"
                 "异常, 常见于难借券的高借券费: 做空拥挤的信号, 且卖 put 的净"
                 "收益会被借券成本侵蚀, 下单前核对券商的借券费率")
@@ -3250,6 +3262,68 @@ def snapshot_universe(meta, tickers, d: str, workers: int = 2) -> None:
             revisions.write_status(status, d, extra, {}, crash=why)
         except OSError:
             pass
+
+
+# --------------------------------------------------------------------------
+# 空头面 (shortside.py) — FINRA 空头股数 + IBKR 借券费, 只做提示, 不进状态机/门控/票据
+# --------------------------------------------------------------------------
+
+# analyze_ticker 的"持有成本异常"提示以此开头; attach_shortside 按它找到那一条,
+# 在后面接上 IBKR 的实际借券费 (那条提示原本只能说"下单前核对券商的借券费率")
+CARRY_NOTE_PREFIX = "期权 forward 反解现货"
+
+
+def attach_shortside(results, s: dict, today: date) -> dict:
+    """给每个结果挂上 r["shortside"] = {"borrow", "si"}; 难借券的在详情里加一行 ⚠️,
+    "持有成本异常"那条后面接一行实际费率; 返回 meta (报告段用)。取数整段包在 try
+    里, 同 attach_insider: 附加信息自己出 bug 也只能降级成报告里一行 ⚠️。"""
+    syms = [r["symbol"] for r in results]
+    try:
+        meta = shortside.run(syms, today, timeout=s["short_timeout_s"])
+    except Exception as e:      # noqa: BLE001
+        why = f"空头面模块异常: {type(e).__name__}: {e}"
+        meta = {"by_symbol": {s_: {"borrow": None, "si": None} for s_ in syms},
+                "borrow_asof": None, "si_date": None,
+                "errors": {"borrow": why, "si": why}}
+    meta["settings"] = s
+    for r in results:
+        info = meta["by_symbol"].get(r["symbol"]) or {"borrow": None, "si": None}
+        r["shortside"] = info
+        notes = r.setdefault("notes", [])
+        if "borrow" not in meta["errors"]:
+            carry = [i for i, n in enumerate(notes) if n.startswith(CARRY_NOTE_PREFIX)]
+            if carry:
+                notes.insert(carry[0] + 1, shortside.carry_line(info["borrow"], s))
+        why = shortside.borrow_flag(info["borrow"], s)
+        if why:
+            notes.append(shortside.borrow_note(info["borrow"], why))
+    return meta
+
+
+def shortside_block(results, meta, today: date | None = None) -> list[str]:
+    """开盘/尾盘报告的空头面段。meta=None (--no-shortside) 整段不出。"""
+    if meta is None:
+        return []
+    items = [(r["symbol"], (r.get("cfg") or {}).get("kind", "stock"), r.get("shortside"))
+             for r in results]
+    return shortside.report_block(items, meta, meta["settings"],
+                                  today or datetime.now(ET).date())
+
+
+def snapshot_shortside(meta, d: str) -> None:
+    """定时尾盘扫描把当天的借券费存一行 (IBKR 只给当下、没有历史; FINRA 有历史
+    不用存)。写不进去只告警 —— 少一天快照不值得让扫描失败。"""
+    if meta is None or "borrow" in meta["errors"]:
+        return
+    try:
+        n = shortside.append_snapshot(
+            shortside.snapshot_rows(meta["by_symbol"], d, meta.get("borrow_asof")),
+            DATA / shortside.SNAPSHOT_NAME)
+    except Exception as e:      # noqa: BLE001
+        print(f"  shortside: 快照写入失败 ({type(e).__name__}: {e})", file=sys.stderr)
+        return
+    if n:
+        print(f"  shortside: +{n} 行借券快照 -> {shortside.SNAPSHOT_NAME}")
 
 
 # --------------------------------------------------------------------------
@@ -3688,7 +3762,7 @@ def zone_position(close: float, zone) -> str:
 
 
 def render_close(results, regime, ivdf, now_et, insider_meta=None,
-                 revisions_meta=None, mnav_meta=None) -> str:
+                 revisions_meta=None, mnav_meta=None, shortside_meta=None) -> str:
     d = now_et.strftime("%Y-%m-%d")
     lines = [f"# 左右侧 watchlist 扫描 — {d} 尾盘 "
              f"({now_et:%H:%M} ET)", ""]
@@ -3735,6 +3809,7 @@ def render_close(results, regime, ivdf, now_et, insider_meta=None,
         ""]
     lines += insider_block(results, insider_meta)
     lines += revisions_block(results, revisions_meta)
+    lines += shortside_block(results, shortside_meta, now_et.date())
     lines += mnav_block(mnav_meta)
 
     detail = [r for r in ordered
@@ -3873,7 +3948,7 @@ def render_close(results, regime, ivdf, now_et, insider_meta=None,
 
 
 def render_open(results, regime, now_et, s: dict, insider_meta=None,
-                revisions_meta=None, mnav_meta=None) -> str:
+                revisions_meta=None, mnav_meta=None, shortside_meta=None) -> str:
     d = now_et.strftime("%Y-%m-%d")
     lines = [f"# 开盘异动 — {d} ({now_et:%H:%M} ET)", ""]
     lines += regime_block(regime)
@@ -3923,6 +3998,10 @@ def render_open(results, regime, now_et, s: dict, insider_meta=None,
     rev = revisions_block(results, revisions_meta)
     if rev:
         lines += [""] + rev[:-1]
+    # 空头面同理 (半月一期的数, 天天都有内容)
+    ss = shortside_block(results, shortside_meta, now_et.date())
+    if ss:
+        lines += [""] + ss[:-1]
     # mNAV 段同理: 每天都有内容, 单独成节
     mn = mnav_block(mnav_meta)
     if mn:
@@ -4383,6 +4462,8 @@ def main() -> int:
                     help="skip Yahoo analyst EPS-revision fetch")
     ap.add_argument("--no-mnav", action="store_true",
                     help="skip StrategyTracker mNAV fetch ([mnav.*] in watchlist.toml)")
+    ap.add_argument("--no-shortside", action="store_true",
+                    help="skip FINRA short interest + IBKR borrow-fee fetch")
     ap.add_argument("--workers", type=int, default=4)
     args = ap.parse_args()
 
@@ -4475,6 +4556,17 @@ def main() -> int:
               f" (Normalized {sum(1 for v in by if v.get('normalized'))}"
               + (f", 退回公开接口 {fallback}" if fallback else "") + ")")
 
+    # 空头面: 两个模式都拉 (报告都有这一段), 一共两个请求 —— FINRA 一次 POST 拿全部
+    # 代码, IBKR 一个 1.8MB 的 FTP 文件。要在渲染之前: 详情里的提示行是这里加的
+    shortside_meta = None
+    if not args.no_shortside:
+        shortside_meta = attach_shortside(results, settings, now_et.date())
+        errs = shortside_meta["errors"]
+        print(f"  shortside: FINRA {shortside_meta['si_date'] or '—'}"
+              + (f" (失败: {errs['si']})" if "si" in errs else "")
+              + f" · IBKR {shortside_meta['borrow_asof'] or '—'}"
+              + (f" (失败: {errs['borrow']})" if "borrow" in errs else ""))
+
     # BTC 财库 mNAV: 两个模式都出 (开盘看的是前一日收盘的读数), 只在配了 [mnav.*] 时
     mnav_meta = None
     if not args.no_mnav:
@@ -4498,6 +4590,7 @@ def main() -> int:
             # --force/--tickers 不写 (同一天手工跑的会占掉定时那一行)
             if revisions_meta is not None:
                 snapshot_revisions(revisions_meta, d)
+            snapshot_shortside(shortside_meta, d)
             snapshot_mnav(mnav_meta, d)
             # persist state transitions (close-basis only, per the playbook)
             for r in results:
@@ -4521,10 +4614,10 @@ def main() -> int:
             if _n:
                 print(f"  journal: +{_n} 条推荐记录 -> {JOURNAL.name}")
         report = render_close(results, regime, ivdf, now_et, insider_meta,
-                              revisions_meta, mnav_meta)
+                              revisions_meta, mnav_meta, shortside_meta)
     else:
         report = render_open(results, regime, now_et, settings, insider_meta,
-                             revisions_meta, mnav_meta)
+                             revisions_meta, mnav_meta, shortside_meta)
 
     REPORTS.mkdir(exist_ok=True)
     report_path.write_text(report + "\n", encoding="utf-8")
