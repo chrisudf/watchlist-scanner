@@ -6613,11 +6613,25 @@ class TestShortsideFlags(unittest.TestCase):
         self.assertIsNone(ss.si_flag(v, _SS_S, pct=14.9))
         self.assertTrue(ss.si_flag(v, _SS_S, pct=17.2).startswith("空头占流通股 17.2% (FINRA 10-15)"))
 
-    def test_carry_line(self):
-        self.assertIn("不是难借券", ss.carry_line(self.rows["SOFI"], _SS_S))
-        self.assertIn("可借 >1000万股", ss.carry_line(self.rows["SOFI"], _SS_S))
-        self.assertIn("背离来自借券成本", ss.carry_line(self.rows["BYND"], _SS_S))
-        self.assertIn("没有这个代码", ss.carry_line(None, _SS_S))
+    def test_carry_line_checks_direction_and_tenor(self):
+        # 费率过了难借券阈值不能归因: 借券只会压低 forward, 还要按期限折算 (PR #27 评审)
+        sofi, bynd = self.rows["SOFI"], self.rows["BYND"]
+        self.assertEqual(ss.carry_line(sofi), "↳ IBKR 借券费 0.33%, 可借 >1000万股")   # 没有价差就不归因
+        self.assertIn("按 35 天折算借券成本只有约 -0.03%, 不到背离 -5.0% 的一半",
+                      ss.carry_line(sofi, -5.0, 35))
+        # 5% 年化 (刚过阈值) 在 35 天只有 -0.48%, 解释不了触发提示的 1.5%
+        self.assertIn("只有约 -0.48%, 不到背离 -1.5% 的一半: 主要原因不是借券",
+                      ss.carry_line({**sofi, "fee": 5.0}, -1.5, 35))
+        # BYND 24.6% 年化 35 天约 -2.36%, 占背离 -3.0% 的一大半
+        self.assertIn("约 -2.36%, 占了背离 -3.0% 的一半以上: 背离主要来自借券成本",
+                      ss.carry_line(bynd, -3.0, 35))
+        # 反解现货高于收盘: 跟借券无关, 哪怕是难借券
+        up = ss.carry_line(bynd, 2.0, 35)
+        self.assertIn("反解现货高于收盘, 借券成本只会压低 forward", up)
+        self.assertNotIn("主要来自借券成本", up)
+        self.assertIn("背离可能就是做空受限", ss.carry_line(None, -2.0, 35))
+        self.assertIn("做空受限只会压低 forward", ss.carry_line(None, 2.0, 35))
+        self.assertIn("没有这个代码", ss.carry_line(None))
 
 
 class TestShortsideShares(unittest.TestCase):
@@ -6686,8 +6700,24 @@ class TestShortsideBaseline(unittest.TestCase):
         self.assertEqual(b["n"], 24)
         self.assertAlmostEqual(b["median"], 11.15)        # 中位 111.5 股 ÷ 1000 股
         self.assertEqual(b["rank"], 100)
+        self.assertTrue(b["new_high"])
         flag = ss.si_flag(info["si"], _SS_S, ss.si_pct(info), b)
         self.assertIn("空头创一年新高 (一年中位 11.2%)", flag)
+
+    def test_new_high_must_beat_every_prior_period(self):
+        # 分位 100 也包括持平: 连续不变、全是 0、跟此前最高持平都不算新高 (PR #27 评审)
+        for sis in ([100] * 24, [0] * 24, [120] + [100] * 22 + [120]):
+            info = self._info(sis)
+            b = ss.si_baseline(info)
+            self.assertEqual(b["rank"], 100)                # 显示照旧
+            self.assertFalse(b["new_high"], sis[-3:])
+            self.assertIsNone(ss.si_flag(info["si"], _SS_S, ss.si_pct(info), b), sis[-3:])
+        self.assertTrue(ss.si_baseline(self._info([120] + [100] * 22 + [121]))["new_high"])
+        meta = {"si_date": "2026-10-15", "borrow_asof": None, "errors": {}}
+        text = "\n".join(ss.report_block([("XX", "stock", self._info([0] * 24))],
+                                         meta, _SS_S, _SS_TODAY))
+        self.assertIn("| XX | 0.0% | 0.0% | 100 |", text)
+        self.assertNotIn("**XX**", text)                   # 全是 0 不报空头拥挤
 
     def test_window_is_one_year(self):
         # 36 期, 只算最近 24 期; 早年的极端值不进中位数
@@ -6772,6 +6802,24 @@ class TestShortsideBlock(unittest.TestCase):
         self.assertNotIn(self.HEAD, lines)
         self.assertEqual(lines[-2:], [ss.NOTE, ""])
 
+    def test_older_settlement_is_dated_and_checked_per_symbol(self):
+        # 表头是所有标的里最新的结算日; 单只停在旧一期要注明自己的日期、单独查断更 (PR #27 评审)
+        recs = _FINRA_RECS + [_finra_rec("XYZ", "2026-08-29", 5_000_000, 5_000_000, 2.0),
+                              _finra_rec("GLD", "2026-09-30", 15_390_000, 8_960_000, 2.08)]
+        lines = self._block(_ss_meta(symbols=("SOFI", "XYZ", "GLD"), recs=recs))
+        self.assertIn("- FINRA 10-15 结算 (每月两期) · IBKR 借券 10-28 01:18 ET", lines)
+        self.assertIn("| SOFI | 17.2% | — | — | 4.8 | +2% | 0.33% | >1000万 |", lines)  # 同一期不注
+        self.assertIn("| XYZ (08-29 结算) | — | — | — | 2.0 | +0% | — | — |", lines)
+        self.assertIn("| GLD (ETF, 09-30 结算) | 4.0% | — | — | 2.1 | +72% | — | — |", lines)
+        text = "\n".join(lines)
+        self.assertIn("- ⚠️ **XYZ** 的 FINRA 最新一期是 2026-08-29, 超过 35 天", text)
+        self.assertNotIn("**GLD** 的 FINRA", text)          # 28 天, 没过 35 天
+        self.assertNotIn("FINRA 最新一期是 2026-10-15", text)   # 整体没断更
+        # 跨年时写全日期, 免得跟表头的 MM-DD 撞上
+        recs = _FINRA_RECS + [_finra_rec("XYZ", "2025-10-15", 5_000_000, 5_000_000, 2.0)]
+        lines = self._block(_ss_meta(symbols=("SOFI", "XYZ"), recs=recs))
+        self.assertIn("| XYZ (2025-10-15 结算) | — | — | — | 2.0 | +0% | — | — |", lines)
+
     def test_stale_sources_warn(self):
         old = [_finra_rec("SOFI", "2026-08-29", 1, 1, 1.0)]
         text = "\n".join(self._block(_ss_meta(symbols=("SOFI",), recs=old,
@@ -6795,10 +6843,11 @@ class TestShortsideAttach(unittest.TestCase):
 
     def test_carry_note_gets_actual_fee_right_after_it(self):
         r = self._r("SOFI", ["先来的一条", self.CARRY, "后面的一条"])
+        r["rr25"] = {"spot_gap_pct": -5.0, "dte": 35}
         self._attach([r])
         self.assertEqual(r["notes"][1], self.CARRY)
         self.assertTrue(r["notes"][2].startswith("↳ IBKR 借券费 0.33%"))
-        self.assertIn("不是难借券", r["notes"][2])
+        self.assertIn("不到背离 -5.0% 的一半", r["notes"][2])     # 方向和期限取自 rr25
         self.assertEqual(r["notes"][3], "后面的一条")
         self.assertEqual(r["shortside"]["si"]["dtc"], 4.75)
 

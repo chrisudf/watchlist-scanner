@@ -29,7 +29,8 @@ ETF/指数的空头含 AP 申赎和对冲盘, 只列数、不出旗标。
 
 借券费的另一个用处: 扫描器原有的"持有成本异常"提示 (forward 反解现货 vs 日线
 收盘背离 >1.5%) 只能说"常见于难借券, 下单前核对券商的借券费率"; 有了实际费率,
-就能直接说背离是不是借券造成的 (carry_line)。
+就能按背离方向和期限核对借券能解释多少 (carry_line) —— 费率高不等于背离就是借券
+造成的: 借券只会压低 forward, 5% 年化在 35 天也只有约 0.48%。
 
 代码按原样匹配两边 (BRK.B 这类带点的代码 IBKR 写成 "BRK B", watchlist 现在没有)。
 
@@ -64,7 +65,7 @@ SNAPSHOT_FIELDS = ["date", "symbol", "fee", "rebate", "avail", "avail_plus", "as
 
 NOTE = ("> 空头占流通股 = 空头股数 ÷ Yahoo 流通股 (多股份类/ADR 口径对不上时用总股本, "
         "ETF 用资产 ÷ 净值估算份额); 一年中位 / 一年分位 = 这只票自己过去一年 (24 期) 的"
-        "空头中位数和现在排第几 (100 = 一年最高; 按现在的股本折算, 上市不满半年不算) —— "
+        "空头中位数和现在排第几 (100 = 一年最高, 含持平; 按现在的股本折算, 上市不满半年不算) —— "
         "同样的占比对不同的票意义不同, 先跟它自己比; 回补天数 = 空头股数 ÷ 日均成交量 (按平常成交量, 空头"
         "全部买回要几天); 较上期 = 空头股数比上一期 (FINRA 每月两期, 结算日后约 8 个交易日"
         "公布)。借券费 = IBKR 给自家客户的年化费率 (普通券约 0.25%), 可借 = IBKR 自己能借出"
@@ -253,7 +254,8 @@ def si_pct(info: dict | None) -> float | None:
 
 def si_baseline(info: dict | None) -> dict | None:
     """这只票**自己**过去一年的空头 -> {"median": 中位占比 %, "rank": 现在排第几
-    分位 (0-100, 100 = 一年最高), "n": 期数}; 不满 BASE_MIN_N 期 = None。
+    分位 (0-100, 100 = 一年最高, 含持平), "n": 期数, "new_high": 严格高于窗口里此前
+    每一期}; 不满 BASE_MIN_N 期 = None。
 
     同样 17% 对 SOFI 和 NVDA 意义不同 (10/28: SOFI 一年中位 12.8%, NVDA 1.2%), 横比
     绝对值不如跟自己比。分母统一用现在的股本 (一年里大量增发/回购的票有偏差)。
@@ -273,9 +275,13 @@ def si_baseline(info: dict | None) -> dict | None:
     if len(rows) < BASE_MIN_N:
         return None
     xs = [r[1] for r in rows]
+    # 分位 100 也包括跟此前最高持平 (连续几期不变、全是 0 都是 100), 只用来显示;
+    # 新高旗标看 new_high (PR #27 评审)
+    prior = [r[1] for r in rows if r[0] < v["date"]]
     return {"median": statistics.median(xs) / sh["shares"] * 100,
             "rank": sum(1 for x in xs if x <= v["si"]) / len(xs) * 100,
-            "n": len(xs)}
+            "n": len(xs),
+            "new_high": bool(prior) and v["si"] > max(prior)}
 
 
 # --------------------------------------------------------------------------
@@ -287,7 +293,8 @@ def run(symbols: list[str], today: date, timeout: float = 30.0,
     """三个源各取一次 -> {
         "by_symbol": {sym: {"borrow": {...} | None, "si": {...} | None,
                             "shares": {...} | None}},
-        "borrow_asof": IBKR 文件时间 | None, "si_date": 最新结算日 | None,
+        "borrow_asof": IBKR 文件时间 | None,
+        "si_date": 所有标的里最新的结算日 | None (单只的在 si["date"]),
         "errors": {"borrow" / "si" / "shares": 原因}}  (只有失败的源才有键)。
     代码不在文件/记录里 = 对应字段 None; 一个源失败不影响另外两个。"""
     meta = {"by_symbol": {s_: {"borrow": None, "si": None, "shares": None} for s_ in symbols},
@@ -337,29 +344,47 @@ def borrow_note(b: dict, why: str) -> str:
             "put 贵、call 便宜, 都不是白捡的; 历史上难借券的票后续收益偏差")
 
 
-def carry_line(b: dict | None, s: dict) -> str:
-    """接在扫描器"持有成本异常"提示后面的一行: 拿 IBKR 的实际费率说清背离是不是借券造成的。
-    b=None = 代码不在 IBKR 文件里 (调用方保证 IBKR 文件本身取到了)。"""
+def carry_line(b: dict | None, gap: float | None = None, dte: int | None = None) -> str:
+    """接在扫描器"持有成本异常"提示后面的一行: IBKR 的实际费率, 再按背离方向和期限
+    核对借券能解释多少。gap = forward 反解现货 vs 日线收盘 (%), dte = 那份 forward 的
+    到期天数; 缺了只给费率, 不归因。b=None = 代码不在 IBKR 文件里 (调用方保证 IBKR
+    文件本身取到了)。
+
+    光看费率过没过难借券阈值不能归因 (PR #27 评审): 借券成本只会压低 forward
+    (F = S·e^((r-q-b)T)), 反解现货高于收盘跟借券无关; 低于收盘时按 费率 × dte/365
+    折算 —— 5% 年化在 35 天只有约 -0.48%, 不到触发提示的 1.5%。折算值占到背离一半
+    以上才说"主要来自借券成本"。"""
     if b is None:
+        if gap is not None and gap > 0:
+            return ("↳ IBKR 借券文件里没有这个代码 (多半借不到), 但反解现货高于收盘 —— "
+                    "做空受限只会压低 forward, 这次背离另有原因 (除权/报价), 先核对再下单")
         return "↳ IBKR 借券文件里没有这个代码 —— 多半借不到, 背离可能就是做空受限"
     desc = (f"IBKR 借券费 {b['fee']:.2f}%, 可借 "
             f"{shares_cn(b['avail'], b['avail_plus'])}股")
-    if b["fee"] >= s["short_fee_warn"]:
-        return f"↳ {desc} —— 背离来自借券成本"
-    return f"↳ {desc} —— 不是难借券, 这次背离另有原因 (股息/除权/报价), 先核对再下单"
+    if gap is None or not dte:
+        return f"↳ {desc}"
+    if gap > 0:
+        return (f"↳ {desc} —— 反解现货高于收盘, 借券成本只会压低 forward: 这次背离"
+                "不是借券造成的 (除权/报价), 先核对再下单")
+    implied = -b["fee"] * dte / 365
+    if implied <= gap / 2:
+        return (f"↳ {desc} —— 按 {dte} 天折算借券成本约 {implied:+.2f}%, 占了背离 "
+                f"{gap:+.1f}% 的一半以上: 背离主要来自借券成本")
+    return (f"↳ {desc} —— 按 {dte} 天折算借券成本只有约 {implied:+.2f}%, 不到背离 "
+            f"{gap:+.1f}% 的一半: 主要原因不是借券 (股息/除权/报价), 先核对再下单")
 
 
 def si_flag(v: dict | None, s: dict, pct: float | None = None,
             base: dict | None = None) -> str | None:
     """只给个股 (调用方按 kind 判断): 空头占流通股 >= short_pct_warn%、创自身一年
-    新高 (base["rank"] = 100)、回补天数 >= short_dtc_warn 或空头较上期 >=
-    +short_chg_warn% -> 原因; 否则 None。"""
+    新高 (base["new_high"]: 严格高于基准窗口里此前每一期, 跟最高持平、全是 0 都不算)、
+    回补天数 >= short_dtc_warn 或空头较上期 >= +short_chg_warn% -> 原因; 否则 None。"""
     if not v:
         return None
     parts = []
     if pct is not None and pct >= s["short_pct_warn"]:
         parts.append(f"空头占流通股 {pct:.1f}%")
-    if base and base["rank"] >= 100:
+    if base and base["new_high"]:
         parts.append(f"空头创一年新高 (一年中位 {base['median']:.1f}%)")
     if v.get("dtc") is not None and v["dtc"] >= s["short_dtc_warn"]:
         parts.append(f"回补 {v['dtc']:.1f} 天")
@@ -391,12 +416,16 @@ TABLE_HEAD = ("| 标的 | 空头占流通股 | 一年中位 | 一年分位 | 回
 TABLE_SEP = "|---|--:|--:|--:|--:|--:|--:|--:|"
 
 
-def _row(sym: str, kind: str, info: dict | None) -> str:
-    """表格一行, 列见 TABLE_HEAD。缺的格子写 —。"""
+def _row(sym: str, kind: str, info: dict | None, si_date: str | None = None) -> str:
+    """表格一行, 列见 TABLE_HEAD。缺的格子写 —。这只的结算日跟表头 (si_date) 不同时
+    在代码后面注明它自己的结算日, 不然旧一期的数会被当成表头那一期 (PR #27 评审)。"""
     info = info or {}
     v, b = info.get("si") or {}, info.get("borrow")
     pct, base = si_pct(info), si_baseline(info)
-    label = f"{sym} ({KIND_LABEL[kind]})" if kind in KIND_LABEL else sym
+    tags = [KIND_LABEL[kind]] if kind in KIND_LABEL else []
+    if v.get("date") and si_date and v["date"] != si_date:
+        tags.append(f"{v['date'][5:] if v['date'][:4] == si_date[:4] else v['date']} 结算")
+    label = f"{sym} ({', '.join(tags)})" if tags else sym
     chg = ("拆股" if v.get("split") else
            f"{v['chg']:+.0f}%" if v.get("chg") is not None else "—")
     cells = [label,
@@ -427,10 +456,17 @@ def report_block(items: list[tuple[str, str, dict | None]], meta: dict, s: dict,
         lines.append(f"- FINRA {d[5:] if d else '?'} 结算 (每月两期) · "
                      f"IBKR 借券 {asof[5:] + ' ET' if asof else '?'}")
         lines += ["", TABLE_HEAD, TABLE_SEP]
-        lines += [_row(*x) for x in rows]
+        lines += [_row(*x, d) for x in rows]
         lines.append("")
     if _stale(d, today, SI_STALE_DAYS):
         lines.append(f"- ⚠️ FINRA 最新一期是 {d}, 超过 {SI_STALE_DAYS} 天 —— 数据可能断更")
+    else:
+        # d 是所有标的里最新的结算日, 单只停在旧一期会被别的标的掩盖, 逐只再查
+        for sym, _, info in rows:
+            own = (info.get("si") or {}).get("date")
+            if _stale(own, today, SI_STALE_DAYS):
+                lines.append(f"- ⚠️ **{sym}** 的 FINRA 最新一期是 {own}, 超过 "
+                             f"{SI_STALE_DAYS} 天 —— 表里它的空头数是旧的")
     if _stale(asof, today, BORROW_STALE_DAYS):
         lines.append(f"- ⚠️ IBKR 借券文件停在 {asof} —— 超过 {BORROW_STALE_DAYS} 天没更新")
 

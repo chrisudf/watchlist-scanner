@@ -3277,7 +3277,8 @@ CARRY_NOTE_PREFIX = "期权 forward 反解现货"
 
 def attach_shortside(results, s: dict, today: date) -> dict:
     """给每个结果挂上 r["shortside"] = {"borrow", "si"}; 难借券的在详情里加一行 ⚠️,
-    "持有成本异常"那条后面接一行实际费率; 返回 meta (报告段用)。取数整段包在 try
+    "持有成本异常"那条后面接一行实际费率 (按 r["rr25"] 的背离方向和期限核对借券能解释
+    多少); 返回 meta (报告段用)。取数整段包在 try
     里, 同 attach_insider: 附加信息自己出 bug 也只能降级成报告里一行 ⚠️。"""
     syms = [r["symbol"] for r in results]
     try:
@@ -3295,7 +3296,9 @@ def attach_shortside(results, s: dict, today: date) -> dict:
         if "borrow" not in meta["errors"]:
             carry = [i for i, n in enumerate(notes) if n.startswith(CARRY_NOTE_PREFIX)]
             if carry:
-                notes.insert(carry[0] + 1, shortside.carry_line(info["borrow"], s))
+                rr = r.get("rr25") or {}
+                notes.insert(carry[0] + 1, shortside.carry_line(
+                    info["borrow"], rr.get("spot_gap_pct"), rr.get("dte")))
         why = shortside.borrow_flag(info["borrow"], s)
         if why:
             notes.append(shortside.borrow_note(info["borrow"], why))
