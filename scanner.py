@@ -55,6 +55,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+import btcratio
 import insider
 import mnav
 import revisions
@@ -319,13 +320,13 @@ def load_config(path: Path = CONFIG_FILE) -> tuple[dict, dict]:
     TypeError, 或者阈值默认值顶着你以为改过的名字继续生效。"""
     with open(path, "rb") as f:
         raw = tomllib.load(f)
-    unknown_top = set(raw) - {"settings", "tickers", "mnav"}
+    unknown_top = set(raw) - {"settings", "tickers", "mnav", "btcratio"}
     if unknown_top:
         # [setting] / [ticker.QQQ] 这类表名手滑不会报错, 整段配置连同
         # 你以为改过的每个阈值一起被静默忽略 (PR #10 评审)
         raise ValueError(
             f"顶层未知表 (typo?): {', '.join('[' + k + ']' for k in sorted(unknown_top))} "
-            f"— 只认 [settings] / [tickers.*] / [mnav.*]")
+            f"— 只认 [settings] / [tickers.*] / [mnav.*] / [btcratio.*]")
     settings_raw = raw.get("settings", {})
     unknown = set(settings_raw) - set(SETTINGS_DEFAULTS)
     if unknown:
@@ -352,6 +353,9 @@ def load_config(path: Path = CONFIG_FILE) -> tuple[dict, dict]:
     # 缺省不设 (整段不出), 设了就在这里按 mnav.validate_config 的规矩炸
     if "mnav" in raw:
         settings["mnav"] = mnav.validate_config(raw["mnav"], datetime.now(ET).date())
+    # BTC 平台股 / BTC 比值 (btcratio.py): [btcratio.COIN] 同理, 另一张顶层表
+    if "btcratio" in raw:
+        settings["btcratio"] = btcratio.validate_config(raw["btcratio"], datetime.now(ET).date())
     tickers = {}
     for sym, tcfg in raw.get("tickers", {}).items():
         unknown = set(tcfg) - set(TICKER_DEFAULTS)
@@ -3374,6 +3378,45 @@ def snapshot_mnav(meta, d: str) -> None:
         print(f"  mnav: +{n} 行 -> {mnav.HISTORY_NAME}")
 
 
+# --------------------------------------------------------------------------
+# BTC 平台股 / BTC 比值 (btcratio.py) — 只做提示, 不进状态机/门控/票据; 只考虑正股与 2x
+# --------------------------------------------------------------------------
+
+def attach_btcratio(settings: dict, results, today: date) -> dict | None:
+    """[btcratio.*] 配了才跑 -> btcratio.run 的 meta (含 cfgs); 没配 = None (整段不出)。
+    标的也在 watchlist 里时, 今天的股价用扫描器自己的收盘 (yfinance 日线的今天那行
+    盘中是半根 bar); 陈旧日线不用。整段包在 try 里, 同 attach_mnav。"""
+    cfgs = settings.get("btcratio") or {}
+    if not cfgs:
+        return None
+    live = {r["symbol"]: r["tech"]["close"] for r in results
+            if r["symbol"] in cfgs and r.get("tech") and not r.get("stale_data")}
+    try:
+        return btcratio.run(cfgs, cache_dir=DATA, today=today, live_px=live)
+    except Exception as e:      # noqa: BLE001
+        return {"by_symbol": {s_: {"error": f"比值模块异常: {type(e).__name__}: {e}"}
+                              for s_ in cfgs},
+                "cfgs": cfgs, "warnings": [], "from_cache": False, "fetched": None}
+
+
+def btcratio_block(meta) -> list[str]:
+    """开盘/尾盘报告的比值段。meta=None (--no-btcratio / 未配置) 整段不出。"""
+    return btcratio.report_block(meta)
+
+
+def snapshot_btcratio(meta, d: str) -> None:
+    """每天一行 data/btcratio_history.csv; 闸同 mnav_history: 只有定时尾盘扫描写。"""
+    if not meta:
+        return
+    try:
+        n = btcratio.append_history(btcratio.history_rows(meta, d), DATA / btcratio.HISTORY_NAME)
+    except Exception as e:      # noqa: BLE001
+        print(f"  btcratio: 历史写入失败 ({type(e).__name__}: {e})", file=sys.stderr)
+        return
+    if n:
+        print(f"  btcratio: +{n} 行 -> {btcratio.HISTORY_NAME}")
+
+
 def zone_invalid_for(cfg: dict, hist, prev_state: dict | None) -> str | None:
     """晚间检查用的 zone 作废判定 —— 与 analyze_ticker 同一口径 (state 里
     的粘性作废 + zone_asof 之后的拆股), 只读不写: 晚间不推进任何状态。"""
@@ -3767,7 +3810,8 @@ def zone_position(close: float, zone) -> str:
 
 
 def render_close(results, regime, ivdf, now_et, insider_meta=None,
-                 revisions_meta=None, mnav_meta=None, shortside_meta=None) -> str:
+                 revisions_meta=None, mnav_meta=None, shortside_meta=None,
+                 btcratio_meta=None) -> str:
     d = now_et.strftime("%Y-%m-%d")
     lines = [f"# 左右侧 watchlist 扫描 — {d} 尾盘 "
              f"({now_et:%H:%M} ET)", ""]
@@ -3817,6 +3861,7 @@ def render_close(results, regime, ivdf, now_et, insider_meta=None,
     lines += insider_block(results, insider_meta)
     lines += revisions_block(results, revisions_meta)
     lines += mnav_block(mnav_meta)
+    lines += btcratio_block(btcratio_meta)
 
     detail = [r for r in ordered
               if r["state"] in ("CONFIRMED", "TREND", "LEFT_ZONE", "NEAR_ZONE")
@@ -3954,7 +3999,8 @@ def render_close(results, regime, ivdf, now_et, insider_meta=None,
 
 
 def render_open(results, regime, now_et, s: dict, insider_meta=None,
-                revisions_meta=None, mnav_meta=None, shortside_meta=None) -> str:
+                revisions_meta=None, mnav_meta=None, shortside_meta=None,
+                btcratio_meta=None) -> str:
     d = now_et.strftime("%Y-%m-%d")
     lines = [f"# 开盘异动 — {d} ({now_et:%H:%M} ET)", ""]
     lines += regime_block(regime)
@@ -4013,6 +4059,10 @@ def render_open(results, regime, now_et, s: dict, insider_meta=None,
     mn = mnav_block(mnav_meta)
     if mn:
         lines += [""] + mn[:-1]
+    # 比值段同理
+    br_ = btcratio_block(btcratio_meta)
+    if br_:
+        lines += [""] + br_[:-1]
     lines += ["", "---",
               "开盘扫描只做提醒 — 右侧确认以收盘为准, 见尾盘报告。数据 ~15min 延迟。"]
     return "\n".join(lines)
@@ -4513,6 +4563,8 @@ def main() -> int:
                     help="skip StrategyTracker mNAV fetch ([mnav.*] in watchlist.toml)")
     ap.add_argument("--no-shortside", action="store_true",
                     help="skip FINRA short interest + IBKR borrow-fee fetch")
+    ap.add_argument("--no-btcratio", action="store_true",
+                    help="skip stock/BTC ratio fetch ([btcratio.*] in watchlist.toml)")
     ap.add_argument("--workers", type=int, default=4)
     args = ap.parse_args()
 
@@ -4628,6 +4680,18 @@ def main() -> int:
                          f"EV {a['m_ev']:.2f} 桶 {a['bucket']}"
                          + (" (缓存)" if mnav_meta.get("from_cache") else "")))
 
+    # BTC 平台股 / BTC 比值: 两个模式都出, 只在配了 [btcratio.*] 时
+    btcratio_meta = None
+    if not args.no_btcratio:
+        btcratio_meta = attach_btcratio(settings, results, now_et.date())
+        if btcratio_meta is not None:
+            for sym, a in btcratio_meta["by_symbol"].items():
+                print(f"  btcratio: {sym} "
+                      + (f"取不到 ({a['error']})" if a.get("error") else
+                         f"比值 {a['ratio']:.3f} 分位 {a['pct']:.1f}% 桶 {a['bucket']}"
+                         + (f" {a['flags']['tier']}" if a["flags"]["tier"] else "")
+                         + (" (缓存)" if a.get("from_cache") else "")))
+
     ivdf = load_iv_history()
     if mode == "close":
         if manual:
@@ -4641,6 +4705,7 @@ def main() -> int:
                 snapshot_revisions(revisions_meta, d)
             snapshot_shortside(shortside_meta, d)
             snapshot_mnav(mnav_meta, d)
+            snapshot_btcratio(btcratio_meta, d)
             # persist state transitions (close-basis only, per the playbook)
             for r in results:
                 if r["error"] or r["tech"] is None:
@@ -4663,10 +4728,10 @@ def main() -> int:
             if _n:
                 print(f"  journal: +{_n} 条推荐记录 -> {JOURNAL.name}")
         report = render_close(results, regime, ivdf, now_et, insider_meta,
-                              revisions_meta, mnav_meta, shortside_meta)
+                              revisions_meta, mnav_meta, shortside_meta, btcratio_meta)
     else:
         report = render_open(results, regime, now_et, settings, insider_meta,
-                             revisions_meta, mnav_meta, shortside_meta)
+                             revisions_meta, mnav_meta, shortside_meta, btcratio_meta)
 
     REPORTS.mkdir(exist_ok=True)
     report_path.write_text(report + "\n", encoding="utf-8")
