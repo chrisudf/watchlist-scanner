@@ -7060,5 +7060,550 @@ class TestShortsideMain(unittest.TestCase):
         self.assertNotIn("空头面", self._report(f"{self._today()}-close.md"))
 
 
+# ---------------------------------------------------------------------------
+# BTC 平台股 / BTC 比值 (btcratio.py, 2026-11-01) — 只做提示, 不进门控; 只考虑正股与 2x
+# ---------------------------------------------------------------------------
+
+import btcratio as br  # noqa: E402
+
+_BR_TODAY = date(2026, 10, 30)
+
+
+def _br_cfg(**over):
+    raw = {"shares_m": 264.8, "shares_asof": "2026-09-30", "two_x": "CONL", **over}
+    return br.validate_config({"COIN": raw}, _BR_TODAY)["COIN"]
+
+
+def _br_df(n=300, end="2026-10-29", ratio=2.5, btc=80_000.0, ratios=None, btcs=None):
+    """缓存的样子: 标的交易日 (工作日), 收盘 = 比值 × BTC / 1000。ratios / btcs 覆盖逐日。"""
+    idx = pd.bdate_range(end=end, periods=n)
+    bs = list(btcs) if btcs is not None else [btc] * n
+    rs = list(ratios) if ratios is not None else [ratio] * n
+    df = pd.DataFrame({"close": [r * b / 1000 for r, b in zip(rs, bs)], "btc": bs}, index=idx)
+    df.index.name = "date"
+    return df
+
+
+def _br_px(r, btc=80_000.0):
+    return r * btc / 1000
+
+
+class TestBtcratioConfig(unittest.TestCase):
+    def test_minimal_config_normalizes(self):
+        c = br.validate_config({"coin": {"two_x": "conl"}}, _BR_TODAY)
+        self.assertEqual(list(c), ["COIN"])
+        self.assertEqual(c["COIN"]["yf_ticker"], "COIN")
+        self.assertEqual(c["COIN"]["two_x"], "CONL")
+        self.assertIsNone(c["COIN"]["shares_m"])
+        self.assertEqual(c["COIN"]["take_profit"], [2.4, 2.6])
+        self.assertEqual(c["COIN"]["t1"], 2.0)
+        c = _br_cfg()
+        self.assertEqual(c["shares_asof"], "2026-09-30")
+
+    def test_empty_is_empty(self):
+        self.assertEqual(br.validate_config(None, _BR_TODAY), {})
+        self.assertEqual(br.validate_config({}, _BR_TODAY), {})
+
+    def test_rejects_bad_entries(self):
+        ok = {"shares_m": 264.8, "shares_asof": "2026-09-30"}
+        bad = [
+            ({"COIN": {**ok, "share_m": 1}}, "未知键"),
+            ({"COIN": {"shares_m": 264.8}}, "shares_asof"),
+            ({"COIN": {"shares_asof": "2026-09-30"}}, "没填 shares_m"),
+            ({"COIN": {**ok, "shares_asof": "2027-01-01"}}, "在未来"),
+            ({"COIN": {"shares_m": -1, "shares_asof": "2026-09-30"}}, "正数"),
+            ({"COIN": {"shares_m": "264", "shares_asof": "2026-09-30"}}, "正数"),
+            ({"COIN": {**ok, "t2": 2.1}}, "顺序"),
+            ({"COIN": {**ok, "watch": 1.9}}, "顺序"),
+            ({"COIN": {**ok, "take_profit": [2.6, 2.4]}}, "take_profit"),
+            ({"COIN": {**ok, "take_profit": [1.9, 2.6]}}, "高于 t1"),
+            ({"COIN": {**ok, "break_lookback": 2.5}}, "正整数"),
+            ({"COIN": {**ok, "two_x": 2}}, "字符串"),
+            ({"COIN": 6.7}, "一张表"),
+            ({"COIN": dict(ok), "coin": dict(ok)}, "重复"),
+        ]
+        for raw, why in bad:
+            with self.assertRaises(ValueError, msg=why) as cm:
+                br.validate_config(raw, _BR_TODAY)
+            self.assertIn(why, str(cm.exception))
+
+
+class TestBtcratioMath(unittest.TestCase):
+    def test_bucket_edges(self):
+        self.assertEqual(br.bucket(1.81), "<1.9")
+        self.assertEqual(br.bucket(1.9), "1.9-2.0")
+        self.assertEqual(br.bucket(1.999), "1.9-2.0")
+        self.assertEqual(br.bucket(2.0), "2.0-2.2")
+        self.assertEqual(br.bucket(2.5), "2.4-2.6")
+        self.assertEqual(br.bucket(4.5), "≥4.5")
+        self.assertEqual(set(br.BUCKET_NOTE), {lab for _, lab in br.BUCKET_EDGES})
+
+    def test_round_trips(self):
+        self.assertAlmostEqual(br.ratio(138.99, 76_600), 1.81449, places=4)
+        self.assertAlmostEqual(br.price_at(br.ratio(138.99, 76_600), 76_600), 138.99, places=9)
+        m = br.mcap_pct(138.99, 264.8, 76_600, 20.0)
+        self.assertAlmostEqual(m, 2.4024, places=3)
+        self.assertAlmostEqual(br.price_at_mcap(m, 264.8, 76_600, 20.0), 138.99, places=9)
+
+    def test_ladder_grid(self):
+        lad = br.ladder(80_000, _br_cfg(), 264.8)
+        self.assertEqual(lad["btc_grid"], [1.0, 0.9, 0.8])
+        self.assertEqual([round(x) for x in lad["t1"]], [160, 144, 128])
+        self.assertEqual([round(x, 1) for x in lad["t2"]], [133.6, 120.2, 106.9])
+        self.assertEqual([round(x) for x in lad["t3"]], [120, 108, 96])
+        self.assertEqual([round(x) for x in lad["watch"]], [176, 158, 141])
+        self.assertAlmostEqual(lad["mcap_floor"][0], 0.0204 * 80_000 * 20.0 / 264.8, places=6)
+        self.assertIsNone(br.ladder(80_000, _br_cfg(shares_m=None, shares_asof=None))["mcap_floor"])
+
+    def test_episodes_and_threshold_stats(self):
+        idx = pd.bdate_range("2026-01-01", periods=40)
+        r = pd.Series([2.5] * 40, index=idx)
+        r.iloc[5:8] = 1.9; r.iloc[10:12] = 1.95       # 断开 2 天 → 同一段
+        r.iloc[30] = 1.4                              # 单独一段
+        st = br.threshold_stats(r, thresholds=(2.0, 1.5, 1.2))
+        self.assertEqual((st[2.0]["days"], st[2.0]["episodes"]), (6, 2))
+        self.assertEqual((st[1.5]["days"], st[1.5]["episodes"]), (1, 1))
+        self.assertEqual((st[1.2]["days"], st[1.2]["episodes"]), (0, 0))
+        self.assertEqual(st[2.0]["runs"][0][2], 5)
+
+    def test_breaks_streak_percentile(self):
+        idx = pd.bdate_range("2026-01-01", periods=30)
+        r = pd.Series([2.5] * 30, index=idx)
+        r.iloc[-1] = 1.95
+        self.assertTrue(br.first_break_below(r, 2.0, 20))
+        r.iloc[-5] = 1.9
+        self.assertFalse(br.first_break_below(r, 2.0, 20))
+        self.assertEqual(br.streak_at_or_below(r, 2.0), 1)
+        r.iloc[-3:] = 1.9
+        self.assertEqual(br.streak_at_or_below(r, 2.0), 3)
+        self.assertEqual(br.streak_at_or_below(pd.Series([2.5, 2.6]), 2.0), 0)
+        self.assertAlmostEqual(br.percentile(pd.Series([1.0, 2.0, 3.0, 4.0]), 2.5), 50.0)
+        self.assertTrue(math.isnan(br.percentile(pd.Series(dtype=float), 2.5)))
+
+    def test_two_x_drag_and_rv(self):
+        self.assertAlmostEqual(br.two_x_drag_pct(0.75), 56.25)
+        self.assertIsNone(br.two_x_drag_pct(None))
+        close = pd.Series([100.0] * 70)
+        self.assertAlmostEqual(br.realized_vol(close, 60), 0.0)
+        self.assertIsNone(br.realized_vol(close.iloc[:30], 60))
+
+    def test_divergence(self):
+        idx = pd.bdate_range("2025-01-01", periods=300)
+        r = pd.Series(np.linspace(3.0, 2.0, 300), index=idx)          # 一路新低
+        btc_up = pd.Series(np.linspace(60_000, 90_000, 300), index=idx)
+        btc_dn = pd.Series(np.linspace(90_000, 60_000, 300), index=idx)
+        self.assertTrue(br.divergence(r, btc_up, 250, 120)["flag"])
+        d = br.divergence(r, btc_dn, 250, 120)
+        self.assertFalse(d["flag"]); self.assertTrue(d["ratio_low"]); self.assertFalse(d["btc_up"])
+        self.assertFalse(br.divergence(r.iloc[:100], btc_up.iloc[:100], 250, 120)["flag"])
+
+    def test_mcap_series_uses_anchors(self):
+        df = _br_df(n=5, end="2023-05-03", ratio=1.672, btc=29_000.0)
+        m = br.mcap_ratio_series(df)
+        self.assertAlmostEqual(float(m.iloc[-1]), 1.672 * 29 * 236.0 / (29_000 * 19.36) * 100, delta=0.05)
+
+
+class TestBtcratioFetch(unittest.TestCase):
+    def _close(self, end="2026-10-30", n=300, with_sym=True):
+        idx = pd.bdate_range(end=end, periods=n)
+        cols = {"BTC-USD": [80_000.0] * n}
+        if with_sym:
+            cols["COIN"] = [200.0] * n
+        df = pd.DataFrame(cols, index=idx)
+        return df
+
+    def test_fetch_writes_cache_then_uses_it(self):
+        calls = []
+
+        def dl(tickers):
+            calls.append(list(tickers))
+            return self._close()
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "data" / br.CACHE_NAME.format("COIN")
+            got = br.fetch_pair("COIN", p, _BR_TODAY, dl)
+            self.assertFalse(got["from_cache"]); self.assertTrue(p.exists())
+            self.assertEqual(calls, [["COIN", "BTC-USD"]])
+            self.assertEqual(list(got["df"].columns), ["close", "btc"])
+            got2 = br.fetch_pair("COIN", p, _BR_TODAY, dl)
+            self.assertTrue(got2["from_cache"]); self.assertEqual(len(calls), 1)
+            # 缓存落后一天 → 重下
+            got3 = br.fetch_pair("COIN", p, date(2026, 11, 2), dl)
+            self.assertFalse(got3["from_cache"]); self.assertEqual(len(calls), 2)
+
+    def test_fetch_failure_falls_back_to_cache_or_raises(self):
+        def boom(tickers):
+            raise OSError("timed out")
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "data" / br.CACHE_NAME.format("COIN")
+            with self.assertRaises(RuntimeError) as cm:
+                br.fetch_pair("COIN", p, _BR_TODAY, boom)
+            self.assertIn("无缓存", str(cm.exception))
+            br.fetch_pair("COIN", p, _BR_TODAY, lambda t: self._close(end="2026-10-29"))
+            got = br.fetch_pair("COIN", p, _BR_TODAY, boom)
+            self.assertTrue(got["from_cache"])
+            self.assertIn("取数失败", got["warnings"][0])
+            # 返回里缺标的列 → 也算失败, 退回缓存
+            got = br.fetch_pair("COIN", p, _BR_TODAY, lambda t: self._close(with_sym=False))
+            self.assertTrue(got["from_cache"])
+
+    def test_btc_aligned_to_stock_days(self):
+        idx = pd.date_range("2026-10-20", periods=10, freq="D")          # 含周末
+        close = pd.DataFrame({"BTC-USD": np.arange(10, dtype=float) + 1}, index=idx)
+        close["COIN"] = np.where(idx.weekday < 5, 100.0, np.nan)
+        with tempfile.TemporaryDirectory() as d:
+            got = br.fetch_pair("COIN", Path(d) / "c.csv", date(2026, 10, 29), lambda t: close)
+        df = got["df"]
+        self.assertTrue((df.index.weekday < 5).all())
+        self.assertEqual(float(df.loc["2026-10-26", "btc"]), 7.0)        # 周一取周一的 BTC
+
+
+class TestBtcratioAssess(unittest.TestCase):
+    def _assess(self, df, cfg=None, **kw):
+        return br.assess(df, cfg or _br_cfg(), today=kw.pop("today", _BR_TODAY), **kw)
+
+    def test_t1_first_break_new_low(self):
+        a = self._assess(_br_df(), live_px=_br_px(1.9))
+        self.assertAlmostEqual(a["ratio"], 1.9, places=9)
+        self.assertEqual(a["px_src"], "live"); self.assertEqual(a["btc_src"], "yf")
+        self.assertEqual(a["bucket"], "1.9-2.0")
+        f = a["flags"]
+        self.assertEqual(f["tier"], "T1"); self.assertTrue(f["watch"]); self.assertTrue(f["break_t1"])
+        self.assertTrue(f["all_time_low"]); self.assertFalse(f["take_profit"]); self.assertFalse(f["divergence"])
+        self.assertEqual(a["streak_t1"], 1)
+        self.assertEqual(a["pct"], 0.0)
+        self.assertEqual(a["n_days"], 301)
+        self.assertEqual(a["asof"], "2026-10-29")
+        self.assertAlmostEqual(a["ladder"]["t1"][0], 160.0)
+        self.assertAlmostEqual(a["mcap_pct"], br.mcap_pct(_br_px(1.9), 264.8, 80_000, 20.0))
+        self.assertEqual(a["stats"][2.0]["days"], 1)
+        self.assertEqual(a["warnings"], [])
+        self.assertAlmostEqual(a["rel_120"]["btc"], 0.0)
+        self.assertLess(a["rel_120"]["stock"], -20)
+
+    def test_tiers_watch_and_streak(self):
+        rs = [2.5] * 296 + [1.95, 1.9, 1.6, 1.4]
+        a = self._assess(_br_df(ratios=rs), live_px=_br_px(1.45))
+        self.assertEqual(a["flags"]["tier"], "T3")
+        self.assertEqual(a["streak_t1"], 5)
+        self.assertFalse(a["flags"]["break_t1"])                  # 不是首次
+        a = self._assess(_br_df(), live_px=_br_px(1.66))
+        self.assertEqual(a["flags"]["tier"], "T2")
+        a = self._assess(_br_df(), live_px=_br_px(2.1))
+        self.assertIsNone(a["flags"]["tier"]); self.assertTrue(a["flags"]["watch"])
+        a = self._assess(_br_df(), live_px=_br_px(2.3))
+        self.assertFalse(a["flags"]["watch"]); self.assertEqual(a["stats"][2.2]["days"], 0)
+
+    def test_take_profit_needs_recent_t1(self):
+        rs = [2.5] * 300
+        rs[-40:-35] = [1.9] * 5                                   # 一个多月前到过 T1
+        a = self._assess(_br_df(ratios=rs), live_px=_br_px(2.45))
+        self.assertTrue(a["flags"]["take_profit"])
+        a = self._assess(_br_df(), live_px=_br_px(2.45))
+        self.assertFalse(a["flags"]["take_profit"])
+        rs = [2.5] * 300; rs[-130] = 1.9                          # 超出 120 天记忆
+        self.assertFalse(self._assess(_br_df(ratios=rs), live_px=_br_px(2.7))["flags"]["take_profit"])
+
+    def test_divergence_flag_and_btc_trend(self):
+        btcs = list(np.linspace(60_000, 90_000, 300))
+        rs = list(np.linspace(3.0, 2.0, 300))
+        a = self._assess(_br_df(ratios=rs, btcs=btcs), live_px=_br_px(1.95, 90_500), live_btc=90_500)
+        self.assertTrue(a["flags"]["divergence"]); self.assertEqual(a["btc_src"], "live")
+        self.assertGreater(a["divergence"]["btc_chg"], 0)
+        self.assertTrue(a["btc_trend"]["above20"]); self.assertTrue(a["btc_trend"]["above50"])
+
+    def test_warnings_stale_data_and_shares(self):
+        a = self._assess(_br_df(end="2026-10-20"), live_px=_br_px(2.5))
+        self.assertTrue(any("落后" in w for w in a["warnings"]))
+        a = self._assess(_br_df(), cfg=_br_cfg(shares_asof="2026-05-01"), live_px=_br_px(2.5))
+        self.assertTrue(any("shares_m" in w for w in a["warnings"]))
+        a = self._assess(_br_df(), cfg=_br_cfg(shares_m=None, shares_asof=None), live_px=_br_px(2.5))
+        self.assertIsNone(a["mcap_pct"]); self.assertIsNone(a["ladder"]["mcap_floor"])
+
+    def test_without_live_uses_last_row(self):
+        df = _br_df(end="2026-10-30", ratio=1.8)                  # 缓存已含今天
+        a = self._assess(df)
+        self.assertEqual(a["px_src"], "yf"); self.assertAlmostEqual(a["ratio"], 1.8)
+        self.assertEqual(a["n_days"], 300)                        # 今天那行不重复算
+        with self.assertRaises(ValueError):
+            self._assess(_br_df(n=0))
+
+    def test_run_isolates_failures(self):
+        cfgs = br.validate_config({"COIN": {"two_x": "CONL"}, "HOOD": {}}, _BR_TODAY)
+
+        def dl(tickers):
+            if "HOOD" in tickers:
+                raise OSError("nope")
+            idx = pd.bdate_range(end="2026-10-29", periods=300)
+            return pd.DataFrame({"COIN": [200.0] * 300, "BTC-USD": [80_000.0] * 300}, index=idx)
+        with tempfile.TemporaryDirectory() as d:
+            meta = br.run(cfgs, cache_dir=Path(d), today=_BR_TODAY, live_px={"COIN": 152.0}, download=dl)
+        self.assertAlmostEqual(meta["by_symbol"]["COIN"]["ratio"], 1.9)
+        self.assertIn("error", meta["by_symbol"]["HOOD"])
+        self.assertFalse(meta["from_cache"])
+        self.assertEqual(meta["cfgs"], cfgs)
+
+
+class TestBtcratioReport(unittest.TestCase):
+    def _meta(self, r=1.9, dip=False, **cfg_over):
+        rs = [2.5] * 300
+        if dip:
+            rs[-40:-35] = [1.9] * 5
+        cfg = _br_cfg(**cfg_over)
+        a = br.assess(_br_df(ratios=rs), cfg, today=_BR_TODAY, live_px=_br_px(r))
+        a["from_cache"] = False
+        return {"by_symbol": {"COIN": a}, "cfgs": {"COIN": cfg}, "warnings": [],
+                "from_cache": False, "fetched": "2026-10-30T20:00:00+00:00"}
+
+    def test_none_renders_nothing(self):
+        self.assertEqual(br.report_block(None), [])
+        self.assertEqual(br.report_block({"by_symbol": {}, "cfgs": {}}), [])
+
+    def test_block_contents(self):
+        text = "\n".join(br.report_block(self._meta()))
+        self.assertIn("## BTC 平台股 / BTC 比值 (yfinance)", text)
+        self.assertIn("比值 **1.900‰**", text)
+        self.assertIn("(扫描器收盘)", text)
+        self.assertIn("全史 0.0 分位", text)
+        self.assertIn("市值比值", text)
+        self.assertIn("桶 1.9-2.0", text)
+        self.assertIn("🟢 现价已在 T1 档内 (连续 1 个交易日", text)
+        self.assertIn("首次收盘跌破 2", text)
+        self.assertIn("⚠️ 比值历史新低", text)
+        self.assertIn("T1 ≤2 $160 / $144 / $128", text)
+        self.assertIn("T2 ≤1.67", text)
+        self.assertIn("市值比值地板 2.04%", text)
+        self.assertIn("止盈 2.4–2.6 = $192–208", text)
+        self.assertIn("2x ETF CONL", text)
+        self.assertIn("不出期权票", text)
+        self.assertIn("历史 (比值, 交易日): <2.2 1 天/1 段", text)
+        self.assertNotIn("(缓存)", text)
+        self.assertNotIn("🔔", text)
+        self.assertNotIn("👀", text)
+
+    def test_block_flags_and_warnings(self):
+        text = "\n".join(br.report_block(self._meta(2.1)))
+        self.assertIn("👀 关注区", text); self.assertNotIn("🟢", text)
+        text = "\n".join(br.report_block(self._meta(2.45, dip=True)))
+        self.assertIn("🔔 在止盈带 2.4–2.6 内", text)
+        self.assertIn("🔔 已高于止盈带上沿 2.6", "\n".join(br.report_block(self._meta(2.7, dip=True))))
+        self.assertNotIn("🔔", "\n".join(br.report_block(self._meta(2.45))))
+        meta = self._meta(two_x=None)
+        text = "\n".join(br.report_block(meta))
+        self.assertNotIn("2x ETF CONL", text); self.assertIn("不出期权票", text)
+        meta = self._meta()
+        meta["warnings"] = ["yfinance 取数失败 (OSError: x), 用的是到 2026-10-29 的缓存"]
+        meta["from_cache"] = True
+        text = "\n".join(br.report_block(meta))
+        self.assertIn("取数失败", text); self.assertIn("(缓存)", text)
+        meta["by_symbol"]["COIN"] = {"error": "RuntimeError: x"}
+        self.assertIn("⚠️ **COIN** 比值取不到: RuntimeError: x", "\n".join(br.report_block(meta)))
+
+    def test_history_rows_and_append(self):
+        meta = self._meta()
+        rows = br.history_rows(meta, "2026-10-30")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["flags"], "watch,break_t1,all_time_low,T1")
+        self.assertEqual(rows[0]["px_src"], "live"); self.assertEqual(rows[0]["streak_t1"], 1)
+        self.assertEqual(rows[0]["shares_m"], 264.8)
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "data" / br.HISTORY_NAME
+            self.assertEqual(br.append_history(rows, p), 1)
+            self.assertEqual(br.append_history(rows, p), 0)
+            self.assertEqual(br.append_history(br.history_rows(meta, "2026-11-02"), p), 1)
+            with p.open(newline="", encoding="utf-8") as f:
+                got = list(__import__("csv").DictReader(f))
+            self.assertEqual([r["date"] for r in got], ["2026-10-30", "2026-11-02"])
+            self.assertEqual(list(got[0]), list(br.HISTORY_FIELDS))
+            p.write_text("date,symbol,px\n2026-10-01,COIN,100\n", encoding="utf-8")
+            self.assertEqual(br.append_history(rows, p), 1)
+            with p.open(newline="", encoding="utf-8") as f:
+                got = list(__import__("csv").DictReader(f))
+            self.assertEqual([r["date"] for r in got], ["2026-10-01", "2026-10-30"])
+            self.assertEqual(got[0]["ratio"], "")
+
+
+class TestBtcratioScanner(unittest.TestCase):
+    """接线: [btcratio.*] 随 settings 走; attach 降级; 两份报告都有这一段; --no-btcratio;
+    历史只在定时尾盘扫描写。"""
+
+    TOML = ("[tickers.QQQ]\nkind = \"index\"\n"
+            "[btcratio.COIN]\nshares_m = 264.8\nshares_asof = \"2026-09-30\"\ntwo_x = \"CONL\"\n")
+
+    def _load(self, text):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "watchlist.toml"
+            p.write_text(text, encoding="utf-8")
+            return sc.load_config(p)
+
+    def test_load_config_accepts_btcratio_table(self):
+        s, t = self._load(self.TOML)
+        self.assertEqual(list(s["btcratio"]), ["COIN"])
+        self.assertEqual(s["btcratio"]["COIN"]["yf_ticker"], "COIN")
+        s, t = self._load("[tickers.QQQ]\nkind = \"index\"\n")
+        self.assertNotIn("btcratio", s)
+        with self.assertRaises(ValueError) as cm:
+            self._load("[btcratio.COIN]\nshares_m = 264.8\n[tickers.QQQ]\n")
+        self.assertIn("shares_asof", str(cm.exception))
+        with self.assertRaises(ValueError) as cm:
+            self._load("[btcratios.COIN]\nshares_m = 1\n[tickers.QQQ]\n")
+        self.assertIn("[btcratio.*]", str(cm.exception))
+
+    def test_repo_config_has_coin(self):
+        s, t = sc.load_config()
+        self.assertIn("COIN", s.get("btcratio", {}))
+        self.assertIn("COIN", t)
+        self.assertFalse(t["COIN"]["options"])                    # 只考虑正股与 2x
+        self.assertEqual(t["COIN"]["two_x"], "CONL")
+        self.assertIsNone(t["COIN"]["value_zone"])
+
+    def _results(self):
+        mk = TestRenderOpenZoneAlert._r
+        rs = [mk(TestRenderOpenZoneAlert(), s_, 18.0, None) for s_ in ("SOFI", "QQQ")]
+        rs.append(mk(TestRenderOpenZoneAlert(), "COIN", 139.0, None))
+        return rs
+
+    def test_attach_passes_live_close_and_degrades(self):
+        self.assertIsNone(sc.attach_btcratio(dict(sc.SETTINGS_DEFAULTS), self._results(), _BR_TODAY))
+        settings = {**sc.SETTINGS_DEFAULTS, "btcratio": {"COIN": _br_cfg()}}
+        seen = {}
+
+        def fake_run(cfgs, **kw):
+            seen.update(kw)
+            return {"by_symbol": {"COIN": {"error": "x"}}, "cfgs": cfgs, "warnings": []}
+        with mock_attr(sc.btcratio, "run", fake_run):
+            meta = sc.attach_btcratio(settings, self._results(), _BR_TODAY)
+        self.assertEqual(seen["live_px"], {"COIN": 139.0})
+        self.assertEqual(seen["today"], _BR_TODAY)
+        self.assertEqual(seen["cache_dir"], sc.DATA)
+        self.assertEqual(meta["cfgs"], settings["btcratio"])
+        rs = self._results()
+        rs[2]["stale_data"] = "x"
+        with mock_attr(sc.btcratio, "run", fake_run):
+            sc.attach_btcratio(settings, rs, _BR_TODAY)
+        self.assertEqual(seen["live_px"], {})
+
+        def boom(*a, **k):
+            raise KeyError("close")
+        with mock_attr(sc.btcratio, "run", boom):
+            meta = sc.attach_btcratio(settings, self._results(), _BR_TODAY)
+        self.assertIn("比值模块异常", meta["by_symbol"]["COIN"]["error"])
+        self.assertIn("比值取不到", "\n".join(sc.btcratio_block(meta)))
+
+    def test_render_both_reports(self):
+        cfg = _br_cfg()
+        a = br.assess(_br_df(), cfg, today=_BR_TODAY, live_px=_br_px(1.9))
+        meta = {"by_symbol": {"COIN": a}, "cfgs": {"COIN": cfg}, "warnings": [], "from_cache": False}
+        rs = self._results()[:2]
+        now = datetime(2026, 10, 30, 9, 45, tzinfo=sc.ET)
+        text = sc.render_open(rs, dict(TestRenderOpenZoneAlert.REGIME), now,
+                              sc.SETTINGS_DEFAULTS, btcratio_meta=meta)
+        self.assertIn("## BTC 平台股 / BTC 比值", text)
+        self.assertIn("无异动", text)
+        self.assertLess(text.index("## BTC 平台股"), text.index("\n---"))
+        text = sc.render_open(rs, dict(TestRenderOpenZoneAlert.REGIME), now, sc.SETTINGS_DEFAULTS)
+        self.assertNotIn("比值", text)
+        for r in rs:
+            r.update({"tech": None, "state": "NO_DATA", "csp": None, "leap": None,
+                      "iv30": None, "spread": None, "ladder": None, "error": None})
+        now = datetime(2026, 10, 30, 15, 45, tzinfo=sc.ET)
+        text = sc.render_close(rs, dict(TestRenderOpenZoneAlert.REGIME), pd.DataFrame(), now,
+                               btcratio_meta=meta)
+        self.assertIn("## BTC 平台股 / BTC 比值", text)
+        self.assertIn("🟢 现价已在 T1 档内", text)
+        text = sc.render_close(rs, dict(TestRenderOpenZoneAlert.REGIME), pd.DataFrame(), now)
+        self.assertNotIn("BTC 比值", text)
+
+
+class TestBtcratioMain(unittest.TestCase):
+    """main(): --no-btcratio 不拉不出; 历史只有定时尾盘扫描写 (--force 不写, 开盘不写)。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.reports, self.data = root / "reports", root / "data"
+        self.calls = []
+        cfg = _br_cfg()
+        a = br.assess(_br_df(), cfg, today=_BR_TODAY, live_px=_br_px(1.9))
+        a["from_cache"] = False
+        self.meta = {"by_symbol": {"COIN": a}, "cfgs": {"COIN": cfg}, "warnings": [],
+                     "from_cache": False, "fetched": None}
+
+        def fake_run(cfgs, **kw):
+            self.calls.append(kw)
+            return dict(self.meta)
+        settings = {**sc.SETTINGS_DEFAULTS, "btcratio": {"COIN": cfg}}
+        tickers = {"QQQ": {**sc.TICKER_DEFAULTS, "kind": "index"}}
+        self.patches = [
+            mock_attr(sc, "REPORTS", self.reports), mock_attr(sc, "DATA", self.data),
+            mock_attr(sc, "IV_HISTORY", self.data / "iv_history.csv"),
+            mock_attr(sc, "load_config", lambda: (dict(settings), dict(tickers))),
+            mock_attr(sc, "fetch_regime", lambda s: dict(TestRenderOpenZoneAlert.REGIME)),
+            mock_attr(sc, "batch_history", lambda syms: {s_: None for s_ in syms}),
+            mock_attr(sc, "market_is_live", lambda: True),
+            mock_attr(sc, "next_earnings", lambda tk: None),
+            mock_attr(sc, "load_state", lambda: {}),
+            mock_attr(sc, "save_state", lambda st: None),
+            mock_attr(sc, "append_journal", lambda rows, path=None: 0),
+            mock_attr(sc.btcratio, "run", fake_run)]
+        for p_ in self.patches:
+            p_.__enter__()
+
+    def tearDown(self):
+        for p_ in reversed(self.patches):
+            p_.__exit__()
+        self.tmp.cleanup()
+
+    def _main(self, *argv):
+        import contextlib
+        with mock_attr(sys, "argv", ["scanner.py", "--no-insider", "--no-options",
+                                     "--no-revisions", "--no-mnav", "--no-shortside", *argv]), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            return sc.main()
+
+    def _hist(self):
+        return self.data / br.HISTORY_NAME
+
+    def test_scheduled_close_writes_history_and_block(self):
+        self.assertEqual(self._main("--mode", "close"), 0)
+        self.assertEqual(len(self.calls), 1)
+        self.assertTrue(self._hist().exists())
+        self.assertEqual(self._hist().read_text(encoding="utf-8").count("\n"), 2)
+        md = next(self.reports.glob("*-close.md")).read_text(encoding="utf-8")
+        self.assertIn("## BTC 平台股 / BTC 比值", md)
+        self.assertIn("比值 **1.900‰**", md)
+
+    def test_force_and_open_do_not_write_history(self):
+        self.assertEqual(self._main("--mode", "close", "--force"), 0)
+        self.assertFalse(self._hist().exists())
+        self.assertIn("## BTC 平台股 / BTC 比值",
+                      next(self.reports.glob("*-close-manual.md")).read_text(encoding="utf-8"))
+        self.assertEqual(self._main("--mode", "open"), 0)
+        self.assertFalse(self._hist().exists())
+        self.assertIn("## BTC 平台股 / BTC 比值",
+                      next(self.reports.glob("*-open.md")).read_text(encoding="utf-8"))
+
+    def test_no_btcratio_flag(self):
+        self.assertEqual(self._main("--mode", "close", "--no-btcratio"), 0)
+        self.assertEqual(self.calls, [])
+        self.assertFalse(self._hist().exists())
+        self.assertNotIn("BTC 比值", next(self.reports.glob("*-close.md")).read_text(encoding="utf-8"))
+
+
+class TestBtcratioCli(unittest.TestCase):
+    def test_cli_reads_repo_config(self):
+        import contextlib
+        seen = {}
+
+        def fake_run(cfgs, **kw):
+            seen.update(kw); seen["cfgs"] = cfgs
+            return {"by_symbol": {s_: {"error": "x"} for s_ in cfgs}, "cfgs": cfgs, "warnings": []}
+        with mock_attr(br, "run", fake_run), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(br.main([]), 0)
+            self.assertEqual(br.main(["ZZZZ"]), 1)
+        self.assertIn("COIN", seen["cfgs"])
+        self.assertEqual(seen["cache_dir"].name, "data")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
