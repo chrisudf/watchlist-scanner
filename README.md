@@ -572,8 +572,9 @@ MSTR; 不配整段不出)。**只做提示, 不进状态机、不当门控、不
   (周末沿用周五股价、BTC 继续动), 统计一律只数交易日 (扣 NYSE 假日表)。股本用
   `total_outstanding_shares` (A+B 类, 与官网市值一致; `processedMetrics.sharesOutstanding`
   只有 A 类), 它**按月跳变**, ATM 密集的月份网站读数偏低几个百分点 (7–8 月约
-  4–7%) —— 报告印股本上次变动日期。标的也在 `[tickers]` 里时今天的股价用扫描器
-  自己的收盘 (陈旧日线不用)。
+  4–7%) —— 报告印股本上次变动日期。标的也在 `[tickers]` 里、且扫描器的日线最后一根
+  就是今天时, 今天的股价用扫描器自己的收盘 (陈旧日线不用; 开盘扫描和 `--no-options`
+  不跑日线陈旧检查, 所以看日期)。
 - **净债权手工维护**: `[mnav.MSTR]` 的 `debt_b` / `pref_b` / `usd_b` ($B) 抄
   strategy.com 首页 Debt / Pref / USD Reserve / USD Cash (或每周 8-K), 改数字同步
   `claims_asof`; 超过 `claims_stale_days` (45) 天报告提醒。官网 "Debt" 自 2026-08-31

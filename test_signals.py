@@ -6270,10 +6270,11 @@ class TestMnavScanner(unittest.TestCase):
         s, _ = sc.load_config()
         self.assertIn("MSTR", s.get("mnav", {}))
 
-    def _results(self):
+    def _results(self, mstr_asof=_MN_TODAY.isoformat()):
         mk = TestRenderOpenZoneAlert._r
         rs = [mk(TestRenderOpenZoneAlert(), s_, 18.0, None) for s_ in ("SOFI", "QQQ")]
         rs.append(mk(TestRenderOpenZoneAlert(), "MSTR", 120.0, None))
+        rs[-1]["tech"]["as_of"] = mstr_asof
         return rs
 
     def test_attach_passes_live_close_and_degrades(self):
@@ -6295,6 +6296,12 @@ class TestMnavScanner(unittest.TestCase):
         rs[2]["stale_data"] = "x"                           # 陈旧日线不当 live 价
         with mock_attr(sc.mnav, "run", fake_run):
             sc.attach_mnav(settings, rs, _MN_TODAY)
+        self.assertEqual(seen["live_px"], {})
+        # 开盘 / --no-options 扫描不跑日线陈旧检查 (stale_data 不置): 日线最后一根不是今天
+        # 也不能当今天的价 (PR #28 评审在 attach_btcratio 上指出的同一个问题)
+        seen.clear()
+        with mock_attr(sc.mnav, "run", fake_run):
+            sc.attach_mnav(settings, self._results(mstr_asof="2026-10-15"), _MN_TODAY)
         self.assertEqual(seen["live_px"], {})
 
         def boom(*a, **k):
