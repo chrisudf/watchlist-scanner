@@ -7,3 +7,4 @@ __pycache__/
 # —— 都是只增不改的本地历史, 每台机器各自一份, 不进版本库
 data/
 # (+ mnav_strategytracker.json 缓存 / mnav_history.csv)
+# (+ btcratio_<SYM>.csv 缓存 / btcratio_history.csv)
