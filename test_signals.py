@@ -8,6 +8,7 @@ No network access needed — everything here is synthetic data.
 import io
 import json
 import math
+import os
 import re
 import sys
 import tempfile
@@ -7212,6 +7213,12 @@ class TestBtcratioFetch(unittest.TestCase):
         df = pd.DataFrame(cols, index=idx)
         return df
 
+    @staticmethod
+    def _written_at(p, hh, mm, day=_BR_TODAY):
+        """缓存文件的写入时间改成 day 的 hh:mm ET (fetch_pair 按它判断今天那行是不是盘中快照)。"""
+        ts = datetime(day.year, day.month, day.day, hh, mm, tzinfo=br.ET).timestamp()
+        os.utime(p, (ts, ts))
+
     def test_fetch_writes_cache_then_uses_it(self):
         calls = []
 
@@ -7224,11 +7231,39 @@ class TestBtcratioFetch(unittest.TestCase):
             self.assertFalse(got["from_cache"]); self.assertTrue(p.exists())
             self.assertEqual(calls, [["COIN", "BTC-USD"]])
             self.assertEqual(list(got["df"].columns), ["close", "btc"])
+            # 今天那行是收盘后写的 → 直接用
+            self._written_at(p, 16, 30)
             got2 = br.fetch_pair("COIN", p, _BR_TODAY, dl)
             self.assertTrue(got2["from_cache"]); self.assertEqual(len(calls), 1)
-            # 缓存落后一天 → 重下
-            got3 = br.fetch_pair("COIN", p, date(2026, 11, 2), dl)
+            # 收盘前写的 (开盘扫描那份) 是盘中快照 → 重下
+            self._written_at(p, 9, 45)
+            got3 = br.fetch_pair("COIN", p, _BR_TODAY, dl)
             self.assertFalse(got3["from_cache"]); self.assertEqual(len(calls), 2)
+            # 缓存落后一天 → 重下
+            got4 = br.fetch_pair("COIN", p, date(2026, 11, 2), dl)
+            self.assertFalse(got4["from_cache"]); self.assertEqual(len(calls), 3)
+            # 缓存比 today 还新 (research 的 --asof) → 直接用
+            got5 = br.fetch_pair("COIN", p, date(2026, 10, 29), dl)
+            self.assertTrue(got5["from_cache"]); self.assertEqual(len(calls), 3)
+
+    def test_close_scan_refetches_cache_written_at_open(self):
+        # 2026-11-02 修: 开盘扫描写进缓存的今天那行 (BTC 80,000), 尾盘扫描 (BTC 已到 76,000)
+        # 以前直接命中缓存, 比值按 6 小时前的 BTC 算成 1.900 (进 T1), 实际 2.000
+        cfgs = br.validate_config({"COIN": {"two_x": "CONL"}}, _BR_TODAY)
+        idx = pd.bdate_range(end=_BR_TODAY.isoformat(), periods=300)
+
+        def feed(btc_now, coin_now):
+            return lambda t: pd.DataFrame({"COIN": [160.0] * 299 + [coin_now],
+                                           "BTC-USD": [80_000.0] * 299 + [btc_now]}, index=idx)
+        with tempfile.TemporaryDirectory() as d:
+            br.run(cfgs, cache_dir=Path(d), today=_BR_TODAY, download=feed(80_000.0, 160.0))
+            self._written_at(Path(d) / br.CACHE_NAME.format("COIN"), 9, 45)
+            meta = br.run(cfgs, cache_dir=Path(d), today=_BR_TODAY, live_px={"COIN": 152.0},
+                          download=feed(76_000.0, 152.0))
+        a = meta["by_symbol"]["COIN"]
+        self.assertFalse(a["from_cache"])
+        self.assertEqual(a["btc"], 76_000.0)
+        self.assertAlmostEqual(a["ratio"], 2.0)
 
     def test_fetch_failure_falls_back_to_cache_or_raises(self):
         def boom(tickers):
@@ -7241,10 +7276,16 @@ class TestBtcratioFetch(unittest.TestCase):
             br.fetch_pair("COIN", p, _BR_TODAY, lambda t: self._close(end="2026-10-29"))
             got = br.fetch_pair("COIN", p, _BR_TODAY, boom)
             self.assertTrue(got["from_cache"])
-            self.assertIn("取数失败", got["warnings"][0])
+            self.assertIn("取数失败 (OSError: timed out), 用的是到 2026-10-29 的缓存", got["warnings"][0])
             # 返回里缺标的列 → 也算失败, 退回缓存
             got = br.fetch_pair("COIN", p, _BR_TODAY, lambda t: self._close(with_sym=False))
             self.assertTrue(got["from_cache"])
+            # 退回的是今天收盘前写的盘中快照 → 说清 BTC 是几点的
+            br.fetch_pair("COIN", p, _BR_TODAY, lambda t: self._close())
+            self._written_at(p, 9, 45)
+            got = br.fetch_pair("COIN", p, _BR_TODAY, boom)
+            self.assertTrue(got["from_cache"])
+            self.assertIn("用的是今天 09:45 ET 写的缓存 (BTC 是那时的)", got["warnings"][0])
 
     def test_btc_aligned_to_stock_days(self):
         idx = pd.date_range("2026-10-20", periods=10, freq="D")          # 含周末

@@ -48,9 +48,9 @@
   三选二; 这里只管"相对 BTC 便不便宜"。
 
 数据: yfinance 日线 (标的 + BTC-USD, 上市起全量, 约 1,400 行, 几秒), 缓存
-data/btcratio_<SYM>.csv; 缓存已含今天就不重下; 取数失败退回缓存并出 ⚠️; 无缓存整段
-降级成一行。BTC-USD 是 UTC 日, 今天那行是实时的; 标的在 [tickers] 里时今天的收盘用
-扫描器自己的 (陈旧日线不用)。
+data/btcratio_<SYM>.csv; 缓存今天收盘后写过才不重下 (收盘前写的今天那行是盘中快照,
+见 fetch_pair); 取数失败退回缓存并出 ⚠️; 无缓存整段降级成一行。BTC-USD 是 UTC 日,
+今天那行是实时的; 标的在 [tickers] 里时今天的收盘用扫描器自己的 (陈旧日线不用)。
 
 命令行 (手工看一眼, 不写历史):
     .venv/bin/python btcratio.py [COIN ...]
@@ -61,12 +61,15 @@ import csv
 import math
 import os
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 
+ET = ZoneInfo("America/New_York")
+CLOSE_ET = time(16, 0)          # 今天那行写于这之后才算收盘数, 之前写的是盘中快照
 CACHE_NAME = "btcratio_{}.csv"
 HISTORY_NAME = "btcratio_history.csv"
 BTC_TICKER = "BTC-USD"
@@ -235,12 +238,25 @@ def _read_cache(path: Path) -> pd.DataFrame | None:
     return df[["close", "btc"]].astype(float).sort_index()
 
 
+def _written_et(path: Path) -> datetime | None:
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, ET)
+    except OSError:
+        return None
+
+
 def fetch_pair(yf_ticker: str, cache_path: Path, today: date, download=_download) -> dict:
     """-> {"df": DataFrame(index=交易日, close, btc), "warnings": [..], "from_cache": bool,
-    "fetched": iso}。缓存已含今天 (或今天不是交易日而缓存到前一交易日) 就不重下; 取数
-    失败退回缓存 (带 ⚠️); 没缓存就抛。"""
+    "fetched": iso}。缓存的最后一行晚于今天, 或就是今天且缓存写于今天收盘 (CLOSE_ET) 之后,
+    才不重下; 其余 (含周末) 都重下, 几秒。收盘前写的今天那行是盘中快照: 开盘扫描 (~9:45)
+    写的缓存尾盘扫描 (~15:45) 再读, BTC 是 6 小时前的, 比值、阶梯价、旗标和历史那一行
+    都跟着偏 (2026-11-02 修)。取数失败退回缓存 (带 ⚠️); 没缓存就抛。"""
     cached = _read_cache(cache_path)
-    if cached is not None and cached.index[-1].date() >= today:
+    last = cached.index[-1].date() if cached is not None else None
+    written = _written_et(cache_path) if cached is not None else None
+    if last is not None and (last > today or (
+            last == today and written is not None
+            and written >= datetime.combine(today, CLOSE_ET, tzinfo=ET))):
         return {"df": cached, "warnings": [], "from_cache": True, "fetched": None}
     try:
         close = download([yf_ticker, BTC_TICKER])
@@ -267,9 +283,10 @@ def fetch_pair(yf_ticker: str, cache_path: Path, today: date, download=_download
     except Exception as e:          # noqa: BLE001
         why = f"{type(e).__name__}: {str(e).splitlines()[0][:80]}" if str(e) else type(e).__name__
         if cached is not None:
+            src = (f"今天 {written:%H:%M} ET 写的缓存 (BTC 是那时的)"
+                   if last == today and written is not None else f"到 {last} 的缓存")
             return {"df": cached, "from_cache": True, "fetched": None,
-                    "warnings": [f"yfinance 取数失败 ({why}), 用的是到 "
-                                 f"{cached.index[-1].date()} 的缓存"]}
+                    "warnings": [f"yfinance 取数失败 ({why}), 用的是{src}"]}
         raise RuntimeError(f"yfinance 取数失败且无缓存 ({why})") from e
 
 
@@ -719,10 +736,9 @@ def append_history(rows: list[dict], path: Path) -> int:
 
 def main(argv: list[str]) -> int:
     import tomllib
-    from zoneinfo import ZoneInfo
     base = Path(__file__).resolve().parent
     raw = tomllib.loads((base / "watchlist.toml").read_text(encoding="utf-8"))
-    today = datetime.now(ZoneInfo("America/New_York")).date()
+    today = datetime.now(ET).date()
     cfgs = validate_config(raw.get("btcratio"), today)
     if argv:
         keep = {a.upper() for a in argv}
