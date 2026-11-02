@@ -3337,14 +3337,17 @@ def snapshot_shortside(meta, d: str) -> None:
 
 def attach_mnav(settings: dict, results, today: date) -> dict | None:
     """[mnav.*] 配了才跑 -> mnav.run 的 meta (含 cfgs); 没配 = None (整段不出)。
-    标的恰好也在 watchlist 里时, 今天的股价用扫描器自己的收盘 (网站的是延迟的)。
-    整段包在 try 里, 同 attach_insider / attach_revisions: 附加信息自己出 bug 也
-    只能降级成报告里一行 ⚠️。"""
+    标的恰好也在 watchlist 里时, 今天的股价用扫描器自己的收盘 (网站的是延迟的);
+    陈旧日线不用 —— 只看 stale_data 不够: 开盘 / --no-options 扫描不跑 daily_bar_stale,
+    批量日线缺今天那根时昨天的收盘会被当成今天的价, 所以还要日线最后一根就是今天
+    (PR #28 评审在 attach_btcratio 上指出的同一个问题)。整段包在 try 里, 同
+    attach_insider / attach_revisions: 附加信息自己出 bug 也只能降级成报告里一行 ⚠️。"""
     cfgs = settings.get("mnav") or {}
     if not cfgs:
         return None
     live = {r["symbol"]: r["tech"]["close"] for r in results
-            if r["symbol"] in cfgs and r.get("tech") and not r.get("stale_data")}
+            if r["symbol"] in cfgs and r.get("tech") and not r.get("stale_data")
+            and r["tech"].get("as_of") == today.isoformat()}
     try:
         return mnav.run(cfgs, cache_path=DATA / mnav.CACHE_NAME, today=today,
                         holidays=NYSE_HOLIDAYS, live_px=live)
