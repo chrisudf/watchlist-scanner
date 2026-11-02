@@ -16,6 +16,8 @@
     55.3 亿只算 C 类; TSM 流通股 378 亿是普通股、总股本 51.9 亿是折成 ADR)。ETF 用
     资产 ÷ 净值 —— yfinance 给 ETF 的 sharesOutstanding 是旧数 (QQQ 3.93 亿 vs
     7.01 亿、GLD 2.60 亿 vs 3.84 亿)。10/28 核对: SOFI 算出 17.2%, Yahoo 页面 17.17%。
+    结算日之后才拆股/合股的 (同一份 info 的 lastSplitDate / lastSplitFactor), 空头
+    股数还是拆股前的口径, 占比和一年中位空到下一期 (split_pending)。
   - IBKR 借券费 + 可借股数: 公共 FTP 上的 usa.txt (约 1.8MB, 约 2 万行, 几分钟
     一更), `|` 分隔, 表头 #SYM|CUR|NAME|CON|ISIN|REBATERATE|FEERATE|AVAILABLE|FIGI。
     首行 #BOF|2026.10.28|01:18:49 是美东时间 (10/28 实测比对过)。可借股数超过
@@ -225,9 +227,28 @@ def first_trade(info: dict) -> str | None:
         return None
 
 
+def last_split(info: dict) -> dict | None:
+    """yfinance info 的 lastSplitDate (秒) + lastSplitFactor ("10:1" 拆股 / "1:10" 合股)
+    -> {"date": ISO 日期, "ratio": 新股数 ÷ 旧股数}; 没拆过股或写坏了 = None。
+    Yahoo 把分拆也记成拆股 (GE 2024-04 分拆 GE Vernova 记成 "1253:1000"), 分不出来,
+    一样当拆股 —— 只用来让占比空一期 (split_pending), 不按它折算股数。"""
+    try:
+        new, old = (float(x) for x in str(info.get("lastSplitFactor")).split(":"))
+        d = datetime.fromtimestamp(info["lastSplitDate"], timezone.utc).date()
+    except (KeyError, TypeError, ValueError, OverflowError, OSError):
+        return None
+    return {"date": d.isoformat(), "ratio": new / old} if new > 0 and old > 0 else None
+
+
+def split_cn(ratio: float) -> str:
+    """新股数 ÷ 旧股数 -> "拆股 10:1" / "合股 1:10" (同 scanner 的拆股提示)。"""
+    return f"拆股 {ratio:g}:1" if ratio >= 1 else f"合股 1:{1 / ratio:g}"
+
+
 def fetch_shares(symbols: list[str], workers: int = 4, ticker_factory=None) -> dict:
-    """-> {sym: {"shares", "basis", "since"} | None}; since = 上市日 (截自身基准的
-    历史用)。单只取不到 = None (那一格显示 —), 不抛。"""
+    """-> {sym: {"shares", "basis", "since", "split"} | None}; since = 上市日 (截自身
+    基准的历史用), split = 最近一次拆股 (last_split, 查结算日之后拆没拆过)。单只取不到
+    = None (那一格显示 —), 不抛。"""
     if ticker_factory is None:
         import yfinance as yf
         ticker_factory = yf.Ticker
@@ -238,24 +259,37 @@ def fetch_shares(symbols: list[str], workers: int = 4, ticker_factory=None) -> d
             n, basis = shares_basis(info)
         except Exception:       # noqa: BLE001
             return sym, None
-        return sym, ({"shares": n, "basis": basis, "since": first_trade(info)}
-                     if n else None)
+        return sym, ({"shares": n, "basis": basis, "since": first_trade(info),
+                      "split": last_split(info)} if n else None)
 
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         return dict(pool.map(one, symbols))
 
 
+def split_pending(info: dict | None) -> dict | None:
+    """FINRA 结算日之后才拆股/合股 -> 那次拆股 ({"date", "ratio"}); 否则 None。
+    这时空头股数还是拆股前的口径, Yahoo 股本已是拆股后的, 相除差一个拆股比例 (1:10
+    合股会把 10% 算成 100%) —— 占比和一年中位空到下一期 (PR #27 评审)。回补天数、
+    较上期、一年分位都是 FINRA 自己的数相比, 口径一致, 照常显示。"""
+    v = (info or {}).get("si") or {}
+    sp = ((info or {}).get("shares") or {}).get("split")
+    return sp if sp and v.get("date") and sp["date"] > v["date"] else None
+
+
 def si_pct(info: dict | None) -> float | None:
-    """空头占流通股 (%) = FINRA 空头股数 ÷ Yahoo 股本; 缺任一个 = None。"""
+    """空头占流通股 (%) = FINRA 空头股数 ÷ Yahoo 股本; 缺任一个、或结算日之后拆过股
+    (两边口径不同, split_pending) = None。"""
     si = ((info or {}).get("si") or {}).get("si")
     sh = ((info or {}).get("shares") or {}).get("shares")
-    return si / sh * 100 if si is not None and sh else None
+    if si is None or not sh or split_pending(info):
+        return None
+    return si / sh * 100
 
 
 def si_baseline(info: dict | None) -> dict | None:
-    """这只票**自己**过去一年的空头 -> {"median": 中位占比 %, "rank": 现在排第几
-    分位 (0-100, 100 = 一年最高, 含持平), "n": 期数, "new_high": 严格高于窗口里此前
-    每一期}; 不满 BASE_MIN_N 期 = None。
+    """这只票**自己**过去一年的空头 -> {"median": 中位占比 % (结算日之后拆过股 =
+    None, 见 split_pending), "rank": 现在排第几分位 (0-100, 100 = 一年最高, 含持平),
+    "n": 期数, "new_high": 严格高于窗口里此前每一期}; 不满 BASE_MIN_N 期 = None。
 
     同样 17% 对 SOFI 和 NVDA 意义不同 (10/28: SOFI 一年中位 12.8%, NVDA 1.2%), 横比
     绝对值不如跟自己比。分母统一用现在的股本 (一年里大量增发/回购的票有偏差)。
@@ -278,7 +312,8 @@ def si_baseline(info: dict | None) -> dict | None:
     # 分位 100 也包括跟此前最高持平 (连续几期不变、全是 0 都是 100), 只用来显示;
     # 新高旗标看 new_high (PR #27 评审)
     prior = [r[1] for r in rows if r[0] < v["date"]]
-    return {"median": statistics.median(xs) / sh["shares"] * 100,
+    return {"median": (None if split_pending(info)
+                       else statistics.median(xs) / sh["shares"] * 100),
             "rank": sum(1 for x in xs if x <= v["si"]) / len(xs) * 100,
             "n": len(xs),
             "new_high": bool(prior) and v["si"] > max(prior)}
@@ -385,7 +420,8 @@ def si_flag(v: dict | None, s: dict, pct: float | None = None,
     if pct is not None and pct >= s["short_pct_warn"]:
         parts.append(f"空头占流通股 {pct:.1f}%")
     if base and base["new_high"]:
-        parts.append(f"空头创一年新高 (一年中位 {base['median']:.1f}%)")
+        parts.append("空头创一年新高" + (f" (一年中位 {base['median']:.1f}%)"
+                                        if base["median"] is not None else ""))
     if v.get("dtc") is not None and v["dtc"] >= s["short_dtc_warn"]:
         parts.append(f"回补 {v['dtc']:.1f} 天")
     if v.get("chg") is not None and v["chg"] >= s["short_chg_warn"]:
@@ -407,6 +443,11 @@ def _stale(d: str | None, today: date, days: int) -> bool:
         return False
 
 
+def _md(d: str, ref: str | None) -> str:
+    """跟 ref 同一年只写 MM-DD, 跨年写全 (免得跟表头的 MM-DD 撞上)。"""
+    return d[5:] if ref and d[:4] == ref[:4] else d
+
+
 KIND_LABEL = {"index": "指数", "etf": "ETF"}
 
 
@@ -418,19 +459,22 @@ TABLE_SEP = "|---|--:|--:|--:|--:|--:|--:|--:|"
 
 def _row(sym: str, kind: str, info: dict | None, si_date: str | None = None) -> str:
     """表格一行, 列见 TABLE_HEAD。缺的格子写 —。这只的结算日跟表头 (si_date) 不同时
-    在代码后面注明它自己的结算日, 不然旧一期的数会被当成表头那一期 (PR #27 评审)。"""
+    在代码后面注明它自己的结算日, 不然旧一期的数会被当成表头那一期; 结算日之后拆过股
+    的注明那次拆股, 占比和一年中位写 — (split_pending) (都是 PR #27 评审)。"""
     info = info or {}
     v, b = info.get("si") or {}, info.get("borrow")
     pct, base = si_pct(info), si_baseline(info)
     tags = [KIND_LABEL[kind]] if kind in KIND_LABEL else []
     if v.get("date") and si_date and v["date"] != si_date:
-        tags.append(f"{v['date'][5:] if v['date'][:4] == si_date[:4] else v['date']} 结算")
+        tags.append(f"{_md(v['date'], si_date)} 结算")
+    if sp := split_pending(info):
+        tags.append(f"{_md(sp['date'], si_date)} {split_cn(sp['ratio'])}")
     label = f"{sym} ({', '.join(tags)})" if tags else sym
     chg = ("拆股" if v.get("split") else
            f"{v['chg']:+.0f}%" if v.get("chg") is not None else "—")
     cells = [label,
              f"{pct:.1f}%" if pct is not None else "—",
-             f"{base['median']:.1f}%" if base else "—",
+             f"{base['median']:.1f}%" if base and base["median"] is not None else "—",
              f"{base['rank']:.0f}" if base else "—",
              f"{v['dtc']:.1f}" if v.get("dtc") is not None else "—",
              chg,
@@ -467,6 +511,11 @@ def report_block(items: list[tuple[str, str, dict | None]], meta: dict, s: dict,
             if _stale(own, today, SI_STALE_DAYS):
                 lines.append(f"- ⚠️ **{sym}** 的 FINRA 最新一期是 {own}, 超过 "
                              f"{SI_STALE_DAYS} 天 —— 表里它的空头数是旧的")
+    for sym, _, info in rows:
+        if sp := split_pending(info):
+            lines.append(f"- ⚠️ **{sym}** {sp['date']} {split_cn(sp['ratio'])}, 在 FINRA 结算日 "
+                         f"{info['si']['date']} 之后 —— 空头股数还是拆股前的口径, 占比和一年中位"
+                         "空到下一期 (回补天数、较上期、一年分位照常)")
     if _stale(asof, today, BORROW_STALE_DAYS):
         lines.append(f"- ⚠️ IBKR 借券文件停在 {asof} —— 超过 {BORROW_STALE_DAYS} 天没更新")
 

@@ -6660,7 +6660,8 @@ class TestShortsideShares(unittest.TestCase):
                 self.info = {"quoteType": "EQUITY", "sharesOutstanding": 100e6} \
                     if sym == "OK" else {}
         got = ss.fetch_shares(["OK", "BAD", "EMPTY"], workers=2, ticker_factory=Tk)
-        self.assertEqual(got, {"OK": {"shares": 100e6, "basis": "out", "since": None},
+        self.assertEqual(got, {"OK": {"shares": 100e6, "basis": "out", "since": None,
+                                      "split": None},
                                "BAD": None, "EMPTY": None})
 
     def test_pct_and_failure_isolated_in_run(self):
@@ -6753,6 +6754,74 @@ class TestShortsideBaseline(unittest.TestCase):
         self.assertIn("| XX | 12.3% | 11.2% | 100 | 1.0 |", text)
         self.assertIn("- ⚠️ **XX** 空头创一年新高", text)
         self.assertNotIn("**YY**", text)                   # ETF 只列数
+
+
+class TestShortsideSplitAfterSettlement(unittest.TestCase):
+    """FINRA 结算日之后才拆股/合股: 空头股数还是旧口径, Yahoo 股本已是新的, 占比空到
+    下一期 (PR #27 评审)。"""
+    REV = {"date": "2026-10-20", "ratio": 0.1}        # 结算日 10-15 之后 1:10 合股
+
+    def _info(self, split, shares=100.0):
+        # 合股前 1000 股、空头 100 股 = 10%; 合股后 Yahoo 只剩 100 股
+        dates, sis = _semimonthly(24), [90] * 23 + [100]
+        recs = [_finra_rec("XX", d, si, sis[i - 1] if i else si, 1.0)
+                for i, (d, si) in enumerate(zip(dates, sis))]
+        return {"si": ss.parse_finra(recs)["XX"],
+                "shares": {"shares": shares, "basis": "float", "since": None, "split": split}}
+
+    def test_last_split_from_yahoo_info(self):
+        nvda = {"lastSplitDate": 1717977600, "lastSplitFactor": "10:1"}     # 11/02 实测
+        self.assertEqual(ss.last_split(nvda), {"date": "2024-06-10", "ratio": 10.0})
+        self.assertEqual(ss.last_split({**nvda, "lastSplitFactor": "1:10"})["ratio"], 0.1)
+        # GE 2024-04 分拆 GE Vernova, Yahoo 也记成拆股
+        self.assertAlmostEqual(ss.last_split({"lastSplitDate": 1712016000,
+                                              "lastSplitFactor": "1253:1000"})["ratio"], 1.253)
+        for bad in ({"lastSplitDate": None, "lastSplitFactor": None},     # SOFI / QQQ 实测
+                    {}, {"lastSplitFactor": "10:1"}, {**nvda, "lastSplitFactor": "abc"},
+                    {**nvda, "lastSplitFactor": "0:1"}, {**nvda, "lastSplitFactor": "10"}):
+            self.assertIsNone(ss.last_split(bad), bad)
+        self.assertEqual((ss.split_cn(10.0), ss.split_cn(0.1), ss.split_cn(1.5)),
+                         ("拆股 10:1", "合股 1:10", "拆股 1.5:1"))
+
+        class Tk:
+            def __init__(self, sym):
+                self.info = {"quoteType": "EQUITY", "sharesOutstanding": 24_147e6, **nvda}
+        self.assertEqual(ss.fetch_shares(["NVDA"], ticker_factory=Tk)["NVDA"]["split"],
+                         {"date": "2024-06-10", "ratio": 10.0})
+
+    def test_ratio_and_median_wait_for_next_period(self):
+        self.assertEqual(ss.si_pct(self._info(None)), 100.0)    # 不查拆股: 10% 算成 100%
+        info = self._info(self.REV)
+        self.assertEqual(ss.split_pending(info), self.REV)
+        self.assertIsNone(ss.si_pct(info))
+        b = ss.si_baseline(info)
+        self.assertIsNone(b["median"])                          # 中位也差同一个比例
+        # 分位、新高是 FINRA 自己的数相比, 口径一致
+        self.assertEqual((b["rank"], b["n"], b["new_high"]), (100, 24, True))
+        flag = ss.si_flag(info["si"], _SS_S, ss.si_pct(info), b)
+        self.assertTrue(flag.startswith("空头创一年新高 (FINRA 10-15) —— "), flag)
+
+    def test_split_on_or_before_settlement_is_already_in_finra(self):
+        for d in ("2026-10-15", "2026-10-01", "2024-06-10"):
+            info = self._info({"date": d, "ratio": 0.1}, shares=1000.0)
+            self.assertIsNone(ss.split_pending(info), d)
+            self.assertEqual(ss.si_pct(info), 10.0, d)
+            self.assertAlmostEqual(ss.si_baseline(info)["median"], 9.0)
+        self.assertIsNone(ss.split_pending({"si": None, "shares": {"split": self.REV}}))
+        self.assertIsNone(ss.split_pending(None))
+
+    def test_report_marks_row_and_warns(self):
+        meta = {"si_date": "2026-10-15", "borrow_asof": None, "errors": {}}
+        text = "\n".join(ss.report_block([("XX", "stock", self._info(self.REV)),
+                                          ("YY", "etf", self._info(self.REV))],
+                                         meta, _SS_S, _SS_TODAY))
+        self.assertIn("| XX (10-20 合股 1:10) | — | — | 100 | 1.0 | +11% | — | — |", text)
+        self.assertIn("| YY (ETF, 10-20 合股 1:10) | — | — | 100 |", text)
+        self.assertIn("- ⚠️ **XX** 2026-10-20 合股 1:10, 在 FINRA 结算日 2026-10-15 之后 —— "
+                      "空头股数还是拆股前的口径, 占比和一年中位空到下一期", text)
+        self.assertIn("- ⚠️ **YY** 2026-10-20 合股 1:10", text)       # ETF 的占比一样不对
+        self.assertNotIn("空头占流通股 100", text)
+        self.assertIn("- ⚠️ **XX** 空头创一年新高 (FINRA 10-15)", text)
 
 
 class TestShortsideBlock(unittest.TestCase):
