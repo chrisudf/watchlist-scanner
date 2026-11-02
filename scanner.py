@@ -1941,6 +1941,19 @@ def retest_gate(state: str, touched_20dma: bool, prev_retested: bool,
         and not prev_retested and (touched_20dma or prev_retest_pending)
 
 
+def retest_tool(cfg: dict) -> str:
+    """首次回踩 20 日线的工具: 出期权票的标的是 3-6 个月 call spread (票见下);
+    options = false 不提期权策略, 只按股价操作 (COIN: 只考虑正股与 2x, PR #28 评审)。"""
+    return "3-6个月 call spread, 票见下" if cfg["options"] else "不出期权票 — 按股价操作"
+
+
+def trend_tools(cfg: dict) -> str:
+    """趋势中段的加仓工具 (剧本: 2x / PMCC)。options = false 的标的不出 PMCC, 只剩
+    2x ETF 和正股 (COIN -> "2x ETF CONL / 正股"; PR #28 评审)。"""
+    return " / ".join(([f"2x ETF {cfg['two_x']}"] if cfg.get("two_x") else [])
+                      + ["PMCC" if cfg["options"] else "正股"])
+
+
 def csp_window_open(zone, in_or_near_zone: bool, stage: str) -> bool:
     """CSP 出票窗口: 有接货价, 且 (价格在/近区 或 恐慌档 或 阶段2解除窗口)。
 
@@ -2783,9 +2796,8 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
                     + " — 恢复后再按股价操作")
         elif retest_seen:
             r["retest"] = True
-            how = "票见下" if cfg["options"] else "无期权链 — 按股价操作"
             r["notes"].append("首次回踩20日线不破 — 剧本首选入场/加仓点 "
-                              f"(3-6个月 call spread, {how})")
+                              f"({retest_tool(cfg)})")
 
         # 趋势中段工具切换 (剧本: 趋势确立、**波动收敛**后 -> 2x/PMCC 加仓)
         # 波动收敛门: 环境止损 (VIX持续>25 / 破200日线) 成立时不得建议进场
@@ -2800,13 +2812,11 @@ def analyze_ticker(sym: str, cfg: dict, hist: pd.DataFrame | None,
                     # PMCC/2x 都是开新多头 — 硬停牌期间不给可执行建议
                     r["notes"].append(
                         f"趋势中段条件已满足 (右侧已 {days_in} 天) 但硬停牌中 "
-                        "(见市场状态 ⛔) — 解除后再切换 2x/PMCC")
+                        f"(见市场状态 ⛔) — 解除后再切换 {trend_tools(cfg)}")
                 else:
-                    two_x = (f"2x ETF {cfg['two_x']} / "
-                             if cfg.get("two_x") else "")
                     r["notes"].append(
-                        f"趋势中段 (右侧已 {days_in} 天): 剧本工具切换 → {two_x}"
-                        "PMCC 金字塔加仓 — 绝不摊低成本; 硬止损: 破20日线无条件; "
+                        f"趋势中段 (右侧已 {days_in} 天): 剧本工具切换 → {trend_tools(cfg)} "
+                        "金字塔加仓 — 绝不摊低成本; 硬止损: 破20日线无条件; "
                         "环境止损: 指数破200日线 / VIX 持续>25 / 倒挂重现即清")
 
         # 正股分批档位只要 zone, 不依赖期权链 — options=false 的标的也要出
@@ -3385,12 +3395,16 @@ def snapshot_mnav(meta, d: str) -> None:
 def attach_btcratio(settings: dict, results, today: date) -> dict | None:
     """[btcratio.*] 配了才跑 -> btcratio.run 的 meta (含 cfgs); 没配 = None (整段不出)。
     标的也在 watchlist 里时, 今天的股价用扫描器自己的收盘 (yfinance 日线的今天那行
-    盘中是半根 bar); 陈旧日线不用。整段包在 try 里, 同 attach_mnav。"""
+    盘中是半根 bar); 陈旧日线不用 —— 只看 stale_data 不够: options = false 的标的 (COIN)
+    和开盘 / --no-options 扫描不跑 daily_bar_stale, 批量日线缺今天那根时昨天的收盘会被当成
+    今天的价, 还盖掉比值模块自己下到的今天的价, 所以还要日线最后一根就是今天 (PR #28
+    评审)。整段包在 try 里, 同 attach_mnav。"""
     cfgs = settings.get("btcratio") or {}
     if not cfgs:
         return None
     live = {r["symbol"]: r["tech"]["close"] for r in results
-            if r["symbol"] in cfgs and r.get("tech") and not r.get("stale_data")}
+            if r["symbol"] in cfgs and r.get("tech") and not r.get("stale_data")
+            and r["tech"].get("as_of") == today.isoformat()}
     try:
         return btcratio.run(cfgs, cache_dir=DATA, today=today, live_px=live)
     except Exception as e:      # noqa: BLE001

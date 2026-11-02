@@ -10,6 +10,10 @@
 比值 = 收盘 ÷ BTC × 1000 (‰)。前瞻收益按交易日数 (20/60/120/250), 有重叠; "首次触及"表才是独立样本。
 股本锚点 (市值比值) 是 10-Q 封面页近似值, 见 btcratio.SHARES_ANCHORS。
 
+入场 = 信号日的下一个交易日收盘 (ENTRY_LAG): 同一天的 BTC UTC 日线收在美东 19:00/20:00, 比
+COIN 16:00 收盘晚 3–4 小时, 信号日当天收盘入场等于用了入场后才知道的 BTC (PR #28 评审)。
+实时报告在 09:45/15:45 用当时的 BTC 算比值, 当天就能看到; 这里按晚一天入场, 只会更保守。
+
 样本本质只有三组 (2022-05 / 2022-12→2023-06 / 2025-04→05) + 2026-10 进行中 —— 所有"胜率"按
 三次经验读, 不是统计显著。
 """
@@ -31,6 +35,7 @@ BINS = [0, 1.9, 2.0, 2.2, 2.4, 2.6, 3.0, 3.5, 4.5, 99]
 LABELS = ["<1.9", "1.9-2.0", "2.0-2.2", "2.2-2.4", "2.4-2.6", "2.6-3.0", "3.0-3.5", "3.5-4.5", "≥4.5"]
 HORIZONS = (20, 60, 120, 250)
 THRESHOLDS = (2.6, 2.4, 2.2, 2.0, 1.9, 1.85, 1.8, 1.7, 1.6, 1.5, 1.2)
+ENTRY_LAG = 1       # 信号日之后第几个交易日收盘入场 (见文档: BTC 日线收得比 COIN 晚)
 
 
 def load(use_cache: bool, asof: date) -> pd.DataFrame:
@@ -44,10 +49,11 @@ def load(use_cache: bool, asof: date) -> pd.DataFrame:
         df = br.fetch_pair("COIN", cache, asof)["df"]
     df = df[df.index.date <= asof].copy()
     df["ratio"] = br.ratio(df.close, df.btc)
-    df["mcap"] = br.mcap_ratio_series(df)
+    df["mcap"] = br.mcap_ratio_series(df, br.SHARES_ANCHORS["COIN"])
+    # 前瞻收益记在信号日那一行, 从 ENTRY_LAG 天后的收盘算起
     for h in HORIZONS:
-        df[f"f{h}"] = df.close.shift(-h) / df.close - 1
-        df[f"fb{h}"] = df.btc.shift(-h) / df.btc - 1
+        df[f"f{h}"] = df.close.shift(-ENTRY_LAG - h) / df.close.shift(-ENTRY_LAG) - 1
+        df[f"fb{h}"] = df.btc.shift(-ENTRY_LAG - h) / df.btc.shift(-ENTRY_LAG) - 1
         df[f"fr{h}"] = df[f"f{h}"] - df[f"fb{h}"]
     df["btc50"] = df.btc.rolling(50).mean()
     return df
@@ -90,7 +96,7 @@ def main() -> int:
         last = m[m].index.max().date() if m.any() else None
         print(f"{th:>6} {int(m.sum()):>5} {strict_runs(m):>12} {len(runs):>14}  {first}  {last}")
 
-    section("3. 按入场比值分桶的前瞻收益 (全部交易日, 有重叠)")
+    section(f"3. 按信号日比值分桶的前瞻收益 (全部交易日, 有重叠; {ENTRY_LAG} 天后收盘入场)")
     df["bk"] = pd.cut(r, BINS, labels=LABELS, right=False)
     for h in HORIZONS:
         g = df.groupby("bk", observed=True)
@@ -103,7 +109,7 @@ def main() -> int:
             "rel_med%": (g[f"fr{h}"].median() * 100).round(1)})
         print(f"\n-- {h} 个交易日"); print(out.to_string())
 
-    section("4. 低于阈值就买 (有重叠)")
+    section(f"4. 低于阈值就买 (有重叠; {ENTRY_LAG} 天后收盘入场)")
     rows = []
     for th in (2.0, 2.2, 2.4, 2.6, 3.0):
         m = r < th
@@ -115,20 +121,24 @@ def main() -> int:
                                  rel_win=round((sr > 0).mean() * 100), rel_med=round(sr.median() * 100, 1)))
     print(pd.DataFrame(rows).to_string(index=False))
 
-    section("5. 首次触及 <2.0 的独立样本 (严格连续段的首日入场; 最大回撤 = 之后 120 日最低收盘)")
+    section(f"5. 首次触及 <2.0 的独立样本 (严格连续段的首日为信号日, {ENTRY_LAG} 天后收盘入场; "
+            "最大回撤 = 入场后 120 日最低收盘)")
     m = (r < 2.0).astype(int); grp = (m.diff() != 0).cumsum()
-    print(f"{'入场日':>10} {'入场价':>7} {'最低比值':>8} {'MAE120':>7} {'120日':>6} {'250日':>6} {'BTC120':>7}")
+    print(f"{'信号日':>10} {'入场价':>7} {'最低比值':>8} {'MAE120':>7} {'120日':>6} {'250日':>6} {'BTC120':>7}")
     for _, g in df[m == 1].groupby(grp[m == 1]):
-        i0 = g.index[0]; pos = df.index.get_loc(i0); p0 = df.close.iloc[pos]
+        i0 = g.index[0]; sig = df.index.get_loc(i0); pos = sig + ENTRY_LAG
+        if pos >= len(df):
+            print(f"{i0.date()}       — {g.ratio.min():>8.3f}  (还没到入场日)"); continue
+        p0 = df.close.iloc[pos]
         win = df.iloc[pos + 1:pos + 121]
         if win.empty:
             print(f"{i0.date()} {p0:>7.1f} {g.ratio.min():>8.3f}  (无前瞻数据)"); continue
         mae = win.close.min() / p0 - 1
-        r120 = df[f"f120"].iloc[pos]; r250 = df[f"f250"].iloc[pos]; b120 = df[f"fb120"].iloc[pos]
+        r120 = df[f"f120"].iloc[sig]; r250 = df[f"f250"].iloc[sig]; b120 = df[f"fb120"].iloc[sig]
         fmt = lambda x: f"{x * 100:>6.0f}%" if pd.notna(x) else "    na"
         print(f"{i0.date()} {p0:>7.1f} {g.ratio.min():>8.3f} {mae * 100:>6.0f}% {fmt(r120)} {fmt(r250)} {fmt(b120)}")
 
-    section("6. BTC 趋势过滤 (比值 <2.2 的日子, 按 BTC 是否在 50 日线上)")
+    section(f"6. BTC 趋势过滤 (比值 <2.2 的日子, 按 BTC 是否在 50 日线上; {ENTRY_LAG} 天后收盘入场)")
     for lbl, mm in (("BTC>50dma", (r < 2.2) & (df.btc > df.btc50)), ("BTC<50dma", (r < 2.2) & (df.btc < df.btc50))):
         for h in (60, 120):
             s = df.loc[mm, f"f{h}"].dropna()

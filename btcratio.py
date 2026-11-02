@@ -12,36 +12,41 @@
     / BTC 29.0k); 分年中位 2021 5.5 / 2022 3.3 / 2023 2.6 / 2024 3.3 / 2025 2.8 / 2026 2.5。
   - 市值比值 = COIN 市值 ÷ BTC 市值 (%)。上市以来股本 +26%、BTC 供给只 +7%, 价格比值
     低估了 2023 的便宜程度: 市值比值 10/30 是 2.40%, 历史最低 2.04% (同一天), 还差 15%。
-    股本历史用 10-Q 封面页锚点线性插值 (SHARES_ANCHORS, 近似 ±3%), 今天的股本抄配置
-    shares_m; 不配 shares_m 市值比值那几句不出。
+    股本历史用 10-Q 封面页锚点线性插值 (SHARES_ANCHORS, 按标的分开, 目前只有 COIN; 近似
+    ±3%), 今天的股本抄配置 shares_m; 不配 shares_m 市值比值那几句不出, 没有锚点的标的只出
+    今天的市值比值、不跟历史比。
 
 回测结论 (research/btcratio_backtest.py 可复现; 样本本质只有 2022-05 / 2022-12→2023-06 /
-2025-04→05 三组 + 2026-10 进行中, 胜率按"三次经验"读):
+2025-04→05 三组 + 2026-10 进行中, 胜率按"三次经验"读。入场 = 信号日的下一个交易日收盘:
+同一天的 BTC UTC 日线收在美东 19:00/20:00, 比 COIN 收盘晚 3–4 小时, 当天收盘入场等于用了
+入场后才知道的 BTC —— 2026-11-02 按 PR #28 评审改, 下面都是改后的数):
   - 低于阈值的天数 (交易日, 到 10/30; 段 = 中间断开 ≤5 个交易日算同一段, 与报告同口径):
-    <2.2 118 天/12 段 · <2.0 29 天/9 段 · <1.8 4 天/1 段 (2023-05-01→05-04) · <1.7 1 天 ·
+    <2.2 117 天/10 段 · <2.0 28 天/8 段 · <1.8 4 天/1 段 (2023-05-01→05-04) · <1.7 1 天 ·
     <1.5 / <1.2 从未出现。严格连续口径是 <2.2 117/28、<2.0 28/12。
-  - 按入场比值分桶 (只数有前瞻数据的日子): ≤2.0 两桶 60 天胜率 100%/中位 +85 ~ +88%,
-    120 天 100%; 2.0–2.2 桶 60 天 99%/+63%; 2.2–2.4 桶 60 天 81%/+23%; 2.4–2.6 桶 60 天
-    64%/+12% (一年中位附近, 优势消失); 3.5–4.5 桶 60 天 14%/−27% 是最坏的桶; ≥4.5 (2021
+  - 按信号日比值分桶 (只数有前瞻数据的日子): ≤2.0 两桶 60 天胜率 100%/中位 +82 ~ +85%,
+    120 天 100%; 2.0–2.2 桶 60 天 100%/+62%; 2.2–2.4 桶 60 天 79%/+23%; 2.4–2.6 桶 60 天
+    64%/+11% (一年中位附近, 优势消失); 3.5–4.5 桶 60 天 12%/−26% 是最坏的桶; ≥4.5 (2021
     上市初) 250 天 0%/−73%。
-  - 低于 2.0 的 10 次首次触及 (严格口径, 合并后 8 段): 120 天全部为正 (最差 +18%), 60 天中位
-    +85%, 入场后 120 天内最大回撤 (收盘) 最坏 −12% (2022-05-11, 之后 BTC 再跌 29%; 盘中低点
-    口径 −24%)、次坏 −11% (2023-04-24); 2025 年三段 250 天只有 +1 ~ +21% (COIN 7 月见顶后
-    跌回) — 比值说的是"相对 BTC 便宜", 不是绝对顶部。
-  - 相对收益 (COIN − BTC) 同样单调: ≤2.0 桶 60 天相对胜率 100%、中位 +57 ~ +82%;
-    >3.5 桶 120 天相对胜率 2–5%。比值的均值回归主要靠 COIN 涨得比 BTC 快。
+  - 低于 2.0 的 10 次首次触及 (严格口径; 合并后 7 段, 不含 2026-10 进行中的一段): 120 天
+    全部为正, 但最差只有 +4% (2022-05-11 信号, 次日 +9% 才入场, 之后 BTC 再跌 31%), 60 天
+    中位 +69%; 入场后 120 天内最大回撤 (收盘) 最坏 −20% (同一次; 盘中低点口径 −24.5%)、次坏
+    −13% (2023-04-24); 2025 年三段 250 天只有 +3 ~ +11% (COIN 7 月见顶后跌回) — 比值说的是
+    "相对 BTC 便宜", 不是绝对顶部。当天收盘入场的旧口径是最差 +18% / 收盘回撤 −12%, 差别
+    几乎全在 2022-05-12 这一天 (53.72 → 58.50)。
+  - 相对收益 (COIN − BTC) 同样单调: ≤2.0 桶 60 天相对胜率 93–100%、中位 +53 ~ +81%;
+    >3.5 桶 120 天相对胜率 2–6%。比值的均值回归主要靠 COIN 涨得比 BTC 快。
   - BTC 趋势过滤在这里**不**起作用 (与 MSTR 不同): 比值 <2.2 的日子 BTC 在 50 日线上
-    60 天胜率 100%, 线下 98%。2022-05 入场 BTC 之后 120 天 −29%, COIN 仍 +18%。
+    60 天胜率 100%, 线下也是 100%。2022-05 入场 BTC 之后 120 天 −31%, COIN 仍 +4%。
   - 2026-10 的背离: 6/30 以来 BTC +31%、比值从 2.49 跌到 1.81 (−27%)。比值创 250 日新低
     且 BTC 高于 120 日前的日子共 18 天, 先例两组: 2023-04/05 (SEC 起诉前夜, 之后 120 天
-    +34%, 收盘最大回撤 −11%) 和 2025-03/04 (之后 +95%, 有 Deribit 并购 / 入标普 500 /
+    +35%, 收盘最大回撤 −13%) 和 2025-03/04 (之后 120 天 +112%, 有 Deribit 并购 / 入标普 500 /
     GENIUS 法案催化)。两次都是 COIN 自己的坏消息压出来的, 都修复了; 这次的坏消息是现货
     份额流失 + Q4 费用上台阶, 是慢变量不是事件。
 
 规则 (阈值可在配置里改):
   关注 = 比值 ≤ watch (2.2); T1 = 比值 ≤ t1 (2.0, 第一批 1/3, 接受 −25% 回撤);
   T2 = 比值 ≤ t2 (1.67 = 历史最低); T3 = 比值 ≤ t3 (1.5, 从未出现 ≈ 市值比值地板);
-  另给市值比值 ≤ mcap_floor_pct (2.01%) 的价; 全部按当时 BTC 实时换算成价格, 同时给
+  另给市值比值 ≤ mcap_floor_pct (2.04%) 的价; 全部按当时 BTC 实时换算成价格, 同时给
   BTC −10% / −20% 的价位。止盈带 take_profit (2.4–2.6 = 一年中位附近, 60 天胜率跌到
   六成), 只在近 tp_memory_days 个交易日内到过 T1 线之后才提醒。
   右侧 (日收 > 前低平台 / 20 日线) 不在这里出 —— COIN 在 [tickers] 里, 走扫描器自己的
@@ -49,8 +54,12 @@
 
 数据: yfinance 日线 (标的 + BTC-USD, 上市起全量, 约 1,400 行, 几秒), 缓存
 data/btcratio_<SYM>.csv; 缓存今天收盘后写过才不重下 (收盘前写的今天那行是盘中快照,
-见 fetch_pair); 取数失败退回缓存并出 ⚠️; 无缓存整段降级成一行。BTC-USD 是 UTC 日,
-今天那行是实时的; 标的在 [tickers] 里时今天的收盘用扫描器自己的 (陈旧日线不用)。
+见 fetch_pair); 取数失败 (含 BTC 最后一行比标的旧) 退回缓存并出 ⚠️; 无缓存整段降级成一行。
+BTC-USD 是 UTC 日: 历史上每一行的 BTC 是美东 19:00/20:00 的价, 今天那行是实时的; 实时
+报告的比值用扫描那一刻 (09:45/15:45) 的 BTC, 跟历史口径差几小时的 BTC 波动 (约 1%, 比值
+2.0 上下差 0.02), 不改变档位的读法。标的在 [tickers] 里且扫描器有今天的日线时, 今天的
+收盘用扫描器自己的 (陈旧日线不用); 周末 / 节假日 / 开盘前没有今天的价, 统计点就是最后
+一个交易日, 不多算一天。
 
 命令行 (手工看一眼, 不写历史):
     .venv/bin/python btcratio.py [COIN ...]
@@ -77,41 +86,45 @@ STATS_THRESHOLDS = (2.2, 2.0, 1.8, 1.5, 1.2)
 EPISODE_GAP = 5                 # 中间断开 ≤ 这么多交易日算同一段
 STALE_DAYS = 4                  # 缓存最后一行落后超过这么多天报告提醒
 
-# 股本锚点 (百万股, A+B 类, 10-Q 封面页; 锚点间线性插值, 近似 ±3%) — 只用于市值比值的
-# 历史分位。今天的股本抄配置 shares_m。
-SHARES_ANCHORS = (
-    ("2021-04-14", 210.0), ("2021-07-01", 212.0), ("2022-01-01", 220.0), ("2022-07-01", 226.0),
-    ("2023-01-01", 232.0), ("2023-07-01", 238.0), ("2024-01-01", 244.0), ("2024-07-01", 250.0),
-    ("2025-01-01", 253.0), ("2025-07-01", 256.0), ("2025-10-01", 268.0), ("2026-01-01", 266.0),
-    ("2026-09-30", 264.8))
+# 股本锚点 (百万股, 10-Q 封面页; 锚点间线性插值, 近似 ±3%) — 只用于市值比值的历史分位,
+# 按标的分开。没有锚点的标的只出今天的市值比值, 不跟历史比 (拿 COIN 的股本算别的标的的
+# 历史市值不可比, PR #28 评审)。今天的股本抄配置 shares_m。
+SHARES_ANCHORS = {
+    "COIN": (   # A+B 类
+        ("2021-04-14", 210.0), ("2021-07-01", 212.0), ("2022-01-01", 220.0), ("2022-07-01", 226.0),
+        ("2023-01-01", 232.0), ("2023-07-01", 238.0), ("2024-01-01", 244.0), ("2024-07-01", 250.0),
+        ("2025-01-01", 253.0), ("2025-07-01", 256.0), ("2025-10-01", 268.0), ("2026-01-01", 266.0),
+        ("2026-09-30", 264.8)),
+}
 # BTC 流通量锚点 (百万枚)
 BTC_SUPPLY_ANCHORS = (
     ("2021-04-14", 18.69), ("2022-01-01", 18.92), ("2023-01-01", 19.25), ("2024-01-01", 19.58),
     ("2024-04-20", 19.69), ("2025-01-01", 19.80), ("2026-01-01", 19.95), ("2026-10-30", 20.00))
 
-# 回测文案 (2026-11-01 快照, 价格比值; 数字与 research/btcratio_backtest.py 同源)
+# 回测文案 (2026-11-02 快照, 价格比值, 信号日次日收盘入场; 数字与 research/btcratio_backtest.py
+# 同源)
 BUCKET_EDGES = ((1.9, "<1.9"), (2.0, "1.9-2.0"), (2.2, "2.0-2.2"), (2.4, "2.2-2.4"),
                 (2.6, "2.4-2.6"), (3.0, "2.6-3.0"), (3.5, "3.0-3.5"), (4.5, "3.5-4.5"),
                 (math.inf, "≥4.5"))
 BUCKET_NOTE = {
     "<1.9": "60 天胜率 100%/中位 +85%, 120 天 100%/+49% (n=9, 只有 2023-05 和 2025-04 两组) — 历史最低区, 分档买",
-    "1.9-2.0": "60 天胜率 100%/中位 +88%, 120 天 100%/+104% (n=15) — 入场区",
-    "2.0-2.2": "60 天胜率 99%/中位 +63%, 120 天 93%/+73% (n=73) — 关注区, 60 天看多",
-    "2.2-2.4": "60 天胜率 81%/中位 +23%, 120 天 70%/+16% — 中性偏多",
-    "2.4-2.6": "60 天胜率 64%/中位 +12%, 120 天 62%/+12% — 一年中位附近, 优势消失, 不加仓",
-    "2.6-3.0": "60 天胜率 46%/中位 −5%, 120 天 52%/+6% — 无优势",
-    "3.0-3.5": "60 天胜率 39%/中位 −8%, 120 天相对 BTC 胜率 27% — 相对 BTC 贵",
-    "3.5-4.5": "60 天胜率 14%/中位 −27%, 120 天 34%/−19% — 历史最坏的桶, 不追",
+    "1.9-2.0": "60 天胜率 100%/中位 +82%, 120 天 100%/+96% (n=15) — 入场区",
+    "2.0-2.2": "60 天胜率 100%/中位 +62%, 120 天 90%/+69% (n=73) — 关注区, 60 天看多",
+    "2.2-2.4": "60 天胜率 79%/中位 +23%, 120 天 71%/+16% — 中性偏多",
+    "2.4-2.6": "60 天胜率 64%/中位 +11%, 120 天 61%/+13% — 一年中位附近, 优势消失, 不加仓",
+    "2.6-3.0": "60 天胜率 46%/中位 −5%, 120 天 53%/+6% — 无优势",
+    "3.0-3.5": "60 天胜率 41%/中位 −7%, 120 天相对 BTC 胜率 26% — 相对 BTC 贵",
+    "3.5-4.5": "60 天胜率 12%/中位 −26%, 120 天 36%/−20% — 历史最坏的桶, 不追",
     "≥4.5": "2021 上市初期, 250 天胜率 0%/中位 −73% — 泡沫区",
 }
-EPISODE_NOTE = ("历史 <2.0 的 10 次首次触及 120 天全部为正 (最差 +18%), 60 天中位 +85%, "
-                "入场后 120 天内最大回撤 (收盘) 最坏 −12% (2022-05, 之后 BTC 再跌 29%; 盘中低点 −24%); "
-                "2025 三段 250 天只有 +1 ~ +21% — 分档, 别一次买完")
-DIVERGENCE_NOTE = ("先例两组: 2023-04/05 (SEC 起诉前夜, 之后 120 天 +34%, 收盘最大回撤 −11%) 和 "
-                   "2025-03/04 (之后 +95%, 有 Deribit 并购 / 入标普 500 / GENIUS 法案催化) — "
+EPISODE_NOTE = ("历史 <2.0 的 10 次首次触及 (次日收盘入场) 120 天全部为正, 但最差只有 +4%, 60 天中位 +69%, "
+                "入场后 120 天内最大回撤 (收盘) 最坏 −20% (2022-05, 之后 BTC 再跌 31%; 盘中低点 −24.5%); "
+                "2025 三段 250 天只有 +3 ~ +11% — 分档, 别一次买完")
+DIVERGENCE_NOTE = ("先例两组: 2023-04/05 (SEC 起诉前夜, 之后 120 天 +35%, 收盘最大回撤 −13%) 和 "
+                   "2025-03/04 (之后 120 天 +112%, 有 Deribit 并购 / 入标普 500 / GENIUS 法案催化) — "
                    "都是 COIN 自己的坏消息压出来的、都修复了; 这次的坏消息是现货份额流失 + Q4 费用上台阶, "
                    "是慢变量不是事件")
-BTC_FILTER_NOTE = ("比值 <2.2 的日子: BTC 在 50 日线上 60 天胜率 100%, 线下 98% — "
+BTC_FILTER_NOTE = ("比值 <2.2 的日子: BTC 在 50 日线上 60 天胜率 100%, 线下也是 100% — "
                    "历史上不影响 (与 MSTR 不同), 但样本只有 3 组")
 TWO_X_NOTE = ("只在右侧趋势中段用 (走 [tickers] 的 2x 提示), 比值阶梯 (左侧) 不用: "
               "日内重置损耗 ≈ 日波动率², 底部区域日波动 5–8%")
@@ -250,7 +263,8 @@ def fetch_pair(yf_ticker: str, cache_path: Path, today: date, download=_download
     "fetched": iso}。缓存的最后一行晚于今天, 或就是今天且缓存写于今天收盘 (CLOSE_ET) 之后,
     才不重下; 其余 (含周末) 都重下, 几秒。收盘前写的今天那行是盘中快照: 开盘扫描 (~9:45)
     写的缓存尾盘扫描 (~15:45) 再读, BTC 是 6 小时前的, 比值、阶梯价、旗标和历史那一行
-    都跟着偏 (2026-11-02 修)。取数失败退回缓存 (带 ⚠️); 没缓存就抛。"""
+    都跟着偏 (2026-11-02 修)。取数失败 (含 BTC 最后一行比标的旧) 退回缓存 (带 ⚠️);
+    没缓存就抛。"""
     cached = _read_cache(cache_path)
     last = cached.index[-1].date() if cached is not None else None
     written = _written_et(cache_path) if cached is not None else None
@@ -266,6 +280,11 @@ def fetch_pair(yf_ticker: str, cache_path: Path, today: date, download=_download
         btc = close[BTC_TICKER].dropna()
         if px.empty or btc.empty:
             raise RuntimeError(f"{yf_ticker} 或 {BTC_TICKER} 序列为空")
+        # BTC 最后一个有效日落后于标的 (今天那格空): 下面的前填会把前一天的 BTC 当成今天的
+        # 写进缓存, assess 只看对齐后的日期, 看不出来 —— 当取数失败 (PR #28 评审)
+        if btc.index[-1] < px.index[-1]:
+            raise RuntimeError(f"{BTC_TICKER} 最后一行 {btc.index[-1].date()} 落后于 "
+                               f"{yf_ticker} 的 {px.index[-1].date()}")
         # 对齐到标的的交易日; BTC 周末也交易, 标的收盘那天取同一天的 BTC (UTC 日收盘,
         # 今天那行是实时价), 缺的向前填
         btc_al = btc.reindex(px.index.union(btc.index)).ffill().reindex(px.index)
@@ -317,9 +336,10 @@ def _interp_anchors(anchors, index: pd.DatetimeIndex) -> pd.Series:
     return full.reindex(index)
 
 
-def mcap_ratio_series(df: pd.DataFrame) -> pd.Series:
-    """历史市值比值 % = 收盘 × 股本锚点 ÷ (BTC × 流通量锚点) × 100。"""
-    sh = _interp_anchors(SHARES_ANCHORS, df.index)
+def mcap_ratio_series(df: pd.DataFrame, anchors) -> pd.Series:
+    """历史市值比值 % = 收盘 × 股本锚点 ÷ (BTC × 流通量锚点) × 100。anchors = 这只标的
+    在 SHARES_ANCHORS 里的那一组。"""
+    sh = _interp_anchors(anchors, df.index)
     sup = _interp_anchors(BTC_SUPPLY_ANCHORS, df.index)
     return (df.close * sh / (df.btc * sup) * 100.0).rename("mcap_pct")
 
@@ -351,13 +371,14 @@ def ladder(btc: float, cfg: dict, shares_m: float | None = None) -> dict:
 
 
 def episodes(mask: pd.Series, gap: int = EPISODE_GAP) -> list[tuple]:
-    """连续为真的区间 [(起, 止, 天数)], 中间断开 ≤ gap 行算同一段。"""
+    """连续为真的区间 [(起, 止, 天数)], 中间断开 ≤ gap 行算同一段 (数的是两个为真之间
+    为假的行数: 恰好断开 gap 行还是一段, gap + 1 行才拆; PR #28 评审)。"""
     ix = np.flatnonzero(mask.to_numpy(dtype=bool))
     if len(ix) == 0:
         return []
     runs, start, prev = [], ix[0], ix[0]
     for i in ix[1:]:
-        if i - prev > gap:
+        if i - prev - 1 > gap:
             runs.append((start, prev))
             start = i
         prev = i
@@ -460,11 +481,16 @@ def rel_perf(close: pd.Series, btc: pd.Series, days: int) -> dict | None:
 # --------------------------------------------------------------------------
 
 def assess(df: pd.DataFrame, cfg: dict, *, today: date,
-           live_px: float | None = None, live_btc: float | None = None) -> dict:
+           live_px: float | None = None, live_btc: float | None = None,
+           anchors=None) -> dict:
     """一只标的 -> 今天的读数 + 旗标 + 阶梯 + 历史统计。
 
-    今天的点: 缓存最后一行, 股价可被扫描器自己的收盘 (live_px) 覆盖, BTC 可被 live_btc
-    覆盖。旗标 / 分位用的序列 = 今天之前的交易日 + 今天这一个点。"""
+    读数: 缓存最后一行, 股价可被扫描器自己的收盘 (live_px) 覆盖, BTC 可被 live_btc
+    覆盖。旗标 / 分位用的序列 = 统计点之前的交易日 + 统计点这一个点; 统计点 = 今天
+    (有 live_px, 即扫描器有今天的价), 否则是日线最后一个实际报价日 —— 周末 / 节假日 /
+    开盘前手工跑, 不把周五那份收盘复制成"今天"再多算一个交易日 (天数、连续 T1、120 日
+    比较、RV 的窗口都会偏一天; PR #28 评审)。anchors = 这只的股本锚点 (SHARES_ANCHORS),
+    没有就不跟历史市值比值比。"""
     if df is None or df.empty:
         raise ValueError("日线为空")
     last = df.iloc[-1]
@@ -472,24 +498,25 @@ def assess(df: pd.DataFrame, cfg: dict, *, today: date,
     btc = float(live_btc) if live_btc else float(last.btc)
     r = ratio(px, btc)
 
-    prior = df[df.index.date < today]
+    point = today if live_px else last.name.date()
+    prior = df[df.index.date < point]
     rp = ratio(prior.close, prior.btc) if len(prior) else pd.Series(dtype=float)
     s = rp.copy()
-    s.loc[pd.Timestamp(today)] = r
+    s.loc[pd.Timestamp(point)] = r
     s = s.sort_index()
     btc_s = prior.btc.copy()
-    btc_s.loc[pd.Timestamp(today)] = btc
+    btc_s.loc[pd.Timestamp(point)] = btc
     btc_s = btc_s.sort_index()
     close_s = prior.close.copy()
-    close_s.loc[pd.Timestamp(today)] = px
+    close_s.loc[pd.Timestamp(point)] = px
     close_s = close_s.sort_index()
 
     shares_m = cfg["shares_m"]
     mc_now = mc_pct = mc_min = mc_min_date = None
     if shares_m:
         mc_now = mcap_pct(px, shares_m, btc, btc_supply_now())
-        if len(prior):
-            mcs = mcap_ratio_series(prior)
+        if anchors and len(prior):
+            mcs = mcap_ratio_series(prior, anchors)
             mc_pct = percentile(mcs, mc_now)
             mc_min, mc_min_date = float(mcs.min()), mcs.idxmin().date().isoformat()
 
@@ -528,10 +555,11 @@ def assess(df: pd.DataFrame, cfg: dict, *, today: date,
         "asof": asof.isoformat(), "px": px, "px_src": "live" if live_px else "yf",
         "btc": btc, "btc_src": "live" if live_btc else "yf",
         "ratio": r, "pct": percentile(rp, r), "n_days": int(len(rp)) + 1,
-        "first_date": (prior.index[0].date().isoformat() if len(prior) else today.isoformat()),
+        "first_date": (prior.index[0].date().isoformat() if len(prior) else point.isoformat()),
         "hist_min": (float(rp.min()) if len(rp) else r),
-        "hist_min_date": (rp.idxmin().date().isoformat() if len(rp) else today.isoformat()),
+        "hist_min_date": (rp.idxmin().date().isoformat() if len(rp) else point.isoformat()),
         "mcap_pct": mc_now, "mcap_pctile": mc_pct, "mcap_min": mc_min, "mcap_min_date": mc_min_date,
+        "mcap_anchored": bool(anchors),
         "bucket": bucket(r), "flags": flags, "ladder": lad,
         "take_profit_px": [price_at(x, btc) for x in cfg["take_profit"]],
         "streak_t1": streak_at_or_below(s, cfg["t1"]),
@@ -555,7 +583,8 @@ def run(cfgs: dict, *, cache_dir: Path, today: date, live_px: dict | None = None
             warns += got["warnings"]
             from_cache = from_cache and got["from_cache"]
             fetched = fetched or got["fetched"]
-            a = assess(got["df"], cfg, today=today, live_px=live_px.get(sym), live_btc=live_btc)
+            a = assess(got["df"], cfg, today=today, live_px=live_px.get(sym), live_btc=live_btc,
+                       anchors=SHARES_ANCHORS.get(sym))
             a["from_cache"] = got["from_cache"]
             by[sym] = a
         except Exception as e:      # noqa: BLE001
@@ -585,7 +614,9 @@ def symbol_lines(sym: str, a: dict, cfg: dict) -> list[str]:
     if a["mcap_pct"] is not None:
         head += (f" · 市值比值 {a['mcap_pct']:.2f}% (股本 {cfg['shares_m']:g}M @{cfg['shares_asof']}"
                  + (f", 历史最低 {a['mcap_min']:.2f}% @{a['mcap_min_date']}, "
-                    f"{a['mcap_pctile']:.1f} 分位" if a["mcap_min"] is not None else "") + ")")
+                    f"{a['mcap_pctile']:.1f} 分位" if a["mcap_min"] is not None
+                    else "" if a.get("mcap_anchored", True) else ", 没有股本历史锚点, 不跟历史比")
+                 + ")")
     out = [head, f"  - 桶 {a['bucket']}: {BUCKET_NOTE[a['bucket']]}"]
     if f["all_time_low"]:
         out.append("  - ⚠️ 比值历史新低 — 之前的最低 (2023-05-03 1.672) 是 SEC 起诉前夜的定价, "
@@ -597,14 +628,14 @@ def symbol_lines(sym: str, a: dict, cfg: dict) -> list[str]:
         out.append(f"  - 🟢 现价已在 {f['tier']} 档内 (连续 {a['streak_t1']} 个交易日 ≤ {cfg['t1']:g}; "
                    f"{EPISODE_NOTE})")
     elif f["watch"]:
-        out.append(f"  - 👀 关注区 (比值 ≤ {cfg['watch']:g}, 2.0–2.2 桶 60 天胜率 99%) — 等 T1 {cfg['t1']:g}")
+        out.append(f"  - 👀 关注区 (比值 ≤ {cfg['watch']:g}, 2.0–2.2 桶 60 天胜率 100%) — 等 T1 {cfg['t1']:g}")
     if f["take_profit"]:
         tp_lo, tp_hi = cfg["take_profit"]
         where = (f"在止盈带 {tp_lo:g}–{tp_hi:g} 内" if a["ratio"] < tp_hi
                  else f"已高于止盈带上沿 {tp_hi:g}")
         out.append(f"  - 🔔 {where} (近 {cfg['tp_memory_days']} 个交易日到过 {cfg['t1']:g} 线): "
                    "持有比值多头的话分批了结 — 2.4–2.6 是一年中位附近, 60 天胜率跌到六成; "
-                   "2025 的三段 250 天只剩 +1 ~ +21%")
+                   "2025 的三段 250 天只剩 +3 ~ +11%")
     lad = a["ladder"]
     lad_s = (f"  - 阶梯 (按当前 BTC / −10% / −20% 换算): 关注 ≤{cfg['watch']:g} {_grid(lad['watch'])} · "
              f"T1 ≤{cfg['t1']:g} {_grid(lad['t1'])} (第一批 1/3, 接受 −25% 回撤) · "

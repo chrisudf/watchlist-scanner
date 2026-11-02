@@ -7167,6 +7167,17 @@ class TestBtcratioMath(unittest.TestCase):
         self.assertEqual((st[1.2]["days"], st[1.2]["episodes"]), (0, 0))
         self.assertEqual(st[2.0]["runs"][0][2], 5)
 
+    def test_episode_gap_counts_rows_in_between(self):
+        # PR #28 评审: "断开 ≤5 个交易日算同一段" 数的是中间为假的行数 —— 恰好 5 行还是
+        # 一段, 6 行才拆 (以前比的是下标差, 恰好 5 行就拆成两段)
+        idx = pd.bdate_range("2026-01-01", periods=20)
+        for gap_rows, n_eps in ((5, 1), (6, 2)):
+            m = pd.Series(False, index=idx)
+            m.iloc[2] = m.iloc[2 + gap_rows + 1] = True
+            eps = br.episodes(m)
+            self.assertEqual(len(eps), n_eps, gap_rows)
+            self.assertEqual(sum(e[2] for e in eps), 2)
+
     def test_breaks_streak_percentile(self):
         idx = pd.bdate_range("2026-01-01", periods=30)
         r = pd.Series([2.5] * 30, index=idx)
@@ -7200,7 +7211,7 @@ class TestBtcratioMath(unittest.TestCase):
 
     def test_mcap_series_uses_anchors(self):
         df = _br_df(n=5, end="2023-05-03", ratio=1.672, btc=29_000.0)
-        m = br.mcap_ratio_series(df)
+        m = br.mcap_ratio_series(df, br.SHARES_ANCHORS["COIN"])
         self.assertAlmostEqual(float(m.iloc[-1]), 1.672 * 29 * 236.0 / (29_000 * 19.36) * 100, delta=0.05)
 
 
@@ -7287,6 +7298,25 @@ class TestBtcratioFetch(unittest.TestCase):
             self.assertTrue(got["from_cache"])
             self.assertIn("用的是今天 09:45 ET 写的缓存 (BTC 是那时的)", got["warnings"][0])
 
+    def test_btc_behind_stock_is_a_failure(self):
+        # PR #28 评审: 下到的 COIN 有今天、BTC 今天那格空 → 以前前填成前一天的 BTC, 当今天的
+        # 写进缓存; 现在算取数失败, 走退回缓存 + ⚠️ (没缓存就抛), 缓存不动
+        close = self._close()
+        close.loc[close.index[-1], "BTC-USD"] = np.nan
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "data" / br.CACHE_NAME.format("COIN")
+            with self.assertRaises(RuntimeError) as cm:
+                br.fetch_pair("COIN", p, _BR_TODAY, lambda t: close)
+            self.assertIn("无缓存", str(cm.exception))
+            self.assertFalse(p.exists())
+            br.fetch_pair("COIN", p, _BR_TODAY, lambda t: self._close(end="2026-10-29"))
+            before = p.read_bytes()
+            got = br.fetch_pair("COIN", p, _BR_TODAY, lambda t: close)
+            self.assertTrue(got["from_cache"])
+            self.assertIn("BTC-USD 最后一行 2026-10-29 落后于 COIN 的 2026-10-30", got["warnings"][0])
+            self.assertIn("用的是到 2026-10-29 的缓存", got["warnings"][0])
+            self.assertEqual(p.read_bytes(), before)
+
     def test_btc_aligned_to_stock_days(self):
         idx = pd.date_range("2026-10-20", periods=10, freq="D")          # 含周末
         close = pd.DataFrame({"BTC-USD": np.arange(10, dtype=float) + 1}, index=idx)
@@ -7367,6 +7397,52 @@ class TestBtcratioAssess(unittest.TestCase):
         self.assertEqual(a["n_days"], 300)                        # 今天那行不重复算
         with self.assertRaises(ValueError):
             self._assess(_br_df(n=0))
+
+    def test_no_live_price_uses_last_trading_day_as_the_point(self):
+        # PR #28 评审: 周日手工跑 (没有扫描器今天的价), 以前把周五那份收盘复制成"周日"再算
+        # 一天: 交易日数、阈值天数、连续 T1 都 +1。现在统计点就是周五, 跟周五当天跑的一样
+        rs = [2.5] * 298 + [1.95, 1.9]
+        df = _br_df(end="2026-10-30", ratios=rs)                  # 最后一行 = 周五
+        fri = self._assess(df, today=date(2026, 10, 30))
+        sun = self._assess(df, today=date(2026, 11, 1))
+        for a in (fri, sun):
+            self.assertEqual(a["n_days"], 300)
+            self.assertEqual(a["streak_t1"], 2)
+            self.assertEqual(a["stats"][2.0]["days"], 2)
+            self.assertAlmostEqual(a["ratio"], 1.9)
+            self.assertEqual(a["asof"], "2026-10-30")
+        self.assertEqual(sun["pct"], fri["pct"])
+        self.assertEqual(sun["rel_120"], fri["rel_120"])
+        self.assertEqual(sun["rv60"], fri["rv60"])
+        # 有扫描器今天的价才多一个点 (周一)
+        mon = self._assess(df, today=date(2026, 11, 2), live_px=_br_px(1.85))
+        self.assertEqual(mon["n_days"], 301)
+        self.assertEqual(mon["streak_t1"], 3)
+
+    def test_mcap_history_needs_this_symbols_anchors(self):
+        # PR #28 评审: 历史市值比值以前固定用 COIN 的股本锚点, 给 HOOD 配 shares_m 就拿 COIN
+        # 的股本算 HOOD 的历史 —— 没有自己的锚点只出今天的市值比值
+        df = _br_df()
+        a = self._assess(df, live_px=_br_px(1.9), anchors=br.SHARES_ANCHORS["COIN"])
+        self.assertIsNotNone(a["mcap_min"]); self.assertIsNotNone(a["mcap_pctile"])
+        b = self._assess(df, live_px=_br_px(1.9))
+        self.assertAlmostEqual(b["mcap_pct"], a["mcap_pct"])
+        self.assertIsNone(b["mcap_min"]); self.assertIsNone(b["mcap_pctile"])
+        cfgs = br.validate_config({"COIN": {"shares_m": 264.8, "shares_asof": "2026-09-30"},
+                                   "HOOD": {"shares_m": 880.0, "shares_asof": "2026-09-30"}},
+                                  _BR_TODAY)
+        idx = pd.bdate_range(end="2026-10-29", periods=300)
+
+        def dl(tickers):
+            return pd.DataFrame({tickers[0]: [160.0] * 300, "BTC-USD": [80_000.0] * 300}, index=idx)
+        with tempfile.TemporaryDirectory() as d:
+            meta = br.run(cfgs, cache_dir=Path(d), today=_BR_TODAY, download=dl)
+        self.assertIsNotNone(meta["by_symbol"]["COIN"]["mcap_min"])
+        self.assertIsNone(meta["by_symbol"]["HOOD"]["mcap_min"])
+        self.assertIsNotNone(meta["by_symbol"]["HOOD"]["mcap_pct"])
+        text = "\n".join(br.report_block(meta))
+        self.assertEqual(text.count("没有股本历史锚点, 不跟历史比"), 1)   # 只有 HOOD 那行
+        self.assertIn("历史最低 ", text)                                   # COIN 照常比
 
     def test_run_isolates_failures(self):
         cfgs = br.validate_config({"COIN": {"two_x": "CONL"}, "HOOD": {}}, _BR_TODAY)
@@ -7497,10 +7573,23 @@ class TestBtcratioScanner(unittest.TestCase):
         self.assertEqual(t["COIN"]["two_x"], "CONL")
         self.assertIsNone(t["COIN"]["value_zone"])
 
-    def _results(self):
+    def test_options_false_hints_name_no_option_strategy(self):
+        # PR #28 评审: COIN options = false (只考虑正股与 2x), 趋势中段提示以前照样写 "PMCC
+        # 金字塔加仓", 首次回踩写 "3-6个月 call spread"
+        s, t = sc.load_config()
+        self.assertEqual(sc.trend_tools(t["COIN"]), "2x ETF CONL / 正股")
+        self.assertEqual(sc.retest_tool(t["COIN"]), "不出期权票 — 按股价操作")
+        base = dict(sc.TICKER_DEFAULTS)
+        self.assertEqual(sc.trend_tools({**base, "two_x": "QLD"}), "2x ETF QLD / PMCC")
+        self.assertEqual(sc.trend_tools(base), "PMCC")
+        self.assertEqual(sc.trend_tools({**base, "options": False}), "正股")
+        self.assertEqual(sc.retest_tool(base), "3-6个月 call spread, 票见下")
+
+    def _results(self, coin_asof=_BR_TODAY.isoformat()):
         mk = TestRenderOpenZoneAlert._r
         rs = [mk(TestRenderOpenZoneAlert(), s_, 18.0, None) for s_ in ("SOFI", "QQQ")]
         rs.append(mk(TestRenderOpenZoneAlert(), "COIN", 139.0, None))
+        rs[-1]["tech"]["as_of"] = coin_asof
         return rs
 
     def test_attach_passes_live_close_and_degrades(self):
@@ -7521,6 +7610,12 @@ class TestBtcratioScanner(unittest.TestCase):
         rs[2]["stale_data"] = "x"
         with mock_attr(sc.btcratio, "run", fake_run):
             sc.attach_btcratio(settings, rs, _BR_TODAY)
+        self.assertEqual(seen["live_px"], {})
+        # options = false 的 COIN 和开盘 / --no-options 扫描不跑日线陈旧检查 (stale_data 永远
+        # 不置): 日线最后一根不是今天也不能当今天的价 (PR #28 评审)
+        seen.clear()
+        with mock_attr(sc.btcratio, "run", fake_run):
+            sc.attach_btcratio(settings, self._results(coin_asof="2026-10-29"), _BR_TODAY)
         self.assertEqual(seen["live_px"], {})
 
         def boom(*a, **k):
