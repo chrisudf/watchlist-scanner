@@ -6610,16 +6610,13 @@ class TestShortsideFlags(unittest.TestCase):
         self.assertIsNone(ss.borrow_flag(self.rows["SOFI"],
                                          {**_SS_S, "short_avail_warn": 10**9}))
 
-    def test_si_flag(self):
-        v = {"date": "2026-10-15", "dtc": 4.75, "chg": 2.2}
-        self.assertIsNone(ss.si_flag(v, _SS_S))
-        self.assertIn("回补 5.2 天", ss.si_flag({**v, "dtc": 5.2}, _SS_S))
-        self.assertIn("空头较上期 +35%", ss.si_flag({**v, "chg": 35.0}, _SS_S))
-        self.assertIn("(FINRA 10-15)", ss.si_flag({**v, "chg": 35.0}, _SS_S))
-        self.assertIsNone(ss.si_flag({**v, "chg": -40.0}, _SS_S))   # 空头在减不报
+    def test_si_tier(self):
+        # 档位只看占比 (2026-11-14 按回测改; 阈值在 [settings] 的 short_pct_*)
+        self.assertEqual([ss.si_tier(x, _SS_S) for x in (None, 0.0, 9.99, 10.0, 19.99, 20.0, 45.0)],
+                         [None, None, None, "偏高", "偏高", "拥挤", "拥挤"])
+        self.assertIsNone(ss.si_tier(12.0, {**_SS_S, "short_pct_warn": 15.0}))
         self.assertIsNone(ss.si_flag(None, _SS_S))
-        self.assertIsNone(ss.si_flag(v, _SS_S, pct=14.9))
-        self.assertTrue(ss.si_flag(v, _SS_S, pct=17.2).startswith("空头占流通股 17.2% (FINRA 10-15)"))
+        self.assertIsNone(ss.si_flag({"si": None, "shares": None}, _SS_S))
 
     def test_carry_line_checks_direction_and_tenor(self):
         # 费率过了难借券阈值不能归因: 借券只会压低 forward, 还要按期限折算 (PR #27 评审)
@@ -6710,8 +6707,8 @@ class TestShortsideBaseline(unittest.TestCase):
         self.assertAlmostEqual(b["median"], 11.15)        # 中位 111.5 股 ÷ 1000 股
         self.assertEqual(b["rank"], 100)
         self.assertTrue(b["new_high"])
-        flag = ss.si_flag(info["si"], _SS_S, ss.si_pct(info), b)
-        self.assertIn("空头创一年新高 (一年中位 11.2%)", flag)
+        # 10.0% -> 12.3% 一直在偏高档: 进档记在窗口第一期, 不再每期报 (新高只当进档那行的附注)
+        self.assertIsNone(ss.si_flag(info, _SS_S))
 
     def test_new_high_must_beat_every_prior_period(self):
         # 分位 100 也包括持平: 连续不变、全是 0、跟此前最高持平都不算新高 (PR #27 评审)
@@ -6720,7 +6717,7 @@ class TestShortsideBaseline(unittest.TestCase):
             b = ss.si_baseline(info)
             self.assertEqual(b["rank"], 100)                # 显示照旧
             self.assertFalse(b["new_high"], sis[-3:])
-            self.assertIsNone(ss.si_flag(info["si"], _SS_S, ss.si_pct(info), b), sis[-3:])
+            self.assertIsNone(ss.si_flag(info, _SS_S), sis[-3:])
         self.assertTrue(ss.si_baseline(self._info([120] + [100] * 22 + [121]))["new_high"])
         meta = {"si_date": "2026-10-15", "borrow_asof": None, "errors": {}}
         text = "\n".join(ss.report_block([("XX", "stock", self._info([0] * 24))],
@@ -6754,13 +6751,14 @@ class TestShortsideBaseline(unittest.TestCase):
         self.assertIsNone(ss.si_baseline({"si": None, "shares": None}))
         self.assertIsNone(ss.si_baseline(None))
 
-    def test_table_row_shows_baseline_and_flags_new_high_for_stocks_only(self):
+    def test_table_row_shows_baseline_and_tier_for_stocks_only(self):
         info = self._info(list(range(100, 124)), shares=1000.0)
         meta = {"si_date": "2026-10-15", "borrow_asof": None, "errors": {}}
         text = "\n".join(ss.report_block([("XX", "stock", info), ("YY", "etf", info)],
                                          meta, _SS_S, _SS_TODAY))
-        self.assertIn("| XX | 12.3% | 11.2% | 100 | 1.0 |", text)
-        self.assertIn("- ⚠️ **XX** 空头创一年新高", text)
+        self.assertIn("| XX | 12.3% 偏高 | 11.2% | 100 | 1.0 |", text)
+        self.assertIn("| YY (ETF) | 12.3% | 11.2% | 100 | 1.0 |", text)   # ETF 不分档
+        self.assertNotIn("- ⚠️ **XX**", text)              # 早就在档: 创一年新高也不报
         self.assertNotIn("**YY**", text)                   # ETF 只列数
 
 
@@ -6806,8 +6804,10 @@ class TestShortsideSplitAfterSettlement(unittest.TestCase):
         self.assertIsNone(b["median"])                          # 中位也差同一个比例
         # 分位、新高是 FINRA 自己的数相比, 口径一致
         self.assertEqual((b["rank"], b["n"], b["new_high"]), (100, 24, True))
-        flag = ss.si_flag(info["si"], _SS_S, ss.si_pct(info), b)
-        self.assertTrue(flag.startswith("空头创一年新高 (FINRA 10-15) —— "), flag)
+        # 占比算不出就不分档、不报 (新高只当进档那行的附注); 单期大跳也不算
+        self.assertIsNone(ss.si_flag(info, _SS_S))
+        self.assertIsNone(ss.tier_entry(info, _SS_S))
+        self.assertIsNone(ss.si_jump(info, _SS_S))
 
     def test_split_on_or_before_settlement_is_already_in_finra(self):
         for d in ("2026-10-15", "2026-10-01", "2024-06-10"):
@@ -6829,7 +6829,143 @@ class TestShortsideSplitAfterSettlement(unittest.TestCase):
                       "空头股数还是拆股前的口径, 占比和一年中位空到下一期", text)
         self.assertIn("- ⚠️ **YY** 2026-10-20 合股 1:10", text)       # ETF 的占比一样不对
         self.assertNotIn("空头占流通股 100", text)
-        self.assertIn("- ⚠️ **XX** 空头创一年新高 (FINRA 10-15)", text)
+        self.assertNotIn("- ⚠️ **XX** 空头", text)        # 占比空着就不分档、不报
+
+
+class TestShortsideTiers(unittest.TestCase):
+    """档位 (2026-11-14 按回测改, research/shortside_backtest.py): 只按占比分档, ⚠️ 只在
+    进档那一期出; 一年新高、较上期、回补天数只当附注; 单期大跳出 ℹ️。旧规则 (四条任一)
+    过去一年在 watchlist 亮 55 次, 41 次只因为一年新高。股本 100 股 = 空头股数直接读成占比 (%)。"""
+
+    HTB = {"fee": 24.6, "rebate": -20.0, "avail": 10_000, "avail_plus": False}
+    GC = {"fee": 0.33, "rebate": 3.5, "avail": 10**8, "avail_plus": True}
+
+    def _info(self, sis, shares=100.0, dtc=1.0, borrow=None, split=None):
+        """sis = 由早到晚每期的空头股数 (半月结算日, 最后一期 10-15); dtc 只给最后一期。"""
+        dates = _semimonthly(len(sis))
+        recs = [_finra_rec("XX", d, si, sis[i - 1] if i else si,
+                           dtc if i == len(sis) - 1 else 1.0)
+                for i, (d, si) in enumerate(zip(dates, sis))]
+        return {"si": ss.parse_finra(recs)["XX"], "borrow": borrow,
+                "shares": {"shares": shares, "basis": "float", "since": None, "split": split}}
+
+    def test_entry_only_on_the_period_it_happens(self):
+        self.assertEqual(ss.tier_entry(self._info([8] * 23 + [12]), _SS_S), "偏高")
+        self.assertIsNone(ss.tier_entry(self._info([12] * 24), _SS_S))           # 早就在档
+        self.assertIsNone(ss.tier_entry(self._info([8] * 23 + [9.5]), _SS_S))    # 没到 10%
+        self.assertEqual(ss.tier_entry(self._info([15]), _SS_S), "偏高")          # 新上市只有一期
+
+    def test_hysteresis(self):
+        # 进档后在 9-10% 之间晃不算出档, 回到 10% 以上不再报; 跌破 9% 才算出档, 再上来重新报
+        self.assertIsNone(ss.tier_entry(self._info([8] * 20 + [10.5, 9.5, 10.2, 10.6]), _SS_S))
+        self.assertEqual(ss.tier_entry(self._info([8] * 20 + [10.5, 8.5, 9.5, 10.2]), _SS_S), "偏高")
+        # 滞回宽度在 [settings] 里改: 0.4 个百分点时 9.5 已经算出档
+        seq = [8] * 21 + [10.5, 9.5, 10.2]
+        self.assertIsNone(ss.tier_entry(self._info(seq), _SS_S))
+        self.assertEqual(ss.tier_entry(self._info(seq), {**_SS_S, "short_pct_hyst": 0.4}), "偏高")
+
+    def test_upgrade_counts_downgrade_does_not(self):
+        self.assertEqual(ss.tier_entry(self._info([12] * 23 + [21]), _SS_S), "拥挤")   # 偏高升拥挤
+        self.assertEqual(ss.tier_entry(self._info([5] * 23 + [25]), _SS_S), "拥挤")    # 一步到拥挤
+        self.assertIsNone(ss.tier_entry(self._info([25] * 23 + [15]), _SS_S))         # 掉回偏高
+        self.assertIsNone(ss.tier_entry(self._info([25] * 23 + [19.5]), _SS_S))       # 拥挤滞回内
+
+    def test_no_tier_when_pct_unknown(self):
+        info = self._info([8] * 23 + [12], split={"date": "2026-10-20", "ratio": 0.1})
+        self.assertIsNone(ss.tier_entry(info, _SS_S))      # 结算日之后拆过股, 占比空着
+        self.assertIsNone(ss.si_flag(info, _SS_S))
+        self.assertIsNone(ss.tier_entry({"si": self._info([12])["si"], "shares": None}, _SS_S))
+
+    def test_flag_on_entry_with_the_rest_as_notes(self):
+        # SOFI 2026-02-27 那种: 一年在 9% 上下, 这期升到 10% 以上 -> 进档报一次
+        flag = ss.si_flag(self._info([9] * 23 + [17.5]), _SS_S)
+        self.assertTrue(flag.startswith(
+            "空头进入偏高档: 占流通股 17.5% (≥10%)、一年中位 9.0%、创一年新高、较上期 +94%、"
+            "回补 1.0 天 (FINRA 10-15) —— 回测同档: 之后半年波动约 45%"), flag)
+        self.assertTrue(flag.endswith("是波动提示, 不是见底信号"), flag)
+        self.assertNotIn("逼空", flag)
+        # 下一期还在档 (SOFI 10/30 那种): 不再报, 表格里标"偏高"
+        self.assertIsNone(ss.si_flag(self._info([9] * 22 + [17.5, 17.6]), _SS_S))
+        # 借券费是附注; 普通券不写"可借只剩"
+        flag = ss.si_flag(self._info([9] * 23 + [17.5], borrow=self.GC), _SS_S)
+        self.assertIn("、借券费 0.33% (FINRA 10-15)", flag)
+
+    def test_new_high_is_a_strict_note(self):
+        # 进档这期刚好跟窗口里的高点持平 -> 不写"创一年新高"; 高一点才写
+        tie = ss.si_flag(self._info([12] + [8] * 22 + [12]), _SS_S)
+        self.assertTrue(tie.startswith("空头进入偏高档"), tie)
+        self.assertNotIn("创一年新高", tie)
+        self.assertIn("创一年新高", ss.si_flag(self._info([12] + [8] * 22 + [12.5]), _SS_S))
+
+    def test_low_short_interest_never_flags(self):
+        # META 10/30 实况: 2,842 万 -> 7,548 万股, 占比 1.3% -> 3.4%, 创一年新高、较上期 +166%
+        # —— 不分档、不打 ⚠️, 只出 ℹ️ (10/26 远期出售 + 强制可转换优先股的对冲盘)
+        meta_ = self._info([28_417_942] * 23 + [75_483_549], shares=2_211_148_684.0)
+        self.assertTrue(ss.si_baseline(meta_)["new_high"])
+        self.assertIsNone(ss.si_tier(ss.si_pct(meta_), _SS_S))
+        self.assertIsNone(ss.si_flag(meta_, _SS_S))
+        jump = ss.si_jump(meta_, _SS_S)
+        self.assertTrue(jump.startswith("空头单期 +166% (多出 4707万股, 约占流通股 2.1%) "
+                                        "(FINRA 10-15) —— 单期大跳常见于增发、可转债、远期出售"), jump)
+        self.assertIn("不一定是有人看空", jump)
+        # GOOG 10/30 实况: 1.1%, 创一年新高、较上期 +24% —— 什么都不出
+        goog = self._info([48_412_278] * 23 + [59_796_131], shares=5_579_000_000.0)
+        self.assertIsNone(ss.si_flag(goog, _SS_S))
+        self.assertIsNone(ss.si_jump(goog, _SS_S))
+
+    def test_jump_needs_size_and_a_comparable_prior(self):
+        self.assertIsNone(ss.si_jump(self._info([0.5] * 23 + [1.0]), _SS_S))    # 翻倍但只多 0.5%
+        self.assertIsNone(ss.si_jump(self._info([10] * 23 + [14]), _SS_S))      # +40% < +50%
+        self.assertIsNotNone(ss.si_jump(self._info([10] * 23 + [15]), _SS_S))   # 正好 +50%
+        dates = _semimonthly(2)                                                 # 拆股那期不算
+        recs = [_finra_rec("XX", dates[0], 10, 10, 1.0), _finra_rec("XX", dates[1], 100, 10, 1.0, "Y")]
+        info = {"si": ss.parse_finra(recs)["XX"], "shares": {"shares": 1000.0, "basis": "float"}}
+        self.assertIsNone(ss.si_jump(info, _SS_S))
+
+    def test_squeeze_reports_every_period(self):
+        info = self._info([25] * 24, dtc=6.1, borrow=self.HTB)      # 早就在拥挤档, 但三条齐了
+        self.assertTrue(ss.squeeze_ready(info, _SS_S))
+        flag = ss.si_flag(info, _SS_S)
+        self.assertTrue(flag.startswith("空头拥挤档: 占流通股 25.0% (≥20%)"), flag)
+        self.assertIn("借券费 24.60%、可借只剩 1万股", flag)
+        self.assertIn("回测同档: 之后半年波动约 52%", flag)
+        self.assertTrue(flag.endswith("涨起来会很急"), flag)
+        # 三条缺一条就不每期报
+        self.assertIsNone(ss.si_flag(self._info([25] * 24, dtc=6.1, borrow=self.GC), _SS_S))
+        self.assertIsNone(ss.si_flag(self._info([25] * 24, dtc=4.0, borrow=self.HTB), _SS_S))
+        self.assertIsNone(ss.si_flag(self._info([15] * 24, dtc=6.1, borrow=self.HTB), _SS_S))
+
+    def test_report_block_tier_cell_lines_and_note(self):
+        meta = {"si_date": "2026-10-15", "borrow_asof": None, "errors": {}}
+        items = [("AA", "stock", self._info([9] * 23 + [17.5])),        # 这期进偏高档
+                 ("BB", "stock", self._info([17.5] * 24)),               # 早在偏高档
+                 ("CC", "stock", self._info([28_417_942] * 23 + [75_483_549],
+                                            shares=2_211_148_684.0)),    # META 型
+                 ("DD", "etf", self._info([9] * 23 + [17.5]))]           # ETF 不分档
+        text = "\n".join(ss.report_block(items, meta, _SS_S, _SS_TODAY,
+                                         {"CC": "10/26 远期出售 4000 万股, 对冲盘", "BB": ""}))
+        self.assertIn("| AA | 17.5% 偏高 |", text)
+        self.assertIn("| BB | 17.5% 偏高 |", text)
+        self.assertIn("| CC | 3.4% |", text)
+        self.assertIn("| DD (ETF) | 17.5% |", text)
+        self.assertIn("- ⚠️ **AA** 空头进入偏高档", text)
+        self.assertNotIn("- ⚠️ **BB**", text)
+        self.assertNotIn("- ⚠️ **CC**", text)
+        self.assertIn("- ℹ️ **CC** 空头单期 +166%", text)
+        self.assertIn("- **CC** 空头备注: 10/26 远期出售 4000 万股, 对冲盘", text)
+        self.assertNotIn("**BB** 空头备注", text)                      # 空备注不出
+        self.assertNotIn("**DD**", text)
+        self.assertIn("占比 ≥10% 偏高、≥20% 拥挤", text)                # 说明跟着阈值走
+        self.assertIn("占比 ≥15% 偏高", ss.note({**_SS_S, "short_pct_warn": 15.0}))
+
+    def test_short_note_must_be_text_in_config(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "watchlist.toml"
+            p.write_text('[tickers.SOFI]\nshort_note = "2029 可转债对冲盘"\n', encoding="utf-8")
+            self.assertEqual(sc.load_config(p)[1]["SOFI"]["short_note"], "2029 可转债对冲盘")
+            p.write_text("[tickers.SOFI]\nshort_note = 1\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "short_note 类型错误"):
+                sc.load_config(p)
 
 
 class TestShortsideBlock(unittest.TestCase):
@@ -6844,11 +6980,11 @@ class TestShortsideBlock(unittest.TestCase):
         self.assertIn("- FINRA 10-15 结算 (每月两期) · IBKR 借券 10-28 01:18 ET", lines)
         i = lines.index(self.HEAD)
         self.assertEqual(lines[i + 2:i + 5], [
-            "| SOFI | 17.2% | — | — | 4.8 | +2% | 0.33% | >1000万 |",
+            "| SOFI | 17.2% 偏高 | — | — | 4.8 | +2% | 0.33% | >1000万 |",
             "| COHR | 4.6% | — | — | 1.2 | -18% | 0.28% | 330万 |",
-            "| QQQ (指数) | 11.7% | — | — | 2.4 | +16% | — | — |"])     # ETF/指数排在个股后面; 历史不满 12 期不算基准
+            "| QQQ (指数) | 11.7% | — | — | 2.4 | +16% | — | — |"])     # ETF/指数排在个股后面、不分档; 历史不满 12 期不算基准
         text = "\n".join(lines)
-        self.assertIn("- ⚠️ **SOFI** 空头占流通股 17.2% (FINRA 10-15)", text)
+        self.assertNotIn("- ⚠️ **SOFI** 空头", text)       # 9/30 (16.8%) 就在偏高档, 10/15 不再报
         self.assertNotIn("**QQQ**", text)                  # 指数不出旗标
         self.assertIn("IBKR 借券文件里没有: QQQ (多半借不到)", text)
 
@@ -6858,8 +6994,12 @@ class TestShortsideBlock(unittest.TestCase):
         meta = _ss_meta(symbols=("SOFI", "BYND", "GLD"), recs=recs)
         text = "\n".join(self._block(meta))
         self.assertIn("- ⚠️ **BYND** 难借券: 借券费 24.6%、可借只剩 1万股", text)
-        self.assertIn("- ⚠️ **BYND** 空头占流通股 30.0%、回补 6.1 天、空头较上期 +50% "
-                      "(FINRA 10-15)", text)
+        # 只有一期 (新上市那种) 且在拥挤档 = 进档; 回补 6.1 天 + 难借券 = 逼空条件齐了
+        self.assertIn("- ⚠️ **BYND** 空头进入拥挤档: 占流通股 30.0% (≥20%)、较上期 +50%、"
+                      "回补 6.1 天、借券费 24.64%、可借只剩 1万股 (FINRA 10-15) —— 回测同档: "
+                      "之后半年波动约 52%", text)
+        self.assertIn("逼空条件齐了 (拥挤 + 回补长 + 券难借)", text)
+        self.assertIn("- ℹ️ **BYND** 空头单期 +50% (多出 3000万股, 约占流通股 10.0%)", text)
         self.assertIn("| GLD (ETF) | 4.0% | — | — | 2.1 | +72% | — | — |", text)   # ETF 照列数
         self.assertNotIn("**GLD**", text)                                   # 但不出旗标
 
@@ -6877,7 +7017,7 @@ class TestShortsideBlock(unittest.TestCase):
         meta = _ss_meta(ibkr_fail=TimeoutError("t"), finra_fail=TimeoutError("t"))
         lines = self._block(meta)
         self.assertNotIn(self.HEAD, lines)
-        self.assertEqual(lines[-2:], [ss.NOTE, ""])
+        self.assertEqual(lines[-2:], [ss.note(_SS_S), ""])
 
     def test_older_settlement_is_dated_and_checked_per_symbol(self):
         # 表头是所有标的里最新的结算日; 单只停在旧一期要注明自己的日期、单独查断更 (PR #27 评审)
@@ -6885,7 +7025,7 @@ class TestShortsideBlock(unittest.TestCase):
                               _finra_rec("GLD", "2026-09-30", 15_390_000, 8_960_000, 2.08)]
         lines = self._block(_ss_meta(symbols=("SOFI", "XYZ", "GLD"), recs=recs))
         self.assertIn("- FINRA 10-15 结算 (每月两期) · IBKR 借券 10-28 01:18 ET", lines)
-        self.assertIn("| SOFI | 17.2% | — | — | 4.8 | +2% | 0.33% | >1000万 |", lines)  # 同一期不注
+        self.assertIn("| SOFI | 17.2% 偏高 | — | — | 4.8 | +2% | 0.33% | >1000万 |", lines)  # 同一期不注
         self.assertIn("| XYZ (08-29 结算) | — | — | — | 2.0 | +0% | — | — |", lines)
         self.assertIn("| GLD (ETF, 09-30 结算) | 4.0% | — | — | 2.1 | +72% | — | — |", lines)
         text = "\n".join(lines)
@@ -6996,7 +7136,8 @@ class TestShortsideMain(unittest.TestCase):
         def fake_run(symbols, today, timeout):
             self.asked.append(list(symbols))
             return _ss_meta(symbols=symbols)
-        cfg = {**sc.TICKER_DEFAULTS, "value_zone": [13.0, 16.0]}
+        cfg = {**sc.TICKER_DEFAULTS, "value_zone": [13.0, 16.0],
+               "short_note": "2029 可转债深度价内, 一部分空头是对冲盘"}
         tickers = {"SOFI": cfg, "QQQ": {**sc.TICKER_DEFAULTS, "kind": "index"}}
         self.patches = [
             mock_attr(sc, "REPORTS", self.reports), mock_attr(sc, "DATA", self.data),
@@ -7040,7 +7181,9 @@ class TestShortsideMain(unittest.TestCase):
         self.assertEqual(self.asked, [["SOFI", "QQQ"]])     # ETF/指数也查 (只是不出旗标)
         text = self._report(f"{self._today()}-close.md")
         self.assertIn("## 空头面", text)
-        self.assertIn("| SOFI | 17.2% | — | — | 4.8 | +2% | 0.33% | >1000万 |", text)
+        self.assertIn("| SOFI | 17.2% 偏高 | — | — | 4.8 | +2% | 0.33% | >1000万 |", text)
+        # watchlist.toml 的 short_note 经 shortside_block 跟在那只后面
+        self.assertIn("- **SOFI** 空头备注: 2029 可转债深度价内, 一部分空头是对冲盘", text)
         self.assertIn("| QQQ (指数) | 11.7% | — | — | 2.4 | +16% | — | — |", text)
         # 空头面紧跟市场状态, 在概览表前面 (10/28 用户要的位置)
         self.assertLess(text.index("## 市场状态"), text.index("## 空头面"))

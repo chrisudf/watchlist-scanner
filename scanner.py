@@ -125,7 +125,10 @@ NYSE_HALF_DAYS = frozenset(map(date.fromisoformat, (
 
 TICKER_DEFAULTS = {"kind": "stock", "options": True, "high_beta": False,
                    "value_zone": None, "zone_asof": None, "two_x": None,
-                   "notes": ""}
+                   "notes": "",
+                   # 空头面的手工备注 (shortside.report_block): 自动判断不出的结构性
+                   # 空头 —— 可转债、远期出售的对冲盘 —— 记一句, 报告里跟在那只后面
+                   "short_note": ""}
 
 SETTINGS_DEFAULTS = {
     "gap_alert_pct": 1.5,        # open pass: flag |gap| above this
@@ -263,17 +266,30 @@ SETTINGS_DEFAULTS = {
     # rebate 可能触发, 但那种标的本来也值得看一眼 (2026-09-04 实测: 陈旧
     # 一天的日线造成 2.0%~16.5% 的差, 3% 会漏掉 MSFT 这档)
     "rr_spot_gap_warn": 0.015,
-    # 空头面 (shortside.py, 2026-10-28): FINRA 空头股数 + IBKR 借券费, 只做提示。
-    # 阈值是经验值, 未回测: IBKR 普通券 0.25%, >= 5% 算难借券; 可借 < 10 万股算借
-    # 不到 (10/28 全美最紧的几只里 QNT 还剩 20 万、IONQ 25 万, 都不亮); 回补天数
-    # >= 5 天、空头较上期 >= +30% 只给个股亮旗标 (ETF 的空头含申赎和对冲盘)。
-    # 10/28 watchlist 回补最高 SOFI 4.75 天。空头占流通股 >= 15% 也只给个股亮
-    # (常见说法 10% 以上算高、20% 以上很高, 取中间); 10/28 只有 SOFI 17.2% 亮
-    "short_pct_warn": 15.0,
+    # 空头面 (shortside.py, 2026-10-28; 2026-11-14 按回测改): FINRA 空头股数 + IBKR
+    # 借券费, 只做提示。占比档位出自 research/shortside_backtest.py (S&P 1500,
+    # 2022-06~2026-05 入场, 满 6 个月约 13 万个样本): 占比越高之后波动越大、涨跌两头
+    # 的极端都更多 (<5% 半年波动约 30%, 10-20% 约 45%, >=20% 约 52%), 不是方向信号;
+    # 5-10% 已经偏高 (40%) 但 watchlist 里常年有几只在这档, 亮了就是背景噪声, 只在表里。
+    # ⚠️ 只在进档那一期出, 在档期间表格里标档名; 跌破阈值 - short_pct_hyst 才算出档
+    # (在 10% 上下来回跳的不每期报)。只给个股 (ETF 的空头含申赎和对冲盘)。
+    # 旧规则 (占比 >=15%、一年新高、回补 >=5 天、较上期 >=+30% 任一条) 过去一年在
+    # watchlist 亮 55 次, 41 次只因为一年新高; 新规则同期 3 次 ⚠️ + 2 次 ℹ️
+    "short_pct_warn": 10.0,          # >= 此值进"偏高"档
+    "short_pct_crowded": 20.0,       # >= 此值进"拥挤"档
+    "short_pct_hyst": 1.0,           # 跌破阈值减这么多 (百分点) 才算出档
+    # IBKR 普通券 0.25%, >= 5% 算难借券; 可借 < 10 万股算借不到 (10/28 全美最紧的
+    # 几只里 QNT 还剩 20 万、IONQ 25 万, 都不亮)。这两条照旧每期亮 (报告段 + 标的详情)
     "short_fee_warn": 5.0,
     "short_avail_warn": 100000,
+    # 回补天数不再单独亮 (回测: 占比 <10% 时回补 >= 5 天的半年波动 34%, 普通票 30%),
+    # 只用来判"逼空条件齐了" = 拥挤档 + 回补 >= 此值 + 难借券 (借券费没有历史, 没回测)
     "short_dtc_warn": 5.0,
-    "short_chg_warn": 30.0,
+    # 空头单期 >= +此值% 且多出的股数 >= short_jump_float_pct% 流通股 -> ℹ️ 一行, 不打
+    # ⚠️: 回测里单期大跳之后跟普通票一样; 常见于增发/可转债/远期出售/并购套利的对冲盘
+    # (10/30 META +166% = 10/26 远期出售 4000 万股 + 强制可转换优先股)
+    "short_jump_pct": 50.0,
+    "short_jump_float_pct": 1.0,
     "short_timeout_s": 30,
     # zone 生命周期腐烂检测 (2026-09-05 zone 评审: 手工 zone 会烂 —
     # 4/15 旧锚在三周~一个月内作废而扫描器全程无感)
@@ -3325,8 +3341,9 @@ def shortside_block(results, meta, today: date | None = None) -> list[str]:
         return []
     items = [(r["symbol"], (r.get("cfg") or {}).get("kind", "stock"), r.get("shortside"))
              for r in results]
+    notes = {r["symbol"]: (r.get("cfg") or {}).get("short_note") for r in results}
     return shortside.report_block(items, meta, meta["settings"],
-                                  today or datetime.now(ET).date())
+                                  today or datetime.now(ET).date(), notes)
 
 
 def snapshot_shortside(meta, d: str) -> None:
