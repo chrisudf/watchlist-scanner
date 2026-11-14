@@ -113,8 +113,31 @@ print(why)' "$et_date" 2>>"$log"); then
   exit 0
 fi
 
-.venv/bin/python scanner.py --mode auto --email >> "$log" 2>&1
+# 开盘报告暂停邮寄 (照常扫描写盘): .env 里 SCAN_OPEN_EMAIL_OFF_UNTIL=YYYY-MM-DD,
+# 美东日期早于它时, 落在开盘窗口 (09:40-10:50 ET, 同 scanner.OPEN_WINDOW) 的 fire
+# 不带 --email; 到期自动恢复, 删掉这行也立即恢复。尾盘/补发/看门狗不受影响。
+# 跳过的那份写 .sent 凭证 (内容注明"暂停"), 否则尾盘 fire 的补发会把它补寄出去,
+# 看门狗也会报"已写盘未送达"。
+email=--email
+et_date=$(TZ=America/New_York date +%F)
+et_hm=$(TZ=America/New_York date +%H%M)
+off_until="${SCAN_OPEN_EMAIL_OFF_UNTIL:-}"
+open_paused=""
+if [ -n "$off_until" ] && [[ "$et_date" < "$off_until" ]] \
+    && [ "$et_hm" -ge 940 ] && [ "$et_hm" -le 1050 ]; then
+  email=""
+  open_paused=1
+fi
+
+.venv/bin/python scanner.py --mode auto $email >> "$log" 2>&1
 status=$?
+
+if [ -n "$open_paused" ] && [ "$status" -eq 0 ] \
+    && [ -f "reports/$et_date-open.md" ] && [ ! -f "reports/$et_date-open.sent" ]; then
+  echo "email paused (SCAN_OPEN_EMAIL_OFF_UNTIL=$off_until) — not sent" \
+    > "reports/$et_date-open.sent"
+  echo "open 报告未邮寄: 暂停至 $off_until" >> "$log"
+fi
 
 if [ "$status" -ne 0 ] && [ "$status" -ne 3 ]; then
   body=$(mktemp)
