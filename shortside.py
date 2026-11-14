@@ -27,11 +27,11 @@
 为什么按档报、只做提示 (2026-11-14 回测, research/shortside_backtest.py): S&P 1500 在
 2022-06~2026-05 入场、满 6 个月的约 13 万个样本里, 空头占流通股越高, 之后半年波动越大、
 涨跌两头的极端都更多 (<5%: 波动约 30%, 跑赢/跑输 30% 以上各约 7%; 10-20%: 45%, 各约
-16%; >=20%: 52%, 各约 20%), 中位收益略差、均值被少数大涨拉平 —— 是风险提示, 不是方向,
+16-17%; >=20%: 52%, 各约 18-20%), 中位收益略差、均值被少数大涨拉平 —— 是风险提示, 不是方向,
 更不是见底信号。"创一年新高"、"较上期大涨"在占比 <5% 的票上跟普通票没区别: 旧规则 (占比
 >=15%、一年新高、回补 >=5 天、较上期 >=+30% 任一条就亮) 过去一年在 watchlist 亮了 55 次,
 41 次只因为一年新高, 31 次亮在占比 <5% 的票上 (NVDA/MSFT/META/GOOG 这种 1% 上下的大票)。
-所以现在只按占比分档 (si_tier), ⚠️ 只在进档那一期出 (tier_entry), 别的都当附注; 单期
+所以现在只按占比分档 (active_tier), ⚠️ 只在进档那一期出 (tier_entry), 别的都当附注; 单期
 大跳另出一行 ℹ️ (si_jump)。借券费高的票后续收益偏差 (Drechsler & Drechsler 2014 等) 也是
 全市场横截面的结论; watchlist 十几只大票 10/28 全是普通券 (0.25-0.43%), 用不上门控。
 ETF/指数的空头含 AP 申赎和对冲盘, 只列数、不分档、不出旗标。
@@ -354,46 +354,56 @@ def si_baseline(info: dict | None) -> dict | None:
 # 档位 (只给个股; 阈值的依据见模块说明和 [settings] 的 short_pct_*)
 # --------------------------------------------------------------------------
 
-def si_tier(pct: float | None, s: dict) -> str | None:
-    """空头占流通股 (%) -> "拥挤" (>= short_pct_crowded) / "偏高" (>= short_pct_warn) / None。"""
-    if pct is None:
-        return None
-    if pct >= s["short_pct_crowded"]:
-        return "拥挤"
-    return "偏高" if pct >= s["short_pct_warn"] else None
+def _tier_walk(info: dict | None, s: dict) -> tuple[str | None, str | None]:
+    """按这只票自己的历史 (_own_rows, 跟占比同一个分母) 逐期走两档的进出 -> (现在所在的档,
+    最新一期刚进的档); 占比算不出 (缺股本、结算日之后拆过股) = (None, None)。
 
-
-def tier_entry(info: dict | None, s: dict) -> str | None:
-    """最新一期刚进档 -> "拥挤" / "偏高"; 否则 None (不在档、早就在档、占比算不出)。
-
-    按这只票自己的历史 (_own_rows, 跟占比同一个分母) 逐期走: 占比 >= 阈值进档, 跌破
-    阈值 - short_pct_hyst 才出档 —— 在 10% 上下来回跳的不会每期都报; 进档发生在最新一期
-    才算。窗口最早那期就在档的, 进档记在那一期 (早就在档, 不报); 新上市只有一期的, 在档
-    就算进档。从偏高升到拥挤算进拥挤档; 从拥挤掉回偏高不算进档 (表格里照样标偏高)。"""
-    pct = si_pct(info)
+    占比 >= 阈值进档, 跌破 阈值 - short_pct_hyst 才出档 (滞回): 在 10% 上下来回跳的不会
+    每期都报; 进了偏高档的票掉到 9.5% 还是偏高, 拥挤档掉到 19.5% 还是拥挤 —— 表格的档名、
+    si_flag、squeeze_ready 都用这一个带滞回的档 (PR #33 评审: 原来表格和逼空判断按当期
+    原始阈值, 跟"跌破阈值 1 个百分点才出档"的说法对不上)。窗口最早那期就在档的, 进档记在
+    那一期 (早就在档, 不报); 新上市只有一期的, 在档就算进档。从偏高升到拥挤算进拥挤档;
+    从拥挤掉回偏高不算进档。阈值之间的关系在 load_config 里校验 (拥挤 > 偏高, 滞回小于
+    偏高阈值和两档间距), 所以在拥挤档时一定也在偏高档。"""
+    if si_pct(info) is None:
+        return None, None
     rows = _own_rows(info)
-    if si_tier(pct, s) is None or not rows:
-        return None
+    if not rows:
+        return None, None
     sh = info["shares"]["shares"]
     xs = [r[1] / sh * 100 for r in rows]
+    state = {}
     for name, thr in (("拥挤", s["short_pct_crowded"]), ("偏高", s["short_pct_warn"])):
-        if xs[-1] < thr:
-            continue
         inside, since = False, None
         for i, x in enumerate(xs):
             if not inside and x >= thr:
                 inside, since = True, i
             elif inside and x < thr - s["short_pct_hyst"]:
                 inside = False
-        return name if since == len(xs) - 1 else None
-    return None
+        state[name] = (inside, inside and since == len(xs) - 1)
+    for name in ("拥挤", "偏高"):
+        inside, entered_now = state[name]
+        if inside:
+            return name, (name if entered_now else None)
+    return None, None
+
+
+def active_tier(info: dict | None, s: dict) -> str | None:
+    """现在所在的档 "拥挤" / "偏高" / None (带滞回, 见 _tier_walk)。"""
+    return _tier_walk(info, s)[0]
+
+
+def tier_entry(info: dict | None, s: dict) -> str | None:
+    """最新一期刚进的档 -> "拥挤" / "偏高"; 否则 None (不在档、早就在档、占比算不出)。"""
+    return _tier_walk(info, s)[1]
 
 
 def squeeze_ready(info: dict | None, s: dict) -> bool:
-    """逼空条件齐了: 拥挤档、回补 >= short_dtc_warn 天、难借券 (borrow_flag) 三条同时成立。
-    文献里逼空要条件叠加 —— 空头多、买回要好几天、券又难借; 借券费没有历史, 这条没回测。"""
+    """逼空条件齐了: 拥挤档 (active_tier)、回补 >= short_dtc_warn 天、难借券 (borrow_flag)
+    三条同时成立。文献里逼空要条件叠加 —— 空头多、买回要好几天、券又难借; 借券费没有
+    历史, 这条没回测。"""
     v = (info or {}).get("si") or {}
-    return (si_tier(si_pct(info), s) == "拥挤"
+    return (active_tier(info, s) == "拥挤"
             and v.get("dtc") is not None and v["dtc"] >= s["short_dtc_warn"]
             and borrow_flag((info or {}).get("borrow"), s) is not None)
 
@@ -498,15 +508,16 @@ def si_flag(info: dict | None, s: dict) -> str | None:
     v = (info or {}).get("si")
     if not v:
         return None
-    pct = si_pct(info)
-    tier = si_tier(pct, s)
+    tier, entered = _tier_walk(info, s)
     if tier is None:
         return None
-    entered, squeeze = tier_entry(info, s), squeeze_ready(info, s)
+    squeeze = squeeze_ready(info, s)
     if not entered and not squeeze:
         return None
+    pct = si_pct(info)
     thr = s["short_pct_crowded"] if tier == "拥挤" else s["short_pct_warn"]
-    facts = [f"占流通股 {pct:.1f}% (≥{thr:g}%)"]
+    # 进档那期占比一定 >= 阈值; 只因逼空条件报的那期可能落在滞回区里 (19.5% 还算拥挤), 不写阈值
+    facts = [f"占流通股 {pct:.1f}%" + (f" (≥{thr:g}%)" if entered else "")]
     base = si_baseline(info)
     if base and base["median"] is not None:
         facts.append(f"一年中位 {base['median']:.1f}%")
@@ -582,7 +593,7 @@ def _row(sym: str, kind: str, info: dict | None, si_date: str | None = None,
     info = info or {}
     v, b = info.get("si") or {}, info.get("borrow")
     pct, base = si_pct(info), si_baseline(info)
-    tier = si_tier(pct, s) if s and kind == "stock" else None
+    tier = active_tier(info, s) if s and kind == "stock" else None
     tags = [KIND_LABEL[kind]] if kind in KIND_LABEL else []
     if v.get("date") and si_date and v["date"] != si_date:
         tags.append(f"{_md(v['date'], si_date)} 结算")

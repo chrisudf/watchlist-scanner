@@ -364,6 +364,19 @@ def load_config(path: Path = CONFIG_FILE) -> tuple[dict, dict]:
             raise ValueError(f"[settings] {k} 类型错误: 期望与默认值 "
                              f"{default!r} 同类, 得到 {v!r}")
     settings = {**SETTINGS_DEFAULTS, **settings_raw}
+    # 空头档位的阈值之间也要校验 (PR #33 评审): 类型对了, 关系错了一样会坏 —— 拥挤 <= 偏高
+    # 两档就不是有序的; 滞回 >= 偏高阈值, 出档线 <= 0, 进了档永远出不来; 滞回 >= 两档间距,
+    # 掉到偏高线以下还算拥挤。shortside._tier_walk 依赖 0 < 偏高 < 拥挤、0 <= 滞回 < 两者
+    warn, crowd, hyst = (settings["short_pct_warn"], settings["short_pct_crowded"],
+                         settings["short_pct_hyst"])
+    if not (0 < warn < crowd and 0 <= hyst < min(warn, crowd - warn)):
+        raise ValueError(
+            "[settings] 空头档位阈值要满足 0 < short_pct_warn < short_pct_crowded, "
+            "0 <= short_pct_hyst < min(short_pct_warn, short_pct_crowded - short_pct_warn); "
+            f"得到 warn={warn!r}, crowded={crowd!r}, hyst={hyst!r}")
+    for k in ("short_jump_pct", "short_jump_float_pct", "short_dtc_warn"):
+        if settings[k] < 0:
+            raise ValueError(f"[settings] {k} 不能是负数, 得到 {settings[k]!r}")
     # BTC 财库 mNAV (mnav.py): [mnav.MSTR] 这类表随 settings 走 (键 "mnav"), 不在
     # SETTINGS_DEFAULTS 白名单里 —— 它不是 [settings] 的键, 是另一张顶层表;
     # 缺省不设 (整段不出), 设了就在这里按 mnav.validate_config 的规矩炸

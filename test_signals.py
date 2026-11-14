@@ -6610,13 +6610,11 @@ class TestShortsideFlags(unittest.TestCase):
         self.assertIsNone(ss.borrow_flag(self.rows["SOFI"],
                                          {**_SS_S, "short_avail_warn": 10**9}))
 
-    def test_si_tier(self):
-        # 档位只看占比 (2026-11-14 按回测改; 阈值在 [settings] 的 short_pct_*)
-        self.assertEqual([ss.si_tier(x, _SS_S) for x in (None, 0.0, 9.99, 10.0, 19.99, 20.0, 45.0)],
-                         [None, None, None, "偏高", "偏高", "拥挤", "拥挤"])
-        self.assertIsNone(ss.si_tier(12.0, {**_SS_S, "short_pct_warn": 15.0}))
+    def test_si_flag_needs_data(self):
+        # 档位和进档见 TestShortsideTiers; 缺数据就不报
         self.assertIsNone(ss.si_flag(None, _SS_S))
         self.assertIsNone(ss.si_flag({"si": None, "shares": None}, _SS_S))
+        self.assertIsNone(ss.active_tier(None, _SS_S))
 
     def test_carry_line_checks_direction_and_tenor(self):
         # 费率过了难借券阈值不能归因: 借券只会压低 forward, 还要按期限折算 (PR #27 评审)
@@ -6849,6 +6847,30 @@ class TestShortsideTiers(unittest.TestCase):
         return {"si": ss.parse_finra(recs)["XX"], "borrow": borrow,
                 "shares": {"shares": shares, "basis": "float", "since": None, "split": split}}
 
+    def test_active_tier_thresholds(self):
+        # 只有一期时就是当期占比按阈值分 (阈值在 [settings] 的 short_pct_*)
+        got = [ss.active_tier(self._info([x]), _SS_S) for x in (0.0, 9.99, 10.0, 19.99, 20.0, 45.0)]
+        self.assertEqual(got, [None, None, "偏高", "偏高", "拥挤", "拥挤"])
+        self.assertIsNone(ss.active_tier(self._info([12.0]), {**_SS_S, "short_pct_warn": 15.0}))
+
+    def test_active_tier_keeps_hysteresis_for_table_and_squeeze(self):
+        # PR #33 评审: 表格、si_flag、逼空判断都用带滞回的档 —— 10.5% 掉到 9.5% 还是偏高,
+        # 跌破 9% 才出档; 拥挤掉到 19.5% 还是拥挤
+        self.assertEqual(ss.active_tier(self._info([8] * 22 + [10.5, 9.5]), _SS_S), "偏高")
+        self.assertIsNone(ss.active_tier(self._info([8] * 22 + [10.5, 8.5]), _SS_S))
+        self.assertIsNone(ss.active_tier(self._info([8] * 23 + [9.5]), _SS_S))   # 没进过档
+        self.assertEqual(ss.active_tier(self._info([12] * 22 + [21, 19.5]), _SS_S), "拥挤")
+        self.assertEqual(ss.active_tier(self._info([12] * 22 + [21, 18.5]), _SS_S), "偏高")
+        meta = {"si_date": "2026-10-15", "borrow_asof": None, "errors": {}}
+        text = "\n".join(ss.report_block([("AA", "stock", self._info([8] * 22 + [10.5, 9.5]))],
+                                         meta, _SS_S, _SS_TODAY))
+        self.assertIn("| AA | 9.5% 偏高 |", text)
+        self.assertNotIn("- ⚠️ **AA**", text)
+        # 滞回区里的拥挤档照样判逼空; 这期不是进档, 占比后面不写阈值
+        sq = self._info([12] * 22 + [21, 19.5], dtc=6.1, borrow=self.HTB)
+        self.assertTrue(ss.squeeze_ready(sq, _SS_S))
+        self.assertTrue(ss.si_flag(sq, _SS_S).startswith("空头拥挤档: 占流通股 19.5%、"))
+
     def test_entry_only_on_the_period_it_happens(self):
         self.assertEqual(ss.tier_entry(self._info([8] * 23 + [12]), _SS_S), "偏高")
         self.assertIsNone(ss.tier_entry(self._info([12] * 24), _SS_S))           # 早就在档
@@ -6902,7 +6924,7 @@ class TestShortsideTiers(unittest.TestCase):
         # —— 不分档、不打 ⚠️, 只出 ℹ️ (10/26 远期出售 + 强制可转换优先股的对冲盘)
         meta_ = self._info([28_417_942] * 23 + [75_483_549], shares=2_211_148_684.0)
         self.assertTrue(ss.si_baseline(meta_)["new_high"])
-        self.assertIsNone(ss.si_tier(ss.si_pct(meta_), _SS_S))
+        self.assertIsNone(ss.active_tier(meta_, _SS_S))
         self.assertIsNone(ss.si_flag(meta_, _SS_S))
         jump = ss.si_jump(meta_, _SS_S)
         self.assertTrue(jump.startswith("空头单期 +166% (多出 4707万股, 约占流通股 2.1%) "
@@ -6926,7 +6948,7 @@ class TestShortsideTiers(unittest.TestCase):
         info = self._info([25] * 24, dtc=6.1, borrow=self.HTB)      # 早就在拥挤档, 但三条齐了
         self.assertTrue(ss.squeeze_ready(info, _SS_S))
         flag = ss.si_flag(info, _SS_S)
-        self.assertTrue(flag.startswith("空头拥挤档: 占流通股 25.0% (≥20%)"), flag)
+        self.assertTrue(flag.startswith("空头拥挤档: 占流通股 25.0%、一年中位 25.0%"), flag)
         self.assertIn("借券费 24.60%、可借只剩 1万股", flag)
         self.assertIn("回测同档: 之后半年波动约 52%", flag)
         self.assertTrue(flag.endswith("涨起来会很急"), flag)
@@ -6957,6 +6979,22 @@ class TestShortsideTiers(unittest.TestCase):
         self.assertNotIn("**DD**", text)
         self.assertIn("占比 ≥10% 偏高、≥20% 拥挤", text)                # 说明跟着阈值走
         self.assertIn("占比 ≥15% 偏高", ss.note({**_SS_S, "short_pct_warn": 15.0}))
+
+    def test_tier_settings_relationships_validated(self):
+        # PR #33 评审: 类型对了、关系错了也要在装载时炸 —— 拥挤 <= 偏高、滞回为负、滞回 >=
+        # 偏高阈值 (出档线 <= 0, 永远出不了档)、滞回 >= 两档间距 (掉到偏高线以下还算拥挤)
+        bad = ["short_pct_crowded = 10.0", "short_pct_crowded = 8.0", "short_pct_hyst = -1.0",
+               "short_pct_warn = 1.0\nshort_pct_hyst = 1.0", "short_pct_hyst = 10.0",
+               "short_pct_warn = 0.0", "short_jump_pct = -5.0"]
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "watchlist.toml"
+            for body in bad:
+                p.write_text(f"[settings]\n{body}\n[tickers.QQQ]\n", encoding="utf-8")
+                with self.assertRaises(ValueError, msg=body):
+                    sc.load_config(p)
+            p.write_text("[settings]\nshort_pct_warn = 8.0\nshort_pct_crowded = 25.0\n"
+                         "short_pct_hyst = 2.0\n[tickers.QQQ]\n", encoding="utf-8")
+            self.assertEqual(sc.load_config(p)[0]["short_pct_crowded"], 25.0)
 
     def test_short_note_must_be_text_in_config(self):
         with tempfile.TemporaryDirectory() as d:

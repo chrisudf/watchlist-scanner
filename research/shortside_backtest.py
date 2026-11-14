@@ -20,6 +20,8 @@
     套到全部历史; 一年里大量增发 / 回购的票有偏差, 只拿来分档。
   - 代码会被重复使用 (META 2022-06 以前是一只 ETF): 某期空头比此前 24 期中位数大 50 倍以上的
     当脏数据扔掉。FINRA 这份数据 2021-07 起, 要先攒 24 期, 所以入场从 2022-06 开始。
+  - 拆股 / 股票股利 (FINRA stockSplitFlag): 只用最后一次拆股之后、24 期窗口完整的期 —— 拆股
+    前后股数口径不同, 跨过去的新高 / 较上期不可比, 之前的期配上现在的流通股占比也不对。
   - 同一只票相邻几期的持有期重叠: t 值先按结算日做横截面平均, 再 Newey-West (12 期) 调整。
   - 2022-06~2026-05 只有四年、大体上涨的一段; 只写"各档之间谁高谁低", 而且逐年都成立的才进
     shortside.py。2026-11-14 跑的结果见 README「空头面」和 lesson.md 同日那条。
@@ -160,7 +162,13 @@ def panel(si: dict, px: pd.DataFrame, fl: dict) -> pd.DataFrame:
         q = df["currentShortPositionQuantity"].astype(float).values
         adv = df["averageDailyVolumeQuantity"].astype(float).values
         j = px.columns.get_loc(s)
-        for n in range(24, len(df)):
+        # 拆股 (FINRA stockSplitFlag, 含股票股利): 那期起股数换了口径 —— 跨过它的 24 期窗口
+        # 新高/较上期不可比, 它之前的期配上现在的流通股占比也不对 (差一个拆股比例)。只用最后
+        # 一次拆股之后、窗口完整的期, 同 shortside._own_rows 截在拆股那期 (PR #33 评审)。
+        # 2026-11 的缓存里 91 只有标记 (112 次)
+        flags = [isinstance(x, str) and x.strip() != "" for x in df.get("stockSplitFlag", [None] * len(df))]
+        last_split = max((i for i, f in enumerate(flags) if f), default=-1)
+        for n in range(max(24, last_split + 24), len(df)):
             prev = q[n - 24:n]
             if prev.min() <= 0 or q[n] / np.median(prev) > 50:
                 continue
