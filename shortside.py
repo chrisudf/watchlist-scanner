@@ -24,10 +24,17 @@
     1000 万写成 ">10000000"; 难借券的 REBATERATE 是负数。**主机是 ftp2** ——
     ftp3 在 2026-10-28 本机和 droplet 都连不上。
 
-为什么只做提示: 借券费高的票后续收益明显偏差 (Drechsler & Drechsler 2014 等),
-回补天数高的也偏差 (Hong 等的 days-to-cover 研究), 但都是全市场横截面的结论;
-watchlist 十几只大票 10/28 全是普通券 (0.25-0.43%), 测不出也用不上门控。
-ETF/指数的空头含 AP 申赎和对冲盘, 只列数、不出旗标。
+为什么按档报、只做提示 (2026-11-14 回测, research/shortside_backtest.py): S&P 1500 在
+2022-06~2026-05 入场、满 6 个月的约 13 万个样本里, 空头占流通股越高, 之后半年波动越大、
+涨跌两头的极端都更多 (<5%: 波动约 30%, 跑赢/跑输 30% 以上各约 7%; 10-20%: 45%, 各约
+16-17%; >=20%: 52%, 各约 18-20%), 中位收益略差、均值被少数大涨拉平 —— 是风险提示, 不是方向,
+更不是见底信号。"创一年新高"、"较上期大涨"在占比 <5% 的票上跟普通票没区别: 旧规则 (占比
+>=15%、一年新高、回补 >=5 天、较上期 >=+30% 任一条就亮) 过去一年在 watchlist 亮了 55 次,
+41 次只因为一年新高, 31 次亮在占比 <5% 的票上 (NVDA/MSFT/META/GOOG 这种 1% 上下的大票)。
+所以现在只按占比分档 (active_tier), ⚠️ 只在进档那一期出 (tier_entry), 别的都当附注; 单期
+大跳另出一行 ℹ️ (si_jump)。借券费高的票后续收益偏差 (Drechsler & Drechsler 2014 等) 也是
+全市场横截面的结论; watchlist 十几只大票 10/28 全是普通券 (0.25-0.43%), 用不上门控。
+ETF/指数的空头含 AP 申赎和对冲盘, 只列数、不分档、不出旗标。
 
 借券费的另一个用处: 扫描器原有的"持有成本异常"提示 (forward 反解现货 vs 日线
 收盘背离 >1.5%) 只能说"常见于难借券, 下单前核对券商的借券费率"; 有了实际费率,
@@ -65,14 +72,29 @@ BORROW_STALE_DAYS = 4        # IBKR 文件日期老于此 (周五晚 → 周一 
 SNAPSHOT_NAME = "borrow_history.csv"
 SNAPSHOT_FIELDS = ["date", "symbol", "fee", "rebate", "avail", "avail_plus", "asof"]
 
-NOTE = ("> 空头占流通股 = 空头股数 ÷ Yahoo 流通股 (多股份类/ADR 口径对不上时用总股本, "
-        "ETF 用资产 ÷ 净值估算份额); 一年中位 / 一年分位 = 这只票自己过去一年 (24 期) 的"
-        "空头中位数和现在排第几 (100 = 一年最高, 含持平; 按现在的股本折算, 上市不满半年不算) —— "
-        "同样的占比对不同的票意义不同, 先跟它自己比; 回补天数 = 空头股数 ÷ 日均成交量 (按平常成交量, 空头"
-        "全部买回要几天); 较上期 = 空头股数比上一期 (FINRA 每月两期, 结算日后约 8 个交易日"
-        "公布)。借券费 = IBKR 给自家客户的年化费率 (普通券约 0.25%), 可借 = IBKR 自己能借出"
-        "的股数。个股按占比从高到低排, ETF/指数排后面: 它们的空头含申赎和对冲盘, 一期变动"
-        "比个股大得多, 不出 ⚠️。只做提示, 未经回测, 不影响任何信号和票据。")
+# 回测同档的数 (research/shortside_backtest.py: S&P 1500, 2022-06~2026-05 入场, 满 6 个月;
+# 涨/跌 = 半年跑赢/跑输 S&P 1500 等权 30% 以上)。改阈值不会改这里 —— 这是那两档的实测
+TIER_BACKTEST = {
+    "偏高": "之后半年波动约 45% (空头 <5% 的票约 30%), 四成再跌 20% 以上, 涨或跌 30% 以上的各约 1/6",
+    "拥挤": "之后半年波动约 52% (空头 <5% 的票约 30%), 四成再跌 20% 以上, 涨或跌 30% 以上的各约 1/5",
+}
+
+
+def note(s: dict) -> str:
+    """报告段最后的说明; 档位阈值跟着 [settings] 走。"""
+    return ("> 空头占流通股 = 空头股数 ÷ Yahoo 流通股 (多股份类/ADR 口径对不上时用总股本, "
+            "ETF 用资产 ÷ 净值估算份额); 一年中位 / 一年分位 = 这只票自己过去一年 (24 期) 的"
+            "空头中位数和现在排第几 (100 = 一年最高, 含持平; 按现在的股本折算, 上市不满半年不算); "
+            "回补天数 = 空头股数 ÷ 日均成交量 (按平常成交量, 空头全部买回要几天); 较上期 = 空头股数"
+            "比上一期 (FINRA 每月两期, 结算日后约 8 个交易日公布)。借券费 = IBKR 给自家客户的年化"
+            "费率 (普通券约 0.25%), 可借 = IBKR 自己能借出的股数。个股按占比从高到低排, ETF/指数"
+            "排后面: 它们的空头含申赎和对冲盘, 一期变动比个股大得多, 不分档、不出 ⚠️。"
+            f"档位 (只给个股): 占比 ≥{s['short_pct_warn']:g}% 偏高、≥{s['short_pct_crowded']:g}% "
+            f"拥挤, 表格里标档名; ⚠️ 只在进档那一期出 (跌破阈值 {s['short_pct_hyst']:g} 个百分点"
+            "才算出档), 拥挤档又碰上回补长、券难借时每期都出。阈值按回测定 (research/"
+            "shortside_backtest.py, S&P 1500 2022–26): 占比越高之后波动越大、涨跌两头的极端都更多"
+            " —— 是风险提示, 不是方向, 更不是见底信号; 创一年新高、较上期大涨在占比低的票上跟普通票"
+            "一样, 只当附注。只做提示, 不影响任何信号和票据。")
 
 
 def _why(e: Exception) -> str:
@@ -286,16 +308,10 @@ def si_pct(info: dict | None) -> float | None:
     return si / sh * 100
 
 
-def si_baseline(info: dict | None) -> dict | None:
-    """这只票**自己**过去一年的空头 -> {"median": 中位占比 % (结算日之后拆过股 =
-    None, 见 split_pending), "rank": 现在排第几分位 (0-100, 100 = 一年最高, 含持平),
-    "n": 期数, "new_high": 严格高于窗口里此前每一期}; 不满 BASE_MIN_N 期 = None。
-
-    同样 17% 对 SOFI 和 NVDA 意义不同 (10/28: SOFI 一年中位 12.8%, NVDA 1.2%), 横比
-    绝对值不如跟自己比。分母统一用现在的股本 (一年里大量增发/回购的票有偏差)。
-    只取上市日之后的期 —— 代码会被重复使用: SPCX 在 2026-03 以前是一只 SPAC ETF,
-    FINRA 历史里混着那只 ETF 的空头 (10/28 实测), 公司改名则不影响 (MSTR 2025-08
-    改名, 不能按 FINRA 的公司名截)。拆股那一期之前的股数不可比, 也截掉。"""
+def _own_rows(info: dict | None) -> list[tuple] | None:
+    """这只票自己可比的历史 [(结算日, 空头股数, 拆股标记)], 按日期排、最后一期 = 最新一期:
+    最新结算日往前一年、上市日之后、最后一次拆股那期起 (理由见 si_baseline)。缺数据 = None。
+    si_baseline 和 tier_entry 共用 —— 两边的"自己的过去"必须是同一段。"""
     v, sh = (info or {}).get("si"), (info or {}).get("shares")
     if not v or not sh or not v.get("hist") or v.get("si") is None:
         return None
@@ -306,8 +322,23 @@ def si_baseline(info: dict | None) -> dict | None:
     splits = [i for i, r in enumerate(rows) if r[2]]
     if splits:
         rows = rows[splits[-1]:]
-    if len(rows) < BASE_MIN_N:
+    return rows
+
+
+def si_baseline(info: dict | None) -> dict | None:
+    """这只票**自己**过去一年的空头 -> {"median": 中位占比 % (结算日之后拆过股 =
+    None, 见 split_pending), "rank": 现在排第几分位 (0-100, 100 = 一年最高, 含持平),
+    "n": 期数, "new_high": 严格高于窗口里此前每一期}; 不满 BASE_MIN_N 期 = None。
+
+    同样 17% 对 SOFI 和 NVDA 意义不同 (10/28: SOFI 一年中位 12.8%, NVDA 1.2%), 横比
+    绝对值不如跟自己比。分母统一用现在的股本 (一年里大量增发/回购的票有偏差)。
+    只取上市日之后的期 —— 代码会被重复使用: SPCX 在 2026-03 以前是一只 SPAC ETF,
+    FINRA 历史里混着那只 ETF 的空头 (10/28 实测), 公司改名则不影响 (MSTR 2025-08
+    改名, 不能按 FINRA 的公司名截)。拆股那一期之前的股数不可比, 也截掉。"""
+    rows = _own_rows(info)
+    if rows is None or len(rows) < BASE_MIN_N:
         return None
+    v, sh = info["si"], info["shares"]
     xs = [r[1] for r in rows]
     # 分位 100 也包括跟此前最高持平 (连续几期不变、全是 0 都是 100), 只用来显示;
     # 新高旗标看 new_high (PR #27 评审)
@@ -317,6 +348,64 @@ def si_baseline(info: dict | None) -> dict | None:
             "rank": sum(1 for x in xs if x <= v["si"]) / len(xs) * 100,
             "n": len(xs),
             "new_high": bool(prior) and v["si"] > max(prior)}
+
+
+# --------------------------------------------------------------------------
+# 档位 (只给个股; 阈值的依据见模块说明和 [settings] 的 short_pct_*)
+# --------------------------------------------------------------------------
+
+def _tier_walk(info: dict | None, s: dict) -> tuple[str | None, str | None]:
+    """按这只票自己的历史 (_own_rows, 跟占比同一个分母) 逐期走两档的进出 -> (现在所在的档,
+    最新一期刚进的档); 占比算不出 (缺股本、结算日之后拆过股) = (None, None)。
+
+    占比 >= 阈值进档, 跌破 阈值 - short_pct_hyst 才出档 (滞回): 在 10% 上下来回跳的不会
+    每期都报; 进了偏高档的票掉到 9.5% 还是偏高, 拥挤档掉到 19.5% 还是拥挤 —— 表格的档名、
+    si_flag、squeeze_ready 都用这一个带滞回的档 (PR #33 评审: 原来表格和逼空判断按当期
+    原始阈值, 跟"跌破阈值 1 个百分点才出档"的说法对不上)。窗口最早那期就在档的, 进档记在
+    那一期 (早就在档, 不报); 新上市只有一期的, 在档就算进档。从偏高升到拥挤算进拥挤档;
+    从拥挤掉回偏高不算进档。阈值之间的关系在 load_config 里校验 (拥挤 > 偏高, 滞回小于
+    偏高阈值和两档间距), 所以在拥挤档时一定也在偏高档。"""
+    if si_pct(info) is None:
+        return None, None
+    rows = _own_rows(info)
+    if not rows:
+        return None, None
+    sh = info["shares"]["shares"]
+    xs = [r[1] / sh * 100 for r in rows]
+    state = {}
+    for name, thr in (("拥挤", s["short_pct_crowded"]), ("偏高", s["short_pct_warn"])):
+        inside, since = False, None
+        for i, x in enumerate(xs):
+            if not inside and x >= thr:
+                inside, since = True, i
+            elif inside and x < thr - s["short_pct_hyst"]:
+                inside = False
+        state[name] = (inside, inside and since == len(xs) - 1)
+    for name in ("拥挤", "偏高"):
+        inside, entered_now = state[name]
+        if inside:
+            return name, (name if entered_now else None)
+    return None, None
+
+
+def active_tier(info: dict | None, s: dict) -> str | None:
+    """现在所在的档 "拥挤" / "偏高" / None (带滞回, 见 _tier_walk)。"""
+    return _tier_walk(info, s)[0]
+
+
+def tier_entry(info: dict | None, s: dict) -> str | None:
+    """最新一期刚进的档 -> "拥挤" / "偏高"; 否则 None (不在档、早就在档、占比算不出)。"""
+    return _tier_walk(info, s)[1]
+
+
+def squeeze_ready(info: dict | None, s: dict) -> bool:
+    """逼空条件齐了: 拥挤档 (active_tier)、回补 >= short_dtc_warn 天、难借券 (borrow_flag)
+    三条同时成立。文献里逼空要条件叠加 —— 空头多、买回要好几天、券又难借; 借券费没有
+    历史, 这条没回测。"""
+    v = (info or {}).get("si") or {}
+    return (active_tier(info, s) == "拥挤"
+            and v.get("dtc") is not None and v["dtc"] >= s["short_dtc_warn"]
+            and borrow_flag((info or {}).get("borrow"), s) is not None)
 
 
 # --------------------------------------------------------------------------
@@ -409,27 +498,65 @@ def carry_line(b: dict | None, gap: float | None = None, dte: int | None = None)
             f"{gap:+.1f}% 的一半: 主要原因不是借券 (股息/除权/报价), 先核对再下单")
 
 
-def si_flag(v: dict | None, s: dict, pct: float | None = None,
-            base: dict | None = None) -> str | None:
-    """只给个股 (调用方按 kind 判断): 空头占流通股 >= short_pct_warn%、创自身一年
-    新高 (base["new_high"]: 严格高于基准窗口里此前每一期, 跟最高持平、全是 0 都不算)、
-    回补天数 >= short_dtc_warn 或空头较上期 >= +short_chg_warn% -> 原因; 否则 None。"""
+def si_flag(info: dict | None, s: dict) -> str | None:
+    """只给个股 (调用方按 kind 判断)。两种情况出一行 ⚠️ 的正文, 其余 None:
+      - 最新一期刚进档 (tier_entry): "空头进入偏高档: ..."; 在档期间不再每期报, 表格里
+        标档名 —— 不然 SOFI/COIN 这种常年 10% 以上的会天天亮成背景噪声;
+      - 拥挤档且逼空条件齐了 (squeeze_ready): 每期都报 (少见, 也最该看)。
+    一年中位/新高、较上期、回补天数、借券费都只是这一行的附注, 不再单独触发 (旧规则的
+    四条任一就亮, 回测见模块说明)。"""
+    v = (info or {}).get("si")
     if not v:
         return None
-    parts = []
-    if pct is not None and pct >= s["short_pct_warn"]:
-        parts.append(f"空头占流通股 {pct:.1f}%")
-    if base and base["new_high"]:
-        parts.append("空头创一年新高" + (f" (一年中位 {base['median']:.1f}%)"
-                                        if base["median"] is not None else ""))
-    if v.get("dtc") is not None and v["dtc"] >= s["short_dtc_warn"]:
-        parts.append(f"回补 {v['dtc']:.1f} 天")
-    if v.get("chg") is not None and v["chg"] >= s["short_chg_warn"]:
-        parts.append(f"空头较上期 {v['chg']:+.0f}%")
-    if not parts:
+    tier, entered = _tier_walk(info, s)
+    if tier is None:
         return None
-    return ("、".join(parts) + f" (FINRA {v['date'][5:]}) —— 空头拥挤: 历史上后续收益"
-            "偏差, 但也容易被逼空急涨")
+    squeeze = squeeze_ready(info, s)
+    if not entered and not squeeze:
+        return None
+    pct = si_pct(info)
+    thr = s["short_pct_crowded"] if tier == "拥挤" else s["short_pct_warn"]
+    # 进档那期占比一定 >= 阈值; 只因逼空条件报的那期可能落在滞回区里 (19.5% 还算拥挤), 不写阈值
+    facts = [f"占流通股 {pct:.1f}%" + (f" (≥{thr:g}%)" if entered else "")]
+    base = si_baseline(info)
+    if base and base["median"] is not None:
+        facts.append(f"一年中位 {base['median']:.1f}%")
+    if base and base["new_high"]:
+        facts.append("创一年新高")
+    if v.get("chg") is not None:
+        facts.append(f"较上期 {v['chg']:+.0f}%")
+    if v.get("dtc") is not None:
+        facts.append(f"回补 {v['dtc']:.1f} 天")
+    if b := (info or {}).get("borrow"):
+        facts.append(f"借券费 {b['fee']:.2f}%"
+                     + ("" if b["avail_plus"] or b["avail"] >= s["short_avail_warn"]
+                        else f"、可借只剩 {shares_cn(b['avail'])}股"))
+    head = f"空头进入{entered}档" if entered else f"空头{tier}档"
+    line = (f"{head}: {'、'.join(facts)} (FINRA {v['date'][5:]}) —— 回测同档: "
+            f"{TIER_BACKTEST[tier]}; 是波动提示, 不是见底信号")
+    if squeeze:
+        line += "; 逼空条件齐了 (拥挤 + 回补长 + 券难借): 空头多、买回要好几天、券又难借, 涨起来会很急"
+    return line
+
+
+def si_jump(info: dict | None, s: dict) -> str | None:
+    """空头单期大跳 -> 一行说明的正文 (报告里是 ℹ️, 不打 ⚠️); 否则 None。只给个股。
+    较上期 >= short_jump_pct% 且多出的股数 >= short_jump_float_pct% 流通股 (占比小的票
+    一期翻倍也只是零头)。回测里占比 <5% 的票单期 >= +50% 之后的波动、回撤跟普通票一样;
+    常见原因是公司融资带来的对冲空头: 10/30 那期 META +166% = 10/26 远期出售 4000 万股
+    (承销商的关联方借股卖出, Meta 2027-11 前交新股结清) + 强制可转换优先股的套利对冲。
+    拆股那期 (较上期写"拆股") 和结算日之后拆过股 (split_pending) 都不算。"""
+    v = (info or {}).get("si") or {}
+    sh = ((info or {}).get("shares") or {}).get("shares")
+    if (v.get("chg") is None or v["chg"] < s["short_jump_pct"] or not v.get("prev")
+            or v.get("si") is None or not sh or split_pending(info)):
+        return None
+    add = v["si"] - v["prev"]
+    if add / sh * 100 < s["short_jump_float_pct"]:
+        return None
+    return (f"空头单期 {v['chg']:+.0f}% (多出 {shares_cn(int(add))}股, 约占流通股 "
+            f"{add / sh * 100:.1f}%) (FINRA {v['date'][5:]}) —— 单期大跳常见于增发、可转债、"
+            "远期出售、并购套利带来的对冲空头, 不一定是有人看空; 先查同期的 8-K / 424B 公告")
 
 
 # --------------------------------------------------------------------------
@@ -457,13 +584,16 @@ TABLE_HEAD = ("| 标的 | 空头占流通股 | 一年中位 | 一年分位 | 回
 TABLE_SEP = "|---|--:|--:|--:|--:|--:|--:|--:|"
 
 
-def _row(sym: str, kind: str, info: dict | None, si_date: str | None = None) -> str:
+def _row(sym: str, kind: str, info: dict | None, si_date: str | None = None,
+         s: dict | None = None) -> str:
     """表格一行, 列见 TABLE_HEAD。缺的格子写 —。这只的结算日跟表头 (si_date) 不同时
     在代码后面注明它自己的结算日, 不然旧一期的数会被当成表头那一期; 结算日之后拆过股
-    的注明那次拆股, 占比和一年中位写 — (split_pending) (都是 PR #27 评审)。"""
+    的注明那次拆股, 占比和一年中位写 — (split_pending) (都是 PR #27 评审)。个股在档的,
+    占比后面写档名 ("17.5% 偏高") —— ⚠️ 只在进档那期出, 在档期间靠这一格。"""
     info = info or {}
     v, b = info.get("si") or {}, info.get("borrow")
     pct, base = si_pct(info), si_baseline(info)
+    tier = active_tier(info, s) if s and kind == "stock" else None
     tags = [KIND_LABEL[kind]] if kind in KIND_LABEL else []
     if v.get("date") and si_date and v["date"] != si_date:
         tags.append(f"{_md(v['date'], si_date)} 结算")
@@ -473,7 +603,7 @@ def _row(sym: str, kind: str, info: dict | None, si_date: str | None = None) -> 
     chg = ("拆股" if v.get("split") else
            f"{v['chg']:+.0f}%" if v.get("chg") is not None else "—")
     cells = [label,
-             f"{pct:.1f}%" if pct is not None else "—",
+             (f"{pct:.1f}%" + (f" {tier}" if tier else "")) if pct is not None else "—",
              f"{base['median']:.1f}%" if base and base["median"] is not None else "—",
              f"{base['rank']:.0f}" if base else "—",
              f"{v['dtc']:.1f}" if v.get("dtc") is not None else "—",
@@ -484,9 +614,11 @@ def _row(sym: str, kind: str, info: dict | None, si_date: str | None = None) -> 
 
 
 def report_block(items: list[tuple[str, str, dict | None]], meta: dict, s: dict,
-                 today: date) -> list[str]:
+                 today: date, notes: dict | None = None) -> list[str]:
     """[(symbol, kind, info)] -> 报告段落: 数据日期一行、每只一行的表格 (个股按空头占
-    流通股从高到低, ETF/指数排后面)、⚠️ 旗标逐只、取数失败/缺记录各一条、说明。"""
+    流通股从高到低, ETF/指数排后面)、⚠️ 旗标 / ℹ️ 单期大跳逐只、取数失败/缺记录各一条、
+    说明。notes = {symbol: watchlist.toml 的 short_note} —— 手工记的结构性空头 (可转债、
+    远期出售的对冲盘), 有就跟在那只后面出一行, 自动判断不出来的原因靠它。"""
     errors = meta.get("errors") or {}
     lines = ["## 空头面 (FINRA 空头股数 / IBKR 借券费)", ""]
     d, asof = meta.get("si_date"), meta.get("borrow_asof")
@@ -500,7 +632,7 @@ def report_block(items: list[tuple[str, str, dict | None]], meta: dict, s: dict,
         lines.append(f"- FINRA {d[5:] if d else '?'} 结算 (每月两期) · "
                      f"IBKR 借券 {asof[5:] + ' ET' if asof else '?'}")
         lines += ["", TABLE_HEAD, TABLE_SEP]
-        lines += [_row(*x, d) for x in rows]
+        lines += [_row(*x, d, s) for x in rows]
         lines.append("")
     if _stale(d, today, SI_STALE_DAYS):
         lines.append(f"- ⚠️ FINRA 最新一期是 {d}, 超过 {SI_STALE_DAYS} 天 —— 数据可能断更")
@@ -523,9 +655,13 @@ def report_block(items: list[tuple[str, str, dict | None]], meta: dict, s: dict,
         b = info.get("borrow")
         if why := borrow_flag(b, s):
             lines.append(f"- ⚠️ **{sym}** 难借券: {why} —— 做空拥挤, put 贵、call 便宜都不是白捡的")
-        if kind == "stock" and (why := si_flag(info.get("si"), s, si_pct(info),
-                                               si_baseline(info))):
-            lines.append(f"- ⚠️ **{sym}** {why}")
+        if kind == "stock":
+            if why := si_flag(info, s):
+                lines.append(f"- ⚠️ **{sym}** {why}")
+            if why := si_jump(info, s):
+                lines.append(f"- ℹ️ **{sym}** {why}")
+        if memo := (notes or {}).get(sym):
+            lines.append(f"- **{sym}** 空头备注: {memo}")
 
     for key, name in (("si", "FINRA 空头股数"), ("borrow", "IBKR 借券费"),
                       ("shares", "Yahoo 股本 (空头占流通股那一列)")):
@@ -543,7 +679,7 @@ def report_block(items: list[tuple[str, str, dict | None]], meta: dict, s: dict,
         lines.append("- 无 (没有标的)")
     if lines[-1] != "":
         lines.append("")
-    lines += [NOTE, ""]
+    lines += [note(s), ""]
     return lines
 
 
@@ -592,7 +728,8 @@ def main(argv: list[str]) -> int:
     meta = run(symbols, today, timeout=settings["short_timeout_s"])
     items = [(s_, tickers.get(s_, {}).get("kind", "stock"), meta["by_symbol"][s_])
              for s_ in symbols]
-    print("\n".join(report_block(items, meta, settings, today)))
+    notes = {s_: tickers.get(s_, {}).get("short_note") for s_ in symbols}
+    print("\n".join(report_block(items, meta, settings, today, notes)))
     return 0
 
 
