@@ -48,6 +48,20 @@ if [ "${1:-}" = "insider" ]; then
   exit "$status"
 fi
 
+# 盘前扫描 (premarket.py, 只读): 布里斯班 22:00 = 07:00 EST / 08:00 EDT, 一条
+# cron 两个 DST 都落在 04:00-09:25 ET 窗口内。窗口外/休市/已跑过 = exit 3 静默;
+# 崩溃或发信失败才发 FAILED。
+if [ "${1:-}" = "premarket" ]; then
+  .venv/bin/python premarket.py --email >> "$log" 2>&1
+  status=$?
+  if [ "$status" -ne 0 ] && [ "$status" -ne 3 ]; then
+    body=$(mktemp); tail -50 "$log" > "$body"
+    notify "[watchlist] premarket FAILED $d (exit $status)" "$body"
+    rm -f "$body"
+  fi
+  exit "$status"
+fi
+
 if [ "${1:-}" = "watchdog" ]; then
   et_date=$(TZ=America/New_York date +%F)   # the US trading day just ended
   # 该交易日到底该不该有报告 —— 问盘面, 不查假日日历 (和扫描器的
@@ -74,6 +88,8 @@ print(why)' "$et_date" 2>>"$log"); then
   # 查: .md 在而 .sent 不在 = 扫描跑了但报告没到收件箱 — 这正是
   # "Resend 抖动一次, 整天静默丢报"的洞 (五轮评审)。scanner 会在下一
   # 个 --email fire 自动补发, 这里报的是补发也没救回来的情况
+  # 开市日 (整日或半日) 也该有盘前报告 —— 它在同一个 ET 日的早上跑
+  [ -n "$modes" ] && modes="premarket $modes"
   missing=""
   for m in $modes; do
     if [ ! -f "reports/$et_date-$m.md" ]; then

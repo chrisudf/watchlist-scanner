@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
@@ -280,6 +281,8 @@ def main() -> int:
     ap.add_argument("--no-insider", action="store_true")
     ap.add_argument("--no-shortside", action="store_true",
                     help="跳过 FINRA 空头仓位 + IBKR 借券费")
+    ap.add_argument("--email", action="store_true",
+                    help="写盘后邮寄报告 (SCAN_SMTP_* / Resend env, 同 scanner)")
     ap.add_argument("--no-btc", action="store_true",
                     help="跳过 mNAV ([mnav.*]) 与 BTC 比值 ([btcratio.*])")
     ap.add_argument("--workers", type=int, default=4)
@@ -362,6 +365,18 @@ def main() -> int:
     print()
     print(report)
     print(f"\nREPORT {report_path}")
+    if args.email:
+        # 主题带时刻, 理由同 scanner: 每封唯一, Gmail 不归会话不折叠
+        subject = (f"[watchlist] {d} premarket {now_et:%H:%M} ET"
+                   + (" manual" if manual else "") + f" — {regime['stage']}")
+        try:
+            sc.send_email_report(report_path, subject)
+            # 投递凭证, 看门狗按它判"已写盘未送达"
+            sc._sent_marker(report_path).write_text(now_et.isoformat(), encoding="utf-8")
+            print(f"email sent to {os.environ.get('SCAN_EMAIL_TO')}")
+        except Exception as e:      # noqa: BLE001
+            print(f"EMAIL FAILED: {e}", file=sys.stderr)
+            return 1
     return 0
 
 
