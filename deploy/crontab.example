@@ -10,6 +10,9 @@
 # 可选带外心跳: .env 里设 SCAN_HEARTBEAT_URL=https://hc-ping.com/<uuid>
 # (healthchecks.io 建 1 day period / 12h grace 的 check) — 邮件商故障时
 # FAILED/MISSED 告警和报告走同一条坏通道, 只有心跳服务能从外面报警。
+# 盘前 (premarket.py): 布里斯班时钟一条就够 = 07:00 EST / 08:00 EDT。
+# UTC 时钟的机器写 "0 12 * * 1-5" (= 07:00 EST / 08:00 EDT)。
+0 22 * * 1-5 /opt/watchlist-scanner/deploy/run_scan.sh premarket   # 布里斯班时钟
 45 13 * * 1-5 /opt/watchlist-scanner/deploy/run_scan.sh   # 09:45 EDT open  (US summer)
 45 14 * * 1-5 /opt/watchlist-scanner/deploy/run_scan.sh   # 09:45 EST open  (US winter; EDT=10:45 also in-window, dedup skips)
 45 19 * * 1-5 /opt/watchlist-scanner/deploy/run_scan.sh   # 15:45 EDT close (US summer)

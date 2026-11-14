@@ -7748,5 +7748,45 @@ class TestBtcratioCli(unittest.TestCase):
         self.assertEqual(seen["cache_dir"].name, "data")
 
 
+class TestPremarket(unittest.TestCase):
+    """premarket.py: BTC 同时点对齐、无盘前价不出读数、22:00 布里斯班落窗口。"""
+
+    def setUp(self):
+        import premarket
+        self.pm = premarket
+        idx = pd.date_range("2026-11-13 07:50", periods=11, freq="1min", tz=sc.ET)
+        self.btc = pd.Series([70000.0 + i for i in range(11)], index=idx)
+
+    def test_btc_at_same_minute(self):
+        ts = datetime(2026, 11, 13, 7, 55, tzinfo=sc.ET)
+        px, t = self.pm.btc_at(self.btc, ts)
+        self.assertEqual((px, t.minute), (70005.0, 55))
+
+    def test_btc_at_rejects_stale(self):
+        ts = datetime(2026, 11, 13, 8, 30, tzinfo=sc.ET)   # 最后一根 08:00, 差 30 分钟
+        self.assertIsNone(self.pm.btc_at(self.btc, ts))
+        self.assertIsNone(self.pm.btc_at(pd.Series(dtype=float), ts))
+
+    def test_no_premarket_quote_is_error_not_stale_close(self):
+        settings = {"mnav": {"MSTR": {"st_ticker": "MSTR"}}, "btcratio": {}}
+        m, b = self.pm.btc_metas(settings, [{"symbol": "MSTR", "pm": None}],
+                                 date(2026, 11, 13), self.btc)
+        self.assertIn("无盘前成交", m["by_symbol"]["MSTR"]["error"])
+        self.assertIsNone(b)
+
+    def test_brisbane_2200_in_window_both_dst(self):
+        bne = ZoneInfo("Australia/Brisbane")
+        for d in (date(2026, 7, 13), date(2026, 11, 16)):   # EDT 周一 / EST 周一
+            et = datetime(d.year, d.month, d.day, 22, 0, tzinfo=bne).astimezone(sc.ET)
+            self.assertEqual(et.date(), d)
+            self.assertTrue(sc.in_window(et, self.pm.PREMARKET_WINDOW), et)
+
+    def test_crontab_example_premarket(self):
+        text = (Path(sc.BASE) / "deploy" / "crontab.example").read_text(encoding="utf-8")
+        lines = [l for l in text.splitlines()
+                 if "run_scan.sh premarket" in l and not l.startswith("#")]
+        self.assertEqual([l.split()[:5] for l in lines], [["0", "22", "*", "*", "1-5"]])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
