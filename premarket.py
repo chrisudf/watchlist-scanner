@@ -54,12 +54,25 @@ def load_dotenv(path=sc.BASE / ".env") -> None:
         os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
-def premarket_quotes(symbols: list[str]) -> dict[str, dict | None]:
-    """今天 (ET) 盘前 04:00-09:30 的 1m bar -> {last, high, low, volume, ts, bars}。
-    没有盘前成交 (指数/冷门票) = None。"""
-    df = yf.download(symbols, period="2d", interval="1m", prepost=True,
+BTC = "BTC-USD"
+
+
+def premarket_quotes(symbols: list[str]):
+    """今天 (ET) 盘前 04:00-09:30 的 1m bar -> ({sym: {last, high, low, volume, ts,
+    bars} | None}, BTC 1m 收盘序列)。没有盘前成交 (指数/冷门票) = None。
+
+    auto_adjust=True 与 batch_history 同口径: 昨收 (pc)、20 日线都是复权价,
+    盘前价也必须是。今天的 bar 在两种口径下数值相同 (复权只回溯调整除权日
+    之前的价), 关键是除权日当天昨收已扣掉股息, gap 才不会把派息算成跌幅。
+    BTC 同一次下载取, mNAV/比值按股价那一分钟对齐 (见 btc_at)。"""
+    df = yf.download(symbols + [BTC], period="2d", interval="1m", prepost=True,
                      group_by="ticker", progress=False, threads=True,
-                     auto_adjust=False)
+                     auto_adjust=True)
+    try:
+        btc = df[BTC]["Close"].dropna()
+        btc.index = btc.index.tz_convert(sc.ET) if btc.index.tz is not None             else btc.index.tz_localize(sc.ET)
+    except KeyError:
+        btc = pd.Series(dtype=float)
     today = datetime.now(sc.ET).date()
     out: dict[str, dict | None] = {}
     for sym in symbols:
@@ -87,7 +100,7 @@ def premarket_quotes(symbols: list[str]) -> dict[str, dict | None]:
             "ts": pm.index[-1].to_pydatetime(),
             "bars": len(pm),
         }
-    return out
+    return out, btc
 
 
 def prev_close(hist: pd.DataFrame | None, today: date) -> tuple[float, str] | None:
@@ -105,40 +118,68 @@ def fmt_vol(v: int) -> str:
     return f"{v / 1e6:.1f}M" if v >= 1e6 else f"{v / 1e3:.0f}K" if v >= 1e3 else str(v)
 
 
-def live_btc_price() -> float | None:
-    """BTC-USD 最新 1m 价 (24/7, 盘前也是实时的)。取不到 = None, 模块退回日线。"""
-    try:
-        b = yf.Ticker("BTC-USD").history(period="1d", interval="1m")
-        return float(b["Close"].dropna().iloc[-1]) if not b.empty else None
-    except Exception:       # noqa: BLE001
+BTC_MAX_LAG_MIN = 5
+
+
+def btc_at(btc: pd.Series, ts: datetime) -> tuple[float, datetime] | None:
+    """股价那一分钟 (或之前最近一分钟, 最多差 BTC_MAX_LAG_MIN) 的 BTC 收盘。
+    对不上 = None —— 调用方不出读数, 不拿错时点的 BTC 硬凑。"""
+    if btc is None or btc.empty:
         return None
+    upto = btc[btc.index <= ts]
+    if upto.empty:
+        return None
+    t = upto.index[-1].to_pydatetime()
+    if (ts - t).total_seconds() > BTC_MAX_LAG_MIN * 60:
+        return None
+    return float(upto.iloc[-1]), t
 
 
-def btc_metas(settings: dict, results, today: date):
+def btc_metas(settings: dict, results, today: date, btc: pd.Series):
     """mNAV + BTC 比值, 股价用**盘前价** (scanner 的 attach_* 用的是日线收盘, 盘前
-    那是昨收), BTC 用实时价 —— 两边同一时点。只取数, 不写 *_history.csv
-    (快照只归尾盘定时扫描); 模块自己的数据缓存照常更新。"""
-    live = {r["symbol"]: r["pm"]["last"] for r in results if r.get("pm")}
-    btc = live_btc_price()
+    那是昨收), BTC 取**同一分钟**的 1m 收盘 (btc_at)。逐只单独跑 —— 各只的盘前
+    最后成交时刻不同, 一个 live_btc 不能共用。
+
+    没有盘前价或对不上同时点的 BTC = 该只写 error, 不出读数: 模块没有 live_px
+    时会退回日线缓存价, 和实时 BTC 拼出来是"不同时点的同一个读数"。
+
+    只取数, 不写 *_history.csv (快照只归尾盘定时扫描); 模块数据缓存照常更新。
+    meta["pm_times"] = {sym: (股价时刻, BTC 时刻)} 供报告注明时点。"""
+    pm = {r["symbol"]: r.get("pm") for r in results}
     out = []
     for key, mod, kw in (
-            ("mnav", sc.mnav, lambda c: dict(cache_path=sc.DATA / sc.mnav.CACHE_NAME,
-                                             holidays=sc.NYSE_HOLIDAYS)),
-            ("btcratio", sc.btcratio, lambda c: dict(cache_dir=sc.DATA))):
+            ("mnav", sc.mnav, dict(cache_path=sc.DATA / sc.mnav.CACHE_NAME,
+                                   holidays=sc.NYSE_HOLIDAYS)),
+            ("btcratio", sc.btcratio, dict(cache_dir=sc.DATA))):
         cfgs = settings.get(key) or {}
         if not cfgs:
             out.append(None)
             continue
-        try:
-            out.append(mod.run(cfgs, today=today, live_btc=btc,
-                               live_px={s_: live[s_] for s_ in cfgs if s_ in live},
-                               **kw(cfgs)))
-        except Exception as e:      # noqa: BLE001
-            out.append({"by_symbol": {s_: {"error": f"{key} 模块异常: "
-                                                     f"{type(e).__name__}: {e}"}
-                                      for s_ in cfgs},
-                        "cfgs": cfgs, "version": None, "timestamp": None,
-                        "warnings": [], "from_cache": False, "fetched": None})
+        meta = {"by_symbol": {}, "cfgs": cfgs, "version": None, "timestamp": None,
+                "warnings": [], "from_cache": False, "fetched": None, "pm_times": {}}
+        for sym, cfg in cfgs.items():
+            q = pm.get(sym)
+            if not q:
+                meta["by_symbol"][sym] = {"error": "无盘前成交 — 不出盘前读数 (不拿昨收配实时 BTC)"}
+                continue
+            b = btc_at(btc, q["ts"])
+            if b is None:
+                meta["by_symbol"][sym] = {"error": f"取不到 {q['ts']:%H:%M} ET 前后 "
+                                                   f"{BTC_MAX_LAG_MIN} 分钟内的 BTC 1m 价 — 不出读数"}
+                continue
+            try:
+                m = mod.run({sym: cfg}, today=today, live_btc=b[0],
+                            live_px={sym: q["last"]}, **kw)
+            except Exception as e:      # noqa: BLE001
+                meta["by_symbol"][sym] = {"error": f"{key} 模块异常: {type(e).__name__}: {e}"}
+                continue
+            meta["by_symbol"].update(m.get("by_symbol") or {})
+            meta["warnings"] += m.get("warnings") or []
+            for k in ("version", "timestamp", "fetched"):
+                meta[k] = meta[k] or m.get(k)
+            meta["from_cache"] = meta["from_cache"] or bool(m.get("from_cache"))
+            meta["pm_times"][sym] = (q["ts"], b[1])
+        out.append(meta)
     return out[0], out[1]
 
 
@@ -195,10 +236,16 @@ def render(results, regime, now_et, s, insider_meta, shortside_meta=None,
     ss = sc.shortside_block(results, shortside_meta, now_et.date())
     if ss:
         lines += [""] + ss
-    for blk in (sc.mnav_block(mnav_meta), sc.btcratio_block(btcratio_meta)):
+    for meta, blk in ((mnav_meta, sc.mnav_block(mnav_meta)),
+                      (btcratio_meta, sc.btcratio_block(btcratio_meta))):
         if blk:
             # 模块把 live_px 标成"扫描器收盘"; 这里喂的是盘前价
             lines += [""] + [l.replace("(扫描器收盘)", "(盘前价)") for l in blk]
+            times = (meta or {}).get("pm_times") or {}
+            if times:
+                lines.append("> 读数时点: " + " · ".join(
+                    f"{sym} 股价 {st:%H:%M} ET / BTC {bt:%H:%M} ET"
+                    for sym, (st, bt) in times.items()))
 
     lines += ["", "## 盘前一览", "",
               "| 标的 | 昨收 | 盘前 | 盘前% | 成交分钟 | 20日线 | 价值区 | 状态 |",
@@ -215,7 +262,8 @@ def render(results, regime, now_et, s, insider_meta, shortside_meta=None,
             + (f"{pm['last']:.2f} | {r['pm_gap_pct']:+.1f}% | {pm['bars']}"
                if pm else "— | — | —")
             + f" | {t['sma20']:.2f} | "
-            + (f"{zone[0]:g}-{zone[1]:g}" if zone else "—")
+            + (f"⛔作废({r['zone_invalid']})" if r.get("zone_invalid")
+               else f"{zone[0]:g}-{zone[1]:g}" if zone else "—")
             + f" | {r.get('prev_state') or '—'} |")
     no_pm = [r["symbol"] for r in results if r["tech"] is not None and not r.get("pm")]
     lines += ["",
@@ -263,7 +311,7 @@ def main() -> int:
 
     regime = sc.fetch_regime(settings)
     hist = sc.batch_history(symbols)
-    pms = premarket_quotes(symbols)
+    pms, btc_1m = premarket_quotes(symbols)
     state = sc.load_state()   # 只读
 
     results_by = {}
@@ -300,7 +348,7 @@ def main() -> int:
 
     mnav_meta = btcratio_meta = None
     if not args.no_btc:
-        mnav_meta, btcratio_meta = btc_metas(settings, results, now_et.date())
+        mnav_meta, btcratio_meta = btc_metas(settings, results, now_et.date(), btc_1m)
 
     report = render(results, regime, now_et, settings, insider_meta, shortside_meta,
                     mnav_meta, btcratio_meta)
