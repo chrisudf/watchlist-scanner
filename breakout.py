@@ -248,6 +248,9 @@ def plan(df: pd.DataFrame, entry: pd.Series, stop: pd.Series, account: float) ->
 
 def market_light(qqq: pd.Series) -> tuple[str, str]:
     """QQQ 收盘序列 → (灯, 说明)。10MA>20MA 且收盘>50MA 绿; 只满足一条黄; 都不满足红。"""
+    qqq = qqq.dropna()          # Yahoo 收盘后最后一行常是 NaN, 比较全为 False 会误判红灯
+    if len(qqq) < 50:
+        return "⚪ 未知", f"QQQ 数据不足 ({len(qqq)} 根), 无法判断大盘"
     last = float(qqq.iloc[-1])
     m10, m20, m50 = (float(qqq.rolling(n).mean().iloc[-1]) for n in (10, 20, 50))
     trend, above = m10 > m20, last > m50
@@ -401,7 +404,10 @@ def main() -> int:
 
     import yfinance as yf
     q = yf.download("QQQ", period="1y", auto_adjust=True, progress=False)["Close"].squeeze()
-    light, mtext = market_light(q.loc[:pd.Timestamp(asof)])
+    q = q.loc[:pd.Timestamp(asof)].dropna()
+    light, mtext = market_light(q)
+    if len(q) and q.index[-1].date() < pd.Timestamp(asof).date():
+        mtext += f" (QQQ 数据截至 {q.index[-1].date()})"
 
     wl_syms = []
     try:

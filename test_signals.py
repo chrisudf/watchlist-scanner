@@ -8050,6 +8050,14 @@ class TestBreakout(unittest.TestCase):
         bounce = pd.Series(list(np.linspace(150, 100, 70)) + list(np.linspace(100, 112, 10)))
         self.assertTrue(bk.market_light(bounce)[0].startswith("🟡"))   # 10>20 但仍在 50MA 下
 
+    def test_market_light_trailing_nan(self):
+        # Yahoo 收盘后 QQQ 最后一行常为 NaN: 不能因 NaN 比较全 False 而误判红灯
+        up = pd.Series(list(np.linspace(100, 150, 80)) + [np.nan])
+        light, text = bk.market_light(up)
+        self.assertTrue(light.startswith("🟢"))
+        self.assertNotIn("nan", text)
+        self.assertTrue(bk.market_light(pd.Series([np.nan] * 60))[0].startswith("⚪"))
+
     def test_parse_universe_filters(self):
         nas = ("Symbol|Security Name|Market Category|Test Issue|Financial Status|Round Lot Size|ETF|NextShares\n"
                "AAA|AAA Corp - Common Stock|Q|N|N|100|N|N\n"
