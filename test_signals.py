@@ -7969,5 +7969,131 @@ class TestPremarket(unittest.TestCase):
         self.assertEqual([l.split()[:5] for l in lines], [["0", "22", "*", "*", "1-5"]])
 
 
+# --------------------------------------------------------------------------
+# Qullamaggie 突破扫描 (breakout.py, 2026-11-18) — 全市场强度排名 + 形态, 只做提示
+# --------------------------------------------------------------------------
+import breakout as bk  # noqa: E402
+
+
+def bk_bars(flat=150, rise=40, base=None, start=50.0, top=75.0, band=0.03, vol=1e6,
+            end="2026-11-17"):
+    """平台 → 线性上涨 → 整理。high/low = close ×(1±band), ADR ≈ 6.2%。
+    base 默认: 第一根最高、之后在 73-74 之间收窄 (高点在 9 根前, 有停顿)。"""
+    base = base if base is not None else [74.5, 73.0, 74.0, 73.2, 73.8, 73.4, 73.6, 73.5, 73.6, 73.5]
+    close = [start] * flat + [start + (top - start) * (i + 1) / rise for i in range(rise)] + base
+    c = pd.Series(close, dtype=float)
+    idx = pd.bdate_range(end=end, periods=len(c))
+    return pd.DataFrame({"Open": c.values, "High": (c * (1 + band)).values,
+                         "Low": (c * (1 - band)).values, "Close": c.values,
+                         "Volume": float(vol)}, index=idx)
+
+
+class TestBreakout(unittest.TestCase):
+    def test_metrics_and_setup_pass(self):
+        m = bk.metrics(bk_bars())
+        self.assertAlmostEqual(m["adr"], 100 * (1.03 / 0.97 - 1), places=1)
+        self.assertEqual(m["hi_ago"], 9)
+        self.assertGreater(m["prior_gain"], 30)
+        self.assertEqual(bk.check_setup(m), [])
+
+    def test_too_short_history(self):
+        self.assertIsNone(bk.metrics(bk_bars().iloc[-100:]))
+
+    def test_fresh_high_not_a_base(self):
+        base = [73.0, 73.5, 74.0, 74.5, 75.0, 75.5, 76.0, 76.5, 77.0, 78.0]   # 今天创新高
+        m = bk.metrics(bk_bars(base=base))
+        self.assertEqual(m["hi_ago"], 0)
+        fails = bk.check_setup(m)
+        self.assertIn("刚创新高未整理", fails)
+
+    def test_low_adr_and_no_prior_run(self):
+        m = bk.metrics(bk_bars(top=55.0, band=0.01,
+                               base=[55.0, 54.6, 54.8, 54.7, 54.8, 54.7, 54.8, 54.7, 54.8, 54.7]))
+        fails = bk.check_setup(m)
+        self.assertIn("ADR偏低", fails)
+        self.assertIn("前段涨幅不足", fails)
+
+    def test_rank_universe_top_pct_and_liquidity(self):
+        # 50 只: 涨幅从 0 到 49%, 价格 ≥$10 且成交额 ≥$30M。分位 = 名次/N 且边界含等号
+        # (与回测同口径): 第 49 名分位正好 98% -> 前 2% 是 S48、S49 两只
+        px = {}
+        for k in range(50):
+            px[f"S{k}"] = bk_bars(top=50.0 * (1 + k / 100) + 0.01, vol=1e6,
+                                  base=[50.0 * (1 + k / 100)] * 10)
+        px["THIN"] = bk_bars(vol=10.0)          # 涨幅最大但成交额太小 -> 不进排名
+        df = bk.rank_universe(px, top=2.0)
+        self.assertFalse(df.set_index("symbol").loc["THIN", "liquid"])
+        self.assertEqual(df[df.strong].symbol.tolist(), ["S48", "S49"])
+
+    def test_breakouts_need_close_above_and_volume(self):
+        prev = pd.DataFrame({"symbol": ["A", "B", "C"], "base_high": [10.0, 20.0, 30.0],
+                             "setup": [True, True, False]})
+        today = pd.DataFrame({"symbol": ["A", "B", "C"], "close": [10.5, 20.5, 31.0],
+                              "vol_ratio": [2.0, 1.2, 3.0]})
+        bo = bk.breakouts(today, prev, vol_k=1.5)
+        self.assertEqual(bo.symbol.tolist(), ["A"])        # B 无量, C 昨天没成形
+        self.assertEqual(bo.bo_px.tolist(), [10.0])
+        self.assertTrue(bk.breakouts(today.iloc[0:0], prev).empty)
+
+    def test_plan_risk_and_cap(self):
+        df = pd.DataFrame({"x": [0, 0]})
+        p = bk.plan(df, pd.Series([100.0, 100.0]), pd.Series([95.0, 99.5]), 100_000)
+        # 1% 风险 = $1000: 每股风险 5 -> 200 股; 每股风险 0.5 -> 2000 股, 被 30% 上限压到 300
+        self.assertEqual(p.shares.tolist(), [200, 300])
+        self.assertEqual(p.pos_pct.tolist(), [20.0, 30.0])
+
+    def test_market_light(self):
+        up = pd.Series(np.linspace(100, 150, 80))
+        down = pd.Series(np.linspace(150, 100, 80))
+        self.assertTrue(bk.market_light(up)[0].startswith("🟢"))
+        self.assertTrue(bk.market_light(down)[0].startswith("🔴"))
+        bounce = pd.Series(list(np.linspace(150, 100, 70)) + list(np.linspace(100, 112, 10)))
+        self.assertTrue(bk.market_light(bounce)[0].startswith("🟡"))   # 10>20 但仍在 50MA 下
+
+    def test_parse_universe_filters(self):
+        nas = ("Symbol|Security Name|Market Category|Test Issue|Financial Status|Round Lot Size|ETF|NextShares\n"
+               "AAA|AAA Corp - Common Stock|Q|N|N|100|N|N\n"
+               "QQQ|Invesco QQQ|G|N|N|100|Y|N\n"
+               "ZZZT|Test Co|Q|Y|N|100|N|N\n"
+               "AAAW|AAA Corp - Warrant|Q|N|N|100|N|N\n"
+               "File Creation Time: 1117202616:00|||||||\n")
+        oth = ("ACT Symbol|Security Name|Exchange|CQS Symbol|ETF|Round Lot Size|Test Issue|NASDAQ Symbol\n"
+               "BBB|BBB Inc Common Stock|N|BBB|N|100|N|BBB\n"
+               "CCC|CCC Inc Common Stock|P|CCC|N|100|N|CCC\n"
+               "BBB$A|BBB Inc 5% Preferred|N|BBBpA|N|100|N|BBB-A\n")
+        u = bk.parse_universe(nas, oth).set_index("symbol")
+        self.assertEqual(sorted(u.index), ["AAA", "BBB", "CCC"])
+        self.assertEqual(u.loc["CCC", "tv_exch"], "AMEX")
+        self.assertEqual(u.loc["AAA", "tv_exch"], "NASDAQ")
+
+    def test_brisbane_cron_lands_in_window_both_dst(self):
+        bne = ZoneInfo("Australia/Brisbane")
+        # 布里斯班周二早上 = 美东周一傍晚; 07:20 和 07:50 在两个 DST 下都落在窗口里
+        for d in (date(2026, 7, 14), date(2026, 11, 17)):
+            for hm in ((7, 20), (7, 50)):
+                et = datetime(d.year, d.month, d.day, *hm, tzinfo=bne).astimezone(sc.ET)
+                self.assertEqual(et.weekday(), 0, et)
+                self.assertTrue(sc.in_window(et, bk.WINDOW), et)
+
+    def test_crontab_example_breakout(self):
+        text = (Path(sc.BASE) / "deploy" / "crontab.example").read_text(encoding="utf-8")
+        lines = [l.split()[:5] for l in text.splitlines()
+                 if "run_scan.sh breakout" in l and not l.startswith("#")]
+        self.assertEqual(lines, [["20", "21", "*", "*", "1-5"], ["50", "21", "*", "*", "1-5"]])
+        for d in (date(2026, 7, 13), date(2026, 11, 16)):     # UTC 周一 21:20 = 美东周一
+            et = datetime(d.year, d.month, d.day, 21, 20, tzinfo=ZoneInfo("UTC")).astimezone(sc.ET)
+            self.assertTrue(sc.in_window(et, bk.WINDOW), et)
+
+    def test_render_sections(self):
+        px = {"A": bk_bars(), "B": bk_bars(top=60.0, base=[60.0] * 10)}
+        df = bk.rank_universe(px, top=50.0)
+        md = bk.render(date(2026, 11, 17), "🔴 红灯", "QQQ …",
+                       dict(universe=2, priced=2, liquid=2, strong=1), df,
+                       bk.breakouts(df, df.iloc[0:0]), pd.DataFrame(), 100_000)
+        for h in ("## ① 今日放量突破", "## ② 就绪", "## ③ 观察", "## ④ 差一条", "## ⑤ 自选"):
+            self.assertIn(h, md)
+        self.assertIn("| A |", md)                         # A 成形且离突破 ≤ 1×ADR -> 就绪
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

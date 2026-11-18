@@ -62,6 +62,21 @@ if [ "${1:-}" = "premarket" ]; then
   exit "$status"
 fi
 
+# Qullamaggie 突破扫描 (breakout.py, 全市场, 只读): 美东收盘后 16:15-23:59 ET 窗口,
+# 布里斯班 07:20 / 07:50 两条 (= 16:20/16:50 EST, 17:20/17:50 EDT), 第二条是重试 ——
+# Yahoo 日线还没更新到今天时脚本 exit 3, 留给下一条。下载 ~5500 只一年日线, 1 核
+# 机器上跑几分钟、峰值 ~300MB, nice 19 让出 CPU 给 VPN 和其它扫描。
+if [ "${1:-}" = "breakout" ]; then
+  nice -n 19 .venv/bin/python breakout.py --email >> "$log" 2>&1
+  status=$?
+  if [ "$status" -ne 0 ] && [ "$status" -ne 3 ]; then
+    body=$(mktemp); tail -50 "$log" > "$body"
+    notify "[watchlist] breakout FAILED $d (exit $status)" "$body"
+    rm -f "$body"
+  fi
+  exit "$status"
+fi
+
 if [ "${1:-}" = "watchdog" ]; then
   et_date=$(TZ=America/New_York date +%F)   # the US trading day just ended
   # 该交易日到底该不该有报告 —— 问盘面, 不查假日日历 (和扫描器的
@@ -90,6 +105,8 @@ print(why)' "$et_date" 2>>"$log"); then
   # 个 --email fire 自动补发, 这里报的是补发也没救回来的情况
   # 开市日 (整日或半日) 也该有盘前报告 —— 它在同一个 ET 日的早上跑
   [ -n "$modes" ] && modes="premarket $modes"
+  # 开市日 (含半日市) 收盘后还该有突破扫描 —— 07:20/07:50 布里斯班跑, 看门狗 08:30
+  [ -n "$modes" ] && modes="$modes breakout"
   missing=""
   for m in $modes; do
     if [ ! -f "reports/$et_date-$m.md" ]; then
