@@ -26,6 +26,14 @@
 15 2 * * 2-6 /opt/watchlist-scanner/deploy/run_scan.sh insider   # 22:15 EDT (US summer)
 15 3 * * 2-6 /opt/watchlist-scanner/deploy/run_scan.sh insider   # 22:15 EST (US winter; EDT=23:15, skip)
 
+# ---- Qullamaggie 突破扫描 (breakout.py, 收盘后全市场) ----
+# 窗口 16:15-23:59 ET; 两条, 第二条是 Yahoo 日线未更新时的重试。美东周一到五傍晚
+# = UTC 周一到五 21:00 之后 / 布里斯班周二到六早上。下面按 UTC 时钟写:
+20 21 * * 1-5 /opt/watchlist-scanner/deploy/run_scan.sh breakout   # 16:20 EST / 17:20 EDT
+50 21 * * 1-5 /opt/watchlist-scanner/deploy/run_scan.sh breakout   # 16:50 EST / 17:50 EDT (重试)
+# 布里斯班时钟的机器 (实际那台 droplet) 写成 "20 7 * * 2-6" 和 "50 7 * * 2-6"。
+# 看门狗 (布里斯班 08:30) 在开市日也查 {ET 日期}-breakout.md / .sent。
+
 # ---- 推荐复盘 (月度) ----
 # 每月 1 号跑一次, 出 markdown 并邮寄。为什么是月度不是周度: CSP 是 12-31 DTE,
 # 一笔要三周左右才结算; 按当前出票节奏一周只多出一两笔已结算样本, 而 delta 基准
