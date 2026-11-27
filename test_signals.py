@@ -4228,7 +4228,7 @@ class TestIv30Method(unittest.TestCase):
 
 
 def form4_xml(*, issuer="0001818874", owners=None, aff="0", rows=(),
-              footnotes=None, orig=None) -> bytes:
+              footnotes=None, orig=None, deriv=()) -> bytes:
     owners = owners or [("0001613438", "Noto Anthony",
                          {"isDirector": "1", "isOfficer": "1",
                           "officerTitle": "Chief Executive Officer"})]
@@ -4261,6 +4261,29 @@ def form4_xml(*, issuer="0001818874", owners=None, aff="0", rows=(),
         "</natureOfOwnership></ownershipNature>"
         "</nonDerivativeTransaction>"
         for r in rows)
+    # 衍生品表 (Table II) 行, 结构照抄伯克希尔 Abel 2026-03-05 的申报: 行权价/
+    # 行权日/到期日只挂转换脚注, 标的股数可有可无
+    dtx = "".join(
+        "<derivativeTransaction>"
+        f"<securityTitle><value>{r.get('security', 'Class A Common Stock')}</value></securityTitle>"
+        f"<conversionOrExercisePrice><value>{r.get('strike', '')}</value>{fn(r.get('conv_fn'))}"
+        "</conversionOrExercisePrice>"
+        f"<transactionDate><value>{r['date']}</value></transactionDate>"
+        f"<transactionCoding><transactionFormType>4</transactionFormType>"
+        f"<transactionCode>{r.get('code', 'P')}</transactionCode></transactionCoding>"
+        f"<transactionAmounts><transactionShares><value>{r['shares']}</value></transactionShares>"
+        f"<transactionPricePerShare><value>{r.get('price', '')}</value></transactionPricePerShare>"
+        f"<transactionAcquiredDisposedCode><value>{r.get('ad', 'A')}</value>"
+        "</transactionAcquiredDisposedCode></transactionAmounts>"
+        f"<exerciseDate>{fn(r.get('conv_fn'))}</exerciseDate>"
+        f"<underlyingSecurity><underlyingSecurityTitle><value>{r.get('under_title', 'See footnote')}"
+        f"</value></underlyingSecurityTitle><underlyingSecurityShares><value>{r.get('under', '')}"
+        "</value></underlyingSecurityShares></underlyingSecurity>"
+        f"<ownershipNature><directOrIndirectOwnership><value>{r.get('direct', 'I')}</value>"
+        f"</directOrIndirectOwnership><natureOfOwnership><value>{r.get('nature', 'By Trust')}</value>"
+        "</natureOfOwnership></ownershipNature>"
+        "</derivativeTransaction>"
+        for r in deriv)
     foot = "".join(f'<footnote id="{k}">{v}</footnote>'
                    for k, v in (footnotes or {}).items())
     return (f"<ownershipDocument><schemaVersion>X0609</schemaVersion>"
@@ -4268,6 +4291,7 @@ def form4_xml(*, issuer="0001818874", owners=None, aff="0", rows=(),
             + (f"<dateOfOriginalSubmission>{orig}</dateOfOriginalSubmission>" if orig else "")
             + f"<aff10b5One>{aff}</aff10b5One>"
             f"<nonDerivativeTable>{txns}</nonDerivativeTable>"
+            + (f"<derivativeTable>{dtx}</derivativeTable>" if dtx else "") +
             f"<footnotes>{foot}</footnotes></ownershipDocument>").encode()
 
 
@@ -4332,6 +4356,94 @@ class TestForm4Parse(unittest.TestCase):
     def test_missing_price_is_none_not_zero(self):
         d = ins.parse_form4(form4_xml(rows=[buy(100, "")]))
         self.assertIsNone(d["rows"][0]["price"])
+
+
+BRK = 1067983
+BRK_CONV = {"F2": "Each share of Class A Common Stock is convertible at any time at the "
+                  "option of the holder into 1,500 shares of Class B Common Stock."}
+
+
+class TestForm4DerivativeEquity(unittest.TestCase):
+    """坑 7: 伯克希尔 A 股记在衍生品表, 只读 Table I 会漏掉 CEO 的买入。"""
+
+    def brk(self, deriv, rows=(), footnotes=BRK_CONV):
+        return ins.parse_form4(form4_xml(issuer="0001067983", deriv=deriv,
+                                         rows=rows, footnotes=footnotes))
+
+    def test_class_a_buy_in_table_ii_converted_to_b_shares(self):
+        d = self.brk([buy(2, 888869.52, date="2026-11-12", conv_fn=["F2"])])
+        self.assertEqual(len(d["rows"]), 1)
+        r = d["rows"][0]
+        self.assertEqual(r["shares"], 3000.0)                       # 2 股 A = 3,000 股 B
+        self.assertAlmostEqual(r["price"], 592.57968)
+        self.assertAlmostEqual(r["shares"] * r["price"], 2 * 888869.52)   # 金额不变
+        self.assertIn("1,500", r["security"])
+        self.assertIn("Class B Common Stock", r["security"])        # 从转换脚注里取
+        self.assertEqual(r["notes"], [])          # 转换脚注不进交易脚注 (不碰计划/私募判定)
+        self.assertEqual(d["txn_dates"], ["2026-11-12"])
+
+    def test_ratio_from_underlying_shares_when_no_footnote(self):
+        # Abel 2023-03-17: 55 股 A, 标的 82,500 股 B, 转换脚注只挂在 holding 行上
+        d = self.brk([buy(55, 447259.99, date="2023-03-17", under="82500",
+                          under_title="Class B Common Stock")], footnotes={})
+        r = d["rows"][0]
+        self.assertEqual(r["shares"], 82500.0)
+        self.assertAlmostEqual(r["price"], 447259.99 / 1500)
+        self.assertIn("Class B Common Stock", r["security"])
+
+    def test_no_ratio_keeps_raw_units(self):
+        # 折不出来就原样留着, 交给 units_ok 归到"单位不同"
+        d = self.brk([buy(1, 725210.19, date="2026-03-04")], footnotes={})
+        self.assertEqual((d["rows"][0]["shares"], d["rows"][0]["price"]), (1.0, 725210.19))
+
+    def test_real_derivatives_still_ignored(self):
+        for kw in (dict(security="Call Option (right to buy)"),
+                   dict(security="Stock Option (Right to Buy) Common Stock", strike="50"),
+                   dict(security="Warrants to purchase Common Stock"),
+                   dict(security="Restricted Stock Units"),
+                   dict(security="Series A Preferred Stock"),
+                   dict(security="Convertible Senior Notes"),
+                   dict(security="Class A Common Stock", strike="12.5"),   # 有行权价
+                   dict(security="Class A Common Stock", code="M"),        # 不是买入
+                   dict(security="Class A Common Stock", code="S", ad="D")):
+            d = self.brk([{**buy(10, 100.0), **kw}])
+            self.assertEqual(d["rows"], [], kw)
+
+    def test_flows_into_open_market_buys_with_b_units(self):
+        x = form4_xml(issuer="0001067983", footnotes=BRK_CONV,
+                      owners=[owner("1646348", "Abel Gregory E.", isOfficer="1")],
+                      deriv=[buy(1, 725210.19, date="2026-03-04", conv_fn=["F2"]),
+                             buy(2, 727185.00, date="2026-03-04", conv_fn=["F2"])])
+        f = {"acc": "b1", "filed": "2026-03-05", "form": "4", "doc": ins.parse_form4(x)}
+        got = ins.open_market_buys([f], BRK, ref_close=lambda d: 486.0)
+        self.assertEqual(len(got), 2)
+        self.assertTrue(all(b["units_ok"] for b in got))    # 折成 B 股后和 B 股日线同单位
+        e = ins.filing_events(got)[0]
+        self.assertEqual(e["shares"], 4500.0)
+        self.assertAlmostEqual(e["value"], 725210.19 + 2 * 727185.00)
+        self.assertAlmostEqual(e["avg_price"], (725210.19 + 2 * 727185.00) / 4500)
+
+    def test_see_remarks_title_taken_from_remarks(self):
+        def doc(remarks, owners):
+            x = form4_xml(issuer="0001067983", owners=owners, rows=[buy(1, 1)])
+            x = x.replace(b"</footnotes>", b"</footnotes><remarks>" + remarks + b"</remarks>")
+            return ins.parse_form4(x)
+        see = {"isOfficer": "1", "officerTitle": "See Remarks"}
+        d = doc(b"President and Chief Executive Officer",
+                [("1646348", "Abel", {**see, "isDirector": "1"})])
+        self.assertEqual(ins.role_label(d["owners"]), "董事/CEO")
+        d = doc(b"Senior Vice President and Chief Financial Officer", [("2", "C", see)])
+        self.assertEqual(ins.role_label(d["owners"]), "CFO")
+        # 联名申报: remarks 不知道在说谁, 保持原样
+        d = doc(b"Chief Financial Officer", [("2", "O", see), ("3", "P", see)])
+        self.assertEqual(d["owners"][0]["title"], "See Remarks")
+
+    def test_both_tables_in_one_filing_sorted_by_date(self):
+        d = self.brk([buy(1, 900000, date="2026-11-13", conv_fn=["F2"])],
+                     rows=[buy(100, 594.0, date="2026-11-12",
+                               security="Class B Common Stock")])
+        self.assertEqual([r["date"] for r in d["rows"]], ["2026-11-12", "2026-11-13"])
+        self.assertEqual(d["txn_dates"], ["2026-11-12", "2026-11-13"])
 
 
 class TestOpenMarketBuys(unittest.TestCase):

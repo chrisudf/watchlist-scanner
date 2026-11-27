@@ -33,6 +33,15 @@ PR #23 评审补的两个 (2026-10-05, 用 EDGAR 全文检索拉真实申报核�
      那一行的。按 (申报人, 交易日) 让更新的申报覆盖旧的, 不按数字去重 ——
      改了股数/价格的修正按数字对不上, 会重复计。
 
+2026-11-27 补 (加 BRK-B 时撞上):
+  7. 可转换的普通股记在**衍生品表** (Table II): 伯克希尔 A 股可随时转成 1,500
+     股 B 股, 2023 年起高管买 A 股都填在 Table II —— Abel 2023-03 的 $2,460 万、
+     2026-03 的 $1,531 万, 以及 Chang 2026-08/11 的买入, 只读 Table I 全漏。
+     Table II 里证券名是普通股、没有行权价的代码 P 也收; 期权/认股权证/可转债
+     这些有行权价或名字对不上的照旧不收。脚注写了 "convertible ... into N
+     shares" 的按 N 折成标的股 (股数 ×N, 价格 ÷N), 这样能和 B 股日线比单位、
+     进均价; 折不出来的仍按坑 4 归到"单位不同"。
+
 命令行 (部署时预热缓存 / 手工看一眼):
     SEC_EMAIL=you@example.com .venv/bin/python insider.py [SOFI HOOD ...]
 不带代码 = watchlist.toml 里全部个股。
@@ -62,7 +71,8 @@ TIMEOUT = 20
 # 旧条目自动重拉, 不用手动清缓存
 #   1  2026-10-05 首版
 #   2  2026-10-05 加 txn_dates / orig_date (4/A 按交易日覆盖原申报)
-PARSE_VERSION = 2
+#   3  2026-11-27 收衍生品表里的可转换普通股买入 (坑 7)
+PARSE_VERSION = 3
 
 FLOOR_USD = 25_000          # 单笔或同一人同一 ISO 周合计 (用户 2026-10-05 拍板)
 WINDOW_DAYS = 180           # 报告里的汇总窗口 (按交易日)
@@ -101,6 +111,19 @@ PRIVATE_RE = re.compile(
     r"|\b(?:in|through|in connection with)\b[^.]{0,40}?\b(?:initial )?public offering",
     re.I)
 OPEN_MARKET_RE = re.compile(r"open[- ]market", re.I)
+# 坑 7: 衍生品表里哪些是"其实就是普通股" —— 名字是普通股, 且不是期权/权证/
+# 受限股/优先股/可转债/单位这类真衍生品 (后者的名字里常也带 "Common Stock")
+DERIV_EQUITY_RE = re.compile(
+    r"\b(?:common|ordinary|capital)\s+(?:stock|shares?)\b"
+    r"|\bclass\s+[a-z]\s+(?:stock|shares?)\b", re.I)
+DERIV_NOT_EQUITY_RE = re.compile(
+    r"option|warrant|right|\bunits?\b|restricted|\bRSUs?\b|phantom|preferred"
+    r"|\bnotes?\b|debenture|swap|performance|\bcall\b|\bput\b", re.I)
+CONVERT_RE = re.compile(
+    r"convertible\b[^.]{0,80}?\binto\s+(\d[\d,]*(?:\.\d+)?)\s+shares"
+    r"(?:\s+of\s+((?:class\s+[a-z]\s+)?(?:common|ordinary)\s+(?:stock|shares)))?", re.I)
+# 伯克希尔这类把职位写在 <remarks> 里、officerTitle 只填 "See Remarks"
+SEE_REMARKS_RE = re.compile(r"^\s*see\s+remarks?\s*$", re.I)
 
 CACHE_NAME = "form4_cache.json"
 SEEN_NAME = "insider_seen.json"
@@ -163,46 +186,96 @@ def _text(node, path: str) -> str:
     return (node.findtext(path) or "").strip() if node is not None else ""
 
 
+def _txn_row(t, foot: dict) -> dict:
+    """一行交易 (Table I 或 II) -> 买入行。脚注只取挂在交易本身上的。"""
+    ids = set()
+    for part in _TXN_PARTS:
+        node = t.find(part)
+        if node is not None:
+            ids |= {f.get("id") for f in node.iter("footnoteId")}
+    return {
+        "security": _text(t, "securityTitle/value"),
+        "date": _text(t, "transactionDate/value")[:10],
+        "shares": _num(_text(t, "transactionAmounts/transactionShares/value")),
+        "price": _num(_text(t, "transactionAmounts/transactionPricePerShare/value")),
+        "ad": _text(t, "transactionAmounts/transactionAcquiredDisposedCode/value"),
+        "direct": _text(t, "ownershipNature/directOrIndirectOwnership/value"),
+        "nature": _text(t, "ownershipNature/natureOfOwnership/value"),
+        "notes": [foot[i] for i in sorted(ids, key=str) if i in foot],
+    }
+
+
+def _deriv_equity_row(t, foot: dict) -> dict | None:
+    """衍生品表里一行: 是可转换普通股的代码 P 买入就返回买入行, 否则 None (坑 7).
+
+    认法: 代码 P + 证券名是普通股 + 名字里没有期权/权证这类词 + 没有行权价
+    数值 (伯克希尔 A 股的"行权价"只挂一条转换脚注)。转换比例取这行任何
+    脚注里的 "convertible ... into N shares", 退而求其次用标的股数 ÷ 股数;
+    拿到 N > 1 就把股数/价格折成标的股, 金额不变。"""
+    if _text(t, "transactionCoding/transactionCode") != "P":
+        return None
+    title = _text(t, "securityTitle/value")
+    if not DERIV_EQUITY_RE.search(title) or DERIV_NOT_EQUITY_RE.search(title):
+        return None
+    if _num(_text(t, "conversionOrExercisePrice/value")):
+        return None
+    row = _txn_row(t, foot)
+    all_ids = {f.get("id") for f in t.iter("footnoteId")}
+    text = " ".join(foot[i] for i in all_ids if i in foot)
+    m = CONVERT_RE.search(text)
+    ratio = _num(m.group(1).replace(",", "")) if m else None
+    under_title = (m.group(2) if m and m.group(2) else
+                   _text(t, "underlyingSecurity/underlyingSecurityTitle/value"))
+    under = _num(_text(t, "underlyingSecurity/underlyingSecurityShares/value"))
+    if ratio is None and under and row["shares"]:
+        ratio = under / row["shares"]
+    if ratio and ratio > 1 and row["shares"]:
+        row["shares"] *= ratio
+        if row["price"]:
+            row["price"] /= ratio
+        if not DERIV_EQUITY_RE.search(under_title):
+            under_title = "标的股"
+        row["security"] = f"{title} (1 股折 {ratio:,.0f} 股 {under_title})"
+    return row
+
+
 def parse_form4(xml: bytes) -> dict:
     """Form 4 原文 -> 发行人 / 申报人 / 买入行 (纯函数).
 
-    只留代码 P 的非衍生品交易 —— v1 只做买入, 缓存小一个数量级 (大票的
-    Form 4 绝大多数是授予/行权/扣税/计划卖出)。以后要卖出就改这里并把
-    PARSE_VERSION +1。"""
+    只留代码 P 的交易 —— v1 只做买入, 缓存小一个数量级 (大票的 Form 4
+    绝大多数是授予/行权/扣税/计划卖出)。衍生品表只收可转换的普通股 (坑 7,
+    见 _deriv_equity_row)。以后要卖出就改这里并把 PARSE_VERSION +1。"""
     root = ET.fromstring(xml)
     foot = {f.get("id"): " ".join((f.text or "").split())
             for f in root.findall("footnotes/footnote")}
+    rows, txn_dates = [], set()
+    for t in root.findall("derivativeTable/derivativeTransaction"):
+        txn_dates.add(_text(t, "transactionDate/value")[:10])
+        row = _deriv_equity_row(t, foot)
+        if row:
+            rows.append(row)
     owners = []
+    remarks = " ".join(_text(root, "remarks").split())
+    solo = len(root.findall("reportingOwner")) == 1
     for o in root.findall("reportingOwner"):
         rel = o.find("reportingOwnerRelationship")
+        title = _text(rel, "officerTitle")
         owners.append({
             "cik": _text(o, "reportingOwnerId/rptOwnerCik").lstrip("0"),
             "name": _text(o, "reportingOwnerId/rptOwnerName"),
             "director": _bool(_text(rel, "isDirector")),
             "officer": _bool(_text(rel, "isOfficer")),
             "ten_pct": _bool(_text(rel, "isTenPercentOwner")),
-            "title": _text(rel, "officerTitle"),
+            # 只有一个申报人时 remarks 才确定是在说他 (联名申报保持原样)
+            "title": (remarks if solo and remarks and SEE_REMARKS_RE.match(title)
+                      else title),
         })
-    rows, txn_dates = [], set()
     for t in root.findall("nonDerivativeTable/nonDerivativeTransaction"):
         txn_dates.add(_text(t, "transactionDate/value")[:10])
         if _text(t, "transactionCoding/transactionCode") != "P":
             continue
-        ids = set()
-        for part in _TXN_PARTS:
-            node = t.find(part)
-            if node is not None:
-                ids |= {f.get("id") for f in node.iter("footnoteId")}
-        rows.append({
-            "security": _text(t, "securityTitle/value"),
-            "date": _text(t, "transactionDate/value")[:10],
-            "shares": _num(_text(t, "transactionAmounts/transactionShares/value")),
-            "price": _num(_text(t, "transactionAmounts/transactionPricePerShare/value")),
-            "ad": _text(t, "transactionAmounts/transactionAcquiredDisposedCode/value"),
-            "direct": _text(t, "ownershipNature/directOrIndirectOwnership/value"),
-            "nature": _text(t, "ownershipNature/natureOfOwnership/value"),
-            "notes": [foot[i] for i in sorted(ids, key=str) if i in foot],
-        })
+        rows.append(_txn_row(t, foot))
+    rows.sort(key=lambda r: r["date"])   # 两张表合起来按交易日排
     issuer = _text(root, "issuer/issuerCik").lstrip("0")
     return {
         "v": PARSE_VERSION,
