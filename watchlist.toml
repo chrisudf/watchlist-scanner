@@ -51,6 +51,9 @@
 #   (20-F 外国发行人, TTM PE 走 Yahoo 季度 EPS + 20-F 核对的兜底)
 #   注: Yahoo 给 ASML 的一致预期 EPS 是欧元 — 倍数一律先按 EURUSD 1.097 (11/17) 折成美元再算
 #
+# 2026-11-25 增补 COST / BRK-B / KO / MO (未动其余 20 标的): 不设 value_zone, 只出技术面/右侧信号和
+#   内部人买入; 接货区待按估值/支撑另行校准。伯克希尔 B 股写 Yahoo 代码 BRK-B (带点的 BRK.B yfinance 取不到)
+#
 # kind = "index" | "stock" | "etf"   (LEAP delta 带: index 0.70-0.80, 其余 0.75-0.85)
 # high_beta = true  → LEAP 提示仓位折半 + 财报后入场
 # options = false   → 不出期权票 (无链/流动性差)
@@ -167,6 +170,14 @@ high_beta = true
 value_zone = [105.0, 135.0]
 zone_asof = "2026-10-16"
 notes = "SpaceX Class A (2026-06-12 IPO $135, Nasdaq); 10/16 收 146.03 (10/6 高 176.4 后 -17%, 10/15 跳空 149.0-151.1 未补); 数值复核维持: 135 = IPO 发行价 (认购盘成本线), 下方有斐波 78.6% 130.7 + 8/20 低 130.4; 105 = 上市后最低 104.83 (8/3); 期权已核实流动 → 撤 options = false: 总 OI 约 490 万张, 11/20-1/15 月度 put 在 110 以上行权价价差 2-9%、每档 OI 1-3.5 万, LEAP 挂到 2029-01; Q3 财报 Yahoo 记 10/20 盘后 (公司未公告; 期权 IV 10/19 档约 43% → 10/21 档约 86% 印证) → 财报后第 2 个交易日起最多 28% 锁定股可售, 12/8 前后 180 天最终解禁 (Musk 锁到 2027-06) = 两波供给; FY27 EPS 一致预期 2.12 (90 天前 0.65, 区间 -0.68~3.96, 分歧极大) ≈69x, 无盈利地板; 历史不到 5 年, LEAP IV 档位只代表一个 regime"
+
+[tickers.COST]
+
+[tickers.BRK-B]
+
+[tickers.KO]
+
+[tickers.MO]
 
 # MSTR (2026-10-19 增补): 故意不设 value_zone — 左侧接货阶梯在文件末尾 [mnav.MSTR] (按当天 BTC 换算)
 [tickers.MSTR]
